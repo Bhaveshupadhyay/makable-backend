@@ -1,0 +1,147 @@
+"""Dependency injection wiring: the only place that knows which implementation backs each interface.
+
+App-wide singletons are the shared clients (`app/core/client.py`, opened by the lifespan) and the
+settings (`get_settings`). Everything else is built per request. Tests replace any provider with
+`app.dependency_overrides`.
+"""
+
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
+from typing import Annotated
+
+import httpx
+from fastapi import Cookie, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.cookies import AuthCookies
+from app.clients.github import GithubClient, HttpGithubClient
+from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
+from app.constants.auth import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, Role
+from app.core.client import get_db_session, get_http_client
+from app.core.config import Settings, get_settings
+from app.core.exceptions import ForbiddenError
+from app.core.security import PayloadSigner, TokenCipher
+from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
+from app.repositories.health import HealthRepository, SqlHealthRepository
+from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
+from app.repositories.user import SqlUserRepository, UserRepository
+from app.schemas.user import UserRead
+from app.services.auth_service import AuthService
+from app.services.health_service import HealthService
+
+# --- App-wide singletons ---
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+
+DbSessionDep = Annotated[AsyncSession, Depends(get_db_session)]
+HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
+
+# --- Infrastructure ---
+
+
+def get_unit_of_work(session: DbSessionDep) -> UnitOfWork:
+    return SqlAlchemyUnitOfWork(session)
+
+
+def get_token_cipher(settings: SettingsDep) -> TokenCipher:
+    return TokenCipher(settings.token_encryption_key.get_secret_value())
+
+
+def get_oauth_state_signer(settings: SettingsDep) -> PayloadSigner:
+    return PayloadSigner(settings.secret_key.get_secret_value(), salt="oauth-state")
+
+
+def get_github_client(http: HttpClientDep) -> GithubClient:
+    return HttpGithubClient(http)
+
+
+def get_supabase_client(http: HttpClientDep, settings: SettingsDep) -> SupabaseAuthClient:
+    return HttpSupabaseAuthClient(http, url=settings.supabase_url, api_key=settings.supabase_publishable_key)
+
+
+def get_auth_cookies(settings: SettingsDep) -> AuthCookies:
+    return AuthCookies(secure=settings.secure_cookies, refresh_ttl=timedelta(days=settings.refresh_token_ttl_days))
+
+
+UnitOfWorkDep = Annotated[UnitOfWork, Depends(get_unit_of_work)]
+AuthCookiesDep = Annotated[AuthCookies, Depends(get_auth_cookies)]
+
+# --- Repositories ---
+
+
+def get_user_repository(session: DbSessionDep) -> UserRepository:
+    return SqlUserRepository(session)
+
+
+def get_github_credential_repository(session: DbSessionDep) -> GithubCredentialRepository:
+    return SqlGithubCredentialRepository(session)
+
+
+def get_health_repository(session: DbSessionDep) -> HealthRepository:
+    return SqlHealthRepository(session)
+
+
+UserRepositoryDep = Annotated[UserRepository, Depends(get_user_repository)]
+
+# --- Services ---
+
+
+def get_auth_service(
+    supabase: Annotated[SupabaseAuthClient, Depends(get_supabase_client)],
+    github: Annotated[GithubClient, Depends(get_github_client)],
+    state_signer: Annotated[PayloadSigner, Depends(get_oauth_state_signer)],
+    users: UserRepositoryDep,
+    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+    uow: UnitOfWorkDep,
+    settings: SettingsDep,
+) -> AuthService:
+    return AuthService(
+        supabase=supabase,
+        github=github,
+        state_signer=state_signer,
+        users=users,
+        credentials=credentials,
+        cipher=cipher,
+        uow=uow,
+        callback_url=settings.auth_callback_url,
+    )
+
+
+def get_health_service(health: Annotated[HealthRepository, Depends(get_health_repository)]) -> HealthService:
+    return HealthService(health)
+
+
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
+
+# --- Authentication ---
+
+AccessTokenDep = Annotated[str | None, Cookie(alias=ACCESS_TOKEN_COOKIE)]
+RefreshTokenDep = Annotated[str | None, Cookie(alias=REFRESH_TOKEN_COOKIE)]
+
+
+async def get_current_user(auth: AuthServiceDep, access_token: AccessTokenDep = None) -> UserRead:
+    """The signed-in user, from the access token cookie.
+
+    Raises:
+        UnauthorizedError: No valid access token, or its user isn't known here.
+    """
+    return await auth.authenticate(access_token)
+
+
+CurrentUserDep = Annotated[UserRead, Depends(get_current_user)]
+
+
+def require_roles(*roles: Role) -> Callable[[UserRead], Awaitable[UserRead]]:
+    """A dependency that only lets users with one of `roles` through, e.g.
+    `Depends(require_roles(Role.ADMIN))`."""
+
+    async def check(user: CurrentUserDep) -> UserRead:
+        if user.role not in roles:
+            raise ForbiddenError()
+        return user
+
+    return check
