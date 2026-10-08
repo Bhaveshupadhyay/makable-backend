@@ -1,8 +1,10 @@
 from uuid import uuid4
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants.auth import Role
+from app.core.exceptions import ConflictError
 from app.repositories.user import SqlUserRepository
 from app.schemas.user import UserCreate, UserUpdate
 
@@ -28,6 +30,14 @@ async def test_create_and_find(session: AsyncSession) -> None:
     assert await users.get_by_auth_user_id(AUTH_USER_ID) is created
     assert await users.get_by_auth_user_id(uuid4()) is None
     assert await users.get_by_id(uuid4()) is None
+
+
+async def test_duplicates_raise_conflict(session: AsyncSession) -> None:
+    users = SqlUserRepository(session)
+    await users.create(octocat())
+
+    with pytest.raises(ConflictError):
+        await users.create(octocat().model_copy(update={"auth_user_id": uuid4()}))
 
 
 async def test_update_only_writes_set_fields(session: AsyncSession) -> None:

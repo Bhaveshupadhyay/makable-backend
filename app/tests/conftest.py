@@ -37,7 +37,7 @@ def settings(db_path: Path) -> Settings:
         log_level="WARNING",
         app_url=APP_URL,
         database_url=f"sqlite+aiosqlite:///{db_path}",
-        secret_key=SecretStr("test-secret"),
+        secret_key=SecretStr("test-secret-that-is-at-least-32-chars"),
         token_encryption_key=SecretStr(Fernet.generate_key().decode()),
         supabase_url="https://project.supabase.co",
         supabase_publishable_key="sb_publishable_test",

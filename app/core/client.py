@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.config import DatabaseSettings
 
@@ -33,9 +34,13 @@ def engine_options(settings: DatabaseSettings) -> dict[str, Any]:
     }
     if settings.db_transaction_pooler:
         # A transaction-mode pooler may run each transaction on a different server connection, where
-        # our cached prepared statements don't exist. Unique names stop clashes with other clients'.
+        # cached prepared statements don't exist. Both caches go: asyncpg's and SQLAlchemy's own. Unique
+        # names stop clashes with other clients' statements, and NullPool leaves pooling to the pooler, so
+        # statements prepared on a server connection don't pile up (SQLAlchemy's PgBouncer guidance).
         connect_args["statement_cache_size"] = 0
+        connect_args["prepared_statement_cache_size"] = 0
         connect_args["prepared_statement_name_func"] = lambda: f"__asyncpg_{uuid4()}__"
+        return {"poolclass": NullPool, "connect_args": connect_args}
     return {
         "pool_size": settings.db_pool_size,
         "max_overflow": settings.db_max_overflow,

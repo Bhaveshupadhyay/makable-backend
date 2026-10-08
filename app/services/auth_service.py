@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from app.clients.github import GithubClient, GithubError
 from app.clients.supabase import SupabaseAuthClient, SupabaseError, SupabaseRejectedError
 from app.constants.auth import AUTH_PROVIDER, GITHUB_SCOPES, OAUTH_STATE_TTL_SECONDS
-from app.core.exceptions import LoginError, UnauthorizedError
+from app.core.exceptions import ConflictError, LoginError, UnauthorizedError
 from app.core.security import InvalidTokenError, PayloadSigner, TokenCipher, generate_token, pkce_challenge
 from app.repositories.github_credential import GithubCredentialRepository
 from app.repositories.unit_of_work import UnitOfWork
@@ -81,8 +81,9 @@ class AuthService:
         GitHub token.
 
         Raises:
-            LoginError: The state cookie is missing, forged or expired, the user declined, or Supabase or
-                GitHub failed. `return_to` is only trusted (and set) once the cookie has been verified.
+            LoginError: The state cookie is missing, forged or expired, the user declined, Supabase or
+                GitHub failed, or a concurrent sign-in created the same user. `return_to` is only trusted
+                (and set) once the cookie has been verified.
         """
         oauth = self._verify_state(state_cookie)
         if error:
@@ -101,7 +102,12 @@ class AuthService:
         except GithubError as err:
             raise LoginError("github_error", err.message, return_to=oauth.return_to) from err
 
-        user = await self._upsert_user(session, github_user)
+        try:
+            user = await self._upsert_user(session, github_user)
+        except ConflictError as err:
+            # A concurrent sign-in for the same GitHub account created the user first.
+            await self._uow.rollback()
+            raise LoginError("conflict", "Another sign-in created this user first", return_to=oauth.return_to) from err
         await self._save_credentials(user, session.provider_token)
         await self._uow.commit()
         logger.info("user signed in", extra={"user_id": str(user.id)})
@@ -165,7 +171,11 @@ class AuthService:
             raise LoginError("invalid_state", "Invalid or expired OAuth state") from err
 
     async def _upsert_user(self, session: SupabaseSession, github_user: GithubUser) -> UserRead:
-        existing = await self._users.get_by_auth_user_id(session.user.id)
+        # The GitHub account identifies the person. Supabase's id for it changes if the Supabase user is
+        # deleted and signs in again, so a miss falls back to the GitHub id and relinks that row.
+        existing = await self._users.get_by_auth_user_id(session.user.id) or await self._users.get_by_github_id(
+            github_user.id
+        )
         if existing is None:
             user = await self._users.create(
                 UserCreate(
@@ -179,7 +189,12 @@ class AuthService:
         else:
             user = await self._users.update(
                 existing,
-                UserUpdate(login=github_user.login, name=github_user.name, avatar_url=github_user.avatar_url),
+                UserUpdate(
+                    auth_user_id=session.user.id,
+                    login=github_user.login,
+                    name=github_user.name,
+                    avatar_url=github_user.avatar_url,
+                ),
             )
         return UserRead.model_validate(user)
 

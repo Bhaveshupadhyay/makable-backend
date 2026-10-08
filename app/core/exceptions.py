@@ -1,6 +1,7 @@
 """Domain exceptions and the global handlers that turn them into error envelopes."""
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -59,6 +60,14 @@ class ServiceUnavailableError(AppError):
     message = "Service unavailable"
 
 
+class ConflictError(AppError):
+    """A write clashed with existing data (e.g. a unique constraint)."""
+
+    status_code = status.HTTP_409_CONFLICT
+    code = "conflict"
+    message = "Conflicts with existing data"
+
+
 class LoginError(AppError):
     """The OAuth callback couldn't sign the user in. The callback turns it into a redirect, not JSON."""
 
@@ -71,11 +80,20 @@ class LoginError(AppError):
         self.return_to = return_to
 
 
-def _error_response(status_code: int, code: str, message: str, details: Any = None) -> JSONResponse:
+def _error_response(
+    status_code: int, code: str, message: str, details: Any = None, headers: Mapping[str, str] | None = None
+) -> JSONResponse:
     body = ErrorResponse(
         error=ErrorDetail(code=code, message=message, details=details), request_id=request_id_var.get()
     )
-    return JSONResponse(jsonable_encoder(body.model_dump(by_alias=True)), status_code=status_code)
+    return JSONResponse(jsonable_encoder(body.model_dump(by_alias=True)), status_code=status_code, headers=headers)
+
+
+def internal_error_response(exc: Exception) -> JSONResponse:
+    """Logs an unhandled exception with its stack trace. The client only gets a generic message and the
+    request id."""
+    logger.exception("unhandled error", exc_info=exc)
+    return _error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, AppError.code, AppError.message)
 
 
 async def _app_error_handler(_: Request, exc: Exception) -> JSONResponse:
@@ -93,13 +111,13 @@ async def _validation_error_handler(_: Request, exc: Exception) -> JSONResponse:
 
 async def _http_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, StarletteHTTPException)
-    return _error_response(exc.status_code, "http_error", str(exc.detail))
+    # Keeps headers Starlette attaches, e.g. `Allow` on a 405.
+    return _error_response(exc.status_code, "http_error", str(exc.detail), headers=exc.headers)
 
 
 async def _unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
-    # Logged with the stack trace; the client only gets a generic message and the request id.
-    logger.exception("unhandled error", exc_info=exc)
-    return _error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, AppError.code, AppError.message)
+    # A fallback: `UnhandledErrorMiddleware` normally catches these first, inside the other middleware.
+    return internal_error_response(exc)
 
 
 def register_exception_handlers(app: FastAPI) -> None:

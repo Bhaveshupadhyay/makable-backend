@@ -29,7 +29,9 @@ class DatabaseSettings(BaseSettings):
     db_name: str = "postgres"
     db_user: str | None = None
     db_password: SecretStr | None = None
-    # "require" encrypts without verifying the certificate, which is what Supabase's pooler expects.
+    # "require" encrypts but doesn't verify the server's certificate, which works with Supabase out of the
+    # box. In production use "verify-full" with Supabase's CA certificate (dashboard -> Database -> SSL) at
+    # the path in PGSSLROOTCERT.
     db_ssl: Literal["disable", "prefer", "require", "verify-ca", "verify-full"] = "require"
 
     # Pool sizing is per process: total connections = workers x (pool_size + max_overflow). Keep it under
@@ -86,7 +88,7 @@ class Settings(DatabaseSettings):
     cors_origins: list[str] = []
 
     # Signs the short-lived OAuth state cookie (PKCE verifier and return path).
-    secret_key: SecretStr
+    secret_key: SecretStr = Field(min_length=32)
     # Fernet key that encrypts GitHub tokens at rest.
     token_encryption_key: SecretStr
 

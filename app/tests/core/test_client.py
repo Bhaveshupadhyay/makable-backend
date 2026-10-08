@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
+from sqlalchemy.pool import NullPool
 
 from app.core.client import (
     close_connection,
@@ -63,10 +64,14 @@ def test_postgres_gets_a_bounded_pre_pinged_pool() -> None:
     assert "statement_cache_size" not in options["connect_args"]
 
 
-def test_transaction_pooler_disables_the_statement_cache() -> None:
-    connect_args = engine_options(supabase(db_transaction_pooler=True))["connect_args"]
+def test_transaction_pooler_disables_both_statement_caches_and_our_pool() -> None:
+    options = engine_options(supabase(db_transaction_pooler=True))
+    connect_args = options["connect_args"]
 
+    assert options["poolclass"] is NullPool
+    assert "pool_size" not in options
     assert connect_args["statement_cache_size"] == 0
+    assert connect_args["prepared_statement_cache_size"] == 0
     name = connect_args["prepared_statement_name_func"]
     assert name() != name()
 

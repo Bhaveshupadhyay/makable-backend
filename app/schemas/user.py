@@ -18,6 +18,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     """Partial update: only fields that are set are written."""
 
+    auth_user_id: UUID | None = None
     login: str | None = None
     name: str | None = None
     avatar_url: str | None = None

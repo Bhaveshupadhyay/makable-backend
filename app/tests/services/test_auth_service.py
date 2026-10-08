@@ -1,9 +1,12 @@
+from uuid import UUID, uuid4
+
 import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import LoginError, UnauthorizedError
 from app.core.security import PayloadSigner, TokenCipher, pkce_challenge
+from app.models.user import User
 from app.repositories.github_credential import SqlGithubCredentialRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.repositories.user import SqlUserRepository
@@ -42,6 +45,45 @@ async def test_login_creates_the_user_and_stores_the_encrypted_github_token(
     assert credential.access_token != GITHUB_TOKEN
     assert CIPHER.decrypt(credential.access_token) == GITHUB_TOKEN
     assert (await service.authenticate(result.tokens.access_token)).id == user.id
+
+
+async def sign_in(service: AuthService) -> str:
+    """A full sign-in; returns the access token."""
+    login = service.start_login("/")
+    return (
+        await service.complete_login(state_cookie=login.state_cookie, code=VALID_CODE, error=None)
+    ).tokens.access_token
+
+
+async def test_a_new_supabase_id_for_a_known_github_account_relinks_the_user(
+    service: AuthService, session: AsyncSession, supabase: FakeSupabaseClient
+) -> None:
+    original = await service.authenticate(await sign_in(service))
+
+    # The Supabase user was deleted; the same GitHub account signs in again under a new Supabase id.
+    supabase.auth_user_id = uuid4()
+    assert (await service.authenticate(await sign_in(service))).id == original.id
+
+
+class RacingUsers(SqlUserRepository):
+    """Misses existing users, as if a concurrent sign-in inserted the row after we looked."""
+
+    async def get_by_auth_user_id(self, auth_user_id: UUID) -> User | None:
+        return None
+
+    async def get_by_github_id(self, github_id: int) -> User | None:
+        return None
+
+
+async def test_a_sign_in_that_loses_a_race_is_a_login_error(service: AuthService, session: AsyncSession) -> None:
+    await sign_in(service)
+    service._users = RacingUsers(session)
+
+    with pytest.raises(LoginError) as exc:
+        await service.complete_login(
+            state_cookie=service.start_login("/projects").state_cookie, code=VALID_CODE, error=None
+        )
+    assert (exc.value.code, exc.value.return_to) == ("conflict", "/projects")
 
 
 async def test_start_login_sanitizes_return_to(service: AuthService) -> None:

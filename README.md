@@ -23,7 +23,7 @@ via `get_postgres_engine`.
 - Pool: `DB_POOL_SIZE` kept open + `DB_MAX_OVERFLOW` extra under load, `pool_pre_ping` (a connection the pooler
   dropped is replaced, not handed to a request), recycled every `DB_POOL_RECYCLE` seconds.
 - Total connections = uvicorn workers x (pool size + overflow). Keep it under your Supabase plan's pooler limit.
-- Supabase session mode (port 5432) works as is. For transaction mode (port 6543) set `DB_TRANSACTION_POOLER=true`,
+- Supabase session mode (port 5432) works as is and is the recommended setup. For transaction mode (port 6543) set `DB_TRANSACTION_POOLER=true`,
   which turns off asyncpg's prepared statement cache.
 
 ### Sign-in (Supabase Auth + GitHub)
