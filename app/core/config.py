@@ -99,7 +99,16 @@ class Settings(DatabaseSettings):
     # How long the browser keeps the refresh token cookie. Supabase decides when the token itself expires.
     refresh_token_ttl_days: int = 30
 
-    @field_validator("app_url", "supabase_url")
+    # The model behind "Edit with AI": any OpenAI-compatible chat completions API. The default is a local
+    # OmniRoute (`OMNIROUTE_SERVER_HOST=127.0.0.1 omniroute serve`), which needs no key.
+    ai_base_url: str = "http://localhost:20128/v1"
+    ai_api_key: SecretStr | None = None
+    ai_model: str = "auto"
+    ai_timeout_seconds: float = Field(default=90, gt=0)
+    # Adds what the model was given to AI edit responses. Never turn it on in production.
+    ai_debug: bool = False
+
+    @field_validator("app_url", "supabase_url", "ai_base_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")

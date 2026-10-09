@@ -6,6 +6,7 @@ from app.clients.supabase import SupabaseRejectedError
 from app.core.database import utc_now
 from app.core.security import InvalidTokenError, generate_token, pkce_challenge
 from app.schemas.auth import AccessTokenClaims
+from app.schemas.chat import ChatMessage
 from app.schemas.github import GithubUser
 from app.schemas.supabase import SupabaseSession, SupabaseUser
 
@@ -81,3 +82,17 @@ class FakeGithubClient:
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
         return self.user
+
+
+class FakeModelClient:
+    """Answers with scripted replies, in order, and records the messages it was sent."""
+
+    name = "fake-model"
+
+    def __init__(self, *replies: str) -> None:
+        self.replies = list(replies)
+        self.calls: list[list[ChatMessage]] = []
+
+    async def complete(self, messages: list[ChatMessage]) -> str:
+        self.calls.append(list(messages))
+        return self.replies.pop(0)
