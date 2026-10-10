@@ -112,14 +112,17 @@ edits the SPA applies) or `{tier: 2, reason}` (the change needs a deeper edit, w
 
 ## Workspace sync
 
-Signed-in users' builder sessions (chat, site draft, AI history) are saved to a private `makable-workspace` repo on
-their GitHub account, with their own token: `projects/<projectId>/session.json`, one commit per save.
+Signed-in users' builder sessions are saved to a private `makable-workspace` repo on their GitHub account, with their
+own token. Each site is a folder, `projects/<projectId>/`, split into files so a save only writes what changed:
+`state.json`, `messages/NNNN.json` (chat chunks), `ai-history/<template>.json` and `files/<template>/<path>`. Each save
+is one commit.
 
 | Endpoint | |
 |---|---|
-| `GET /api/v1/workspace/sessions/latest` | the newest saved session (`{snapshot, sha}`), or 404 `workspace_session_not_found` |
-| `GET /api/v1/workspace/sessions/{projectId}` | one site's saved session |
-| `PUT /api/v1/workspace/sessions/{projectId}` | `{snapshot, baseSha}`: saves it, creating the repo on first use. 409 `workspace_conflict` when the file changed since `baseSha` |
+| `PUT /api/v1/workspace/sessions/{projectId}` | `{baseSha, state, parts, deletes}`: writes the changed files and the state as one commit, creating the repo on first use. 409 `workspace_conflict` when the state changed since `baseSha` |
+| `GET /api/v1/workspace/sessions/latest` | the newest saved state (`{state, sha}`), or 404 `workspace_session_not_found` |
+| `GET /api/v1/workspace/sessions/{projectId}` | one site's saved state |
+| `GET /api/v1/workspace/sessions/{projectId}/parts/{path}` | one file of a saved session |
 
 makable never writes to a `makable-workspace` repo it didn't create (no marker file) or one that's public.
 

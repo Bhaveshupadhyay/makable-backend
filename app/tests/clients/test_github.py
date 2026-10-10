@@ -16,6 +16,7 @@ from app.clients.github import (
     GithubUnauthorizedError,
     HttpGithubClient,
 )
+from app.schemas.github import GithubBranchHead, GithubTreeChange
 
 REPO = "octocat/makable-workspace"
 
@@ -86,7 +87,14 @@ async def test_create_private_repo_and_an_existing_name() -> None:
         bodies.append(json.loads(request.content))
         if len(bodies) > 1:
             return httpx.Response(422)
-        repo = {"id": 1, "name": "makable-workspace", "full_name": REPO, "private": True, "html_url": "https://x"}
+        repo = {
+            "id": 1,
+            "name": "makable-workspace",
+            "full_name": REPO,
+            "private": True,
+            "html_url": "https://x",
+            "default_branch": "main",
+        }
         return httpx.Response(201, json=repo)
 
     github = client(handler)
@@ -113,3 +121,47 @@ async def test_rate_limits_carry_githubs_wait(headers: dict[str, str], reset_in:
         await github.put_file("tok", REPO, "a.json", "{}", message="m", sha=None)
     assert abs(limited.value.retry_after - expected) <= 2
     assert limited.value.details == {"retryAfter": limited.value.retry_after}
+
+
+async def test_commit_changes_writes_one_tree_and_commit_then_moves_the_branch() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/git/trees"):
+            return httpx.Response(201, json={"sha": "t2"})
+        if request.url.path.endswith("/git/commits"):
+            return httpx.Response(201, json={"sha": "c2"})
+        return httpx.Response(200, json={"object": {"sha": "c2"}})
+
+    head = GithubBranchHead(commit_sha="c1", tree_sha="t1")
+    changes = [GithubTreeChange(path="a.json", content="{}"), GithubTreeChange(path="old.css", content=None)]
+    sha = await client(handler).commit_changes("tok", REPO, "main", head, changes, message="Save")
+
+    assert sha == "c2"
+    tree, commit, ref = (json.loads(r.content) for r in seen)
+    assert tree == {
+        "base_tree": "t1",
+        "tree": [
+            {"path": "a.json", "mode": "100644", "type": "blob", "content": "{}"},
+            {"path": "old.css", "mode": "100644", "type": "blob", "sha": None},
+        ],
+    }
+    assert commit == {"message": "Save", "tree": "t2", "parents": ["c1"]}
+    assert seen[2].method == "PATCH" and seen[2].url.path.endswith("/git/refs/heads/main")
+    assert ref == {"sha": "c2", "force": False}
+
+
+async def test_a_branch_that_moved_is_a_conflict_and_the_head_is_read_in_one_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/branches/main"):
+            return httpx.Response(200, json={"commit": {"sha": "c1", "commit": {"tree": {"sha": "t1"}}}})
+        if request.method == "PATCH":
+            return httpx.Response(422, json={"message": "Update is not a fast forward"})
+        return httpx.Response(201, json={"sha": "x"})
+
+    github = client(handler)
+    head = await github.get_branch_head("tok", REPO, "main")
+    assert head == GithubBranchHead(commit_sha="c1", tree_sha="t1")
+    with pytest.raises(GithubConflictError):
+        await github.commit_changes("tok", REPO, "main", head, [], message="m")

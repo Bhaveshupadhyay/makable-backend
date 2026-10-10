@@ -11,7 +11,14 @@ from fastapi import status
 from pydantic import BaseModel
 
 from app.core.exceptions import ExternalServiceError
-from app.schemas.github import GithubDirEntry, GithubFile, GithubRepo, GithubUser
+from app.schemas.github import (
+    GithubBranchHead,
+    GithubDirEntry,
+    GithubFile,
+    GithubRepo,
+    GithubTreeChange,
+    GithubUser,
+)
 
 API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
@@ -75,6 +82,19 @@ class GithubClient(Protocol):
 
     async def put_file(
         self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
+    ) -> str: ...
+
+    async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead: ...
+
+    async def commit_changes(
+        self,
+        access_token: str,
+        full_name: str,
+        branch: str,
+        head: GithubBranchHead,
+        changes: list[GithubTreeChange],
+        *,
+        message: str,
     ) -> str: ...
 
 
@@ -183,6 +203,68 @@ class HttpGithubClient:
         if res.status_code == status.HTTP_404_NOT_FOUND:
             raise GithubNotFoundError()
         return str(_json(res, "writing the file")["content"]["sha"])
+
+    async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead:
+        """The commit a branch points to, and its tree.
+
+        Raises:
+            GithubNotFoundError: The repository or branch doesn't exist (yet).
+            GithubError: The request failed.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/branches/{quote(branch)}", access_token)
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            raise GithubNotFoundError()
+        data = _json(res, "reading the branch")
+        try:
+            return GithubBranchHead(commit_sha=data["commit"]["sha"], tree_sha=data["commit"]["commit"]["tree"]["sha"])
+        except (KeyError, TypeError) as err:
+            raise GithubError("reading the branch failed: unexpected response") from err
+
+    async def commit_changes(
+        self,
+        access_token: str,
+        full_name: str,
+        branch: str,
+        head: GithubBranchHead,
+        changes: list[GithubTreeChange],
+        *,
+        message: str,
+    ) -> str:
+        """Writes and deletes several files as one commit on top of `head`, then moves the branch to it. Nothing
+        is visible until the branch moves, so a failure part-way leaves the repo unchanged. Returns the commit SHA.
+
+        Raises:
+            GithubConflictError: The branch moved since `head` was read (another save got in first).
+            GithubError: A request failed.
+        """
+        tree = [
+            {"path": c.path, "mode": "100644", "type": "blob", "content": c.content}
+            if c.content is not None
+            else {"path": c.path, "mode": "100644", "type": "blob", "sha": None}
+            for c in changes
+        ]
+        res = await self._request(
+            "POST", f"/repos/{full_name}/git/trees", access_token, json={"base_tree": head.tree_sha, "tree": tree}
+        )
+        tree_sha = str(_json(res, "writing the files")["sha"])
+        res = await self._request(
+            "POST",
+            f"/repos/{full_name}/git/commits",
+            access_token,
+            json={"message": message, "tree": tree_sha, "parents": [head.commit_sha]},
+        )
+        commit_sha = str(_json(res, "creating the commit")["sha"])
+        res = await self._request(
+            "PATCH",
+            f"/repos/{full_name}/git/refs/heads/{quote(branch)}",
+            access_token,
+            json={"sha": commit_sha, "force": False},
+        )
+        # "Update is not a fast forward": the branch moved after `head` was read.
+        if res.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
+            raise GithubConflictError()
+        _json(res, "moving the branch")
+        return commit_sha
 
     async def _request(
         self, method: str, path: str, access_token: str, *, json: dict[str, Any] | None = None

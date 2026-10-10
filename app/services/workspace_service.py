@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -13,21 +14,27 @@ from app.constants.workspace import (
     MARKER_CONTENT,
     MARKER_PATH,
     MAX_PROJECTS,
-    MAX_SESSION_BYTES,
     NEW_REPO_RETRY_DELAYS,
     PROJECTS_DIR,
+    STATE_FILE,
     VERIFIED_REPO_TTL,
     WORKSPACE_DESCRIPTION,
     WORKSPACE_REPO,
-    session_path,
+    project_dir,
 )
 from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.security import TokenCipher
 from app.repositories.github_credential import GithubCredentialRepository
-from app.schemas.github import GithubRepo
-from app.schemas.session import SessionSnapshot
+from app.schemas.github import GithubFile, GithubRepo, GithubTreeChange
 from app.schemas.user import UserRead
-from app.schemas.workspace import WorkspaceSaved, WorkspaceSession, WorkspaceSessionWrite
+from app.schemas.workspace import (
+    WorkspacePartRead,
+    WorkspaceSave,
+    WorkspaceSaved,
+    WorkspaceState,
+    WorkspaceStateRead,
+    check_part_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +71,9 @@ class WorkspaceSessionNotFoundError(NotFoundError):
     message = "No saved session on GitHub yet"
 
 
-class WorkspaceSessionTooLargeError(AppError):
-    status_code = status.HTTP_413_CONTENT_TOO_LARGE
-    code = "workspace_session_too_large"
-    message = "This session is too large to save to GitHub."
+class WorkspacePartNotFoundError(NotFoundError):
+    code = "workspace_part_not_found"
+    message = "That part of the session isn't saved"
 
 
 class WorkspaceInvalidError(AppError):
@@ -113,8 +119,9 @@ VERIFIED_REPOS = VerifiedRepos()
 
 
 class WorkspaceService:
-    """Keeps the user's builder sessions in a private `makable-workspace` repo on their GitHub account, one file
-    per site (`projects/<projectId>/session.json`). The browser keeps the working copy; nothing is stored here.
+    """Keeps the user's builder sessions in a private `makable-workspace` repo on their GitHub account, one folder
+    per site (`projects/<projectId>/`). A session is split into files (see `constants/workspace.py`), so a save
+    writes only what changed, as one commit. The browser keeps the working copy; nothing is stored here.
 
     makable only writes to a workspace repo it created (it has the marker file) and that is private.
     """
@@ -136,8 +143,8 @@ class WorkspaceService:
         self._retry_delays = retry_delays
         self._verified = verified
 
-    async def get_session(self, user: UserRead, project_id: UUID) -> WorkspaceSession:
-        """The session saved for a site.
+    async def get_state(self, user: UserRead, project_id: UUID) -> WorkspaceStateRead:
+        """A site's saved state (its chat chunks, AI history and files are read with `get_part`).
 
         Raises:
             WorkspaceSessionNotFoundError: Nothing is saved for that site (or there's no workspace repo yet).
@@ -148,13 +155,13 @@ class WorkspaceService:
         """
         token = await self._token(user)
         repo = await self._workspace(token, user)
-        session = await self._read(token, repo, session_path(str(project_id))) if repo else None
-        if session is None:
+        state = await self._read_state(token, repo, str(project_id)) if repo else None
+        if state is None:
             raise WorkspaceSessionNotFoundError()
-        return session
+        return state
 
-    async def get_latest_session(self, user: UserRead) -> WorkspaceSession:
-        """The most recently saved session of any of the user's sites, to restore on a new device.
+    async def get_latest_state(self, user: UserRead) -> WorkspaceStateRead:
+        """The most recently saved state of any of the user's sites, to restore on a new device.
 
         Raises:
             WorkspaceSessionNotFoundError: Nothing is saved yet.
@@ -169,52 +176,84 @@ class WorkspaceService:
             raise WorkspaceSessionNotFoundError()
         entries = await self._github.list_dir(token, repo.full_name, PROJECTS_DIR)
         folders = [e.name for e in entries if e.type == "dir"][:MAX_PROJECTS]
-        sessions = await asyncio.gather(*(self._read(token, repo, session_path(f)) for f in folders))
-        found = [s for s in sessions if s is not None]
+        states = await asyncio.gather(*(self._read_state(token, repo, folder) for folder in folders))
+        found = [s for s in states if s is not None]
         if not found:
             raise WorkspaceSessionNotFoundError()
-        return max(found, key=lambda s: s.snapshot.exported_at)
+        # The SPA writes `savedAt` with `toISOString()` (always UTC, same format), so strings sort by time.
+        return max(found, key=lambda s: s.state.saved_at)
 
-    async def save_session(self, user: UserRead, project_id: UUID, write: WorkspaceSessionWrite) -> WorkspaceSaved:
-        """Saves a site's session as one commit, creating the private workspace repo on first use.
+    async def get_part(self, user: UserRead, project_id: UUID, path: str) -> WorkspacePartRead:
+        """One file of a saved session: a message chunk, the AI history or an AI-edited file.
 
         Raises:
-            WorkspaceInvalidError: The session is for another site than `project_id`.
-            WorkspaceSessionTooLargeError: The session is over the size limit.
-            WorkspaceConflictError: The saved file changed since `write.base_sha` (another device saved).
+            WorkspaceInvalidError: `path` isn't a session file.
+            WorkspacePartNotFoundError: No such file is saved.
+            GithubNotConnectedError: No usable GitHub token.
+            GithubError: GitHub failed.
+        """
+        try:
+            path = check_part_path(path)
+        except ValueError:
+            raise WorkspaceInvalidError("Not a session file") from None
+        token = await self._token(user)
+        repo = await self._workspace(token, user)
+        full_path = f"{project_dir(str(project_id))}/{path}"
+        file = await self._github.get_file(token, repo.full_name, full_path) if repo else None
+        if file is None:
+            raise WorkspacePartNotFoundError()
+        return WorkspacePartRead(path=path, content=file.content)
+
+    async def save(self, user: UserRead, project_id: UUID, save: WorkspaceSave) -> WorkspaceSaved:
+        """Saves the changed files of a site's session and its new state as one commit, creating the private
+        workspace repo on first use. Nothing is written if the state changed on GitHub since `save.base_sha`.
+
+        Raises:
+            WorkspaceInvalidError: The state is for another site than `project_id`.
+            WorkspaceConflictError: Another device saved this site since `save.base_sha`.
             WorkspaceRepoTakenError: The repo exists but makable didn't create it.
             WorkspaceRepoPublicError: The repo is public.
             GithubNotConnectedError: No usable GitHub token.
             GithubError: GitHub failed.
         """
-        if write.snapshot.project_id != project_id:
+        if save.state is not None and save.state.project_id != project_id:
             raise WorkspaceInvalidError()
-        content = _serialize(write.snapshot)
-        if len(content.encode()) > MAX_SESSION_BYTES:
-            raise WorkspaceSessionTooLargeError()
+        folder = project_dir(str(project_id))
+        state_content = _serialize(save.state) if save.state else None
+        changes = [
+            *(GithubTreeChange(path=f"{folder}/{p.path}", content=p.content) for p in save.parts),
+            *(GithubTreeChange(path=f"{folder}/{p}", content=None) for p in save.deletes),
+            *([GithubTreeChange(path=f"{folder}/{STATE_FILE}", content=state_content)] if state_content else []),
+        ]
+        if not changes:
+            raise WorkspaceInvalidError("Nothing to save")
+        message = f"Save session ({len(save.parts)} changed, {len(save.deletes)} removed)"
         token = await self._token(user)
-        path = session_path(str(project_id))
-        message = f"Save session ({len(write.snapshot.conversation.messages)} messages)"
         repo = await self._workspace(token, user) or await self._create_workspace(token, user)
-        try:
+        # Two tries: the branch can move between reading it and committing (another site's save got in first).
+        for attempt in range(2):
             try:
-                sha = await self._github.put_file(
-                    token, repo.full_name, path, content, message=message, sha=write.base_sha
-                )
+                head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
             except GithubNotFoundError:
-                # The repo checked earlier is gone (deleted or renamed on GitHub): check again, once.
+                # The repo checked earlier is gone (deleted or renamed on GitHub): check it again.
                 self._verified.discard(user)
                 repo = await self._workspace(token, user) or await self._create_workspace(token, user)
-                sha = await self._github.put_file(
-                    token, repo.full_name, path, content, message=message, sha=write.base_sha
+                head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
+            current = await self._github.get_file(token, repo.full_name, f"{folder}/{STATE_FILE}")
+            if (current.sha if current else None) != save.base_sha:
+                raise WorkspaceConflictError(details=_conflict_details(current))
+            try:
+                await self._github.commit_changes(
+                    token, repo.full_name, repo.default_branch, head, changes, message=message
                 )
-        except GithubConflictError:
-            current = await self._read(token, repo, path)
-            raise WorkspaceConflictError(
-                details={"sha": current.sha, "exportedAt": current.snapshot.exported_at} if current else None
-            ) from None
+                break
+            except GithubConflictError:
+                if attempt == 1:
+                    raise WorkspaceConflictError() from None
         logger.info("workspace session saved", extra={"user_id": str(user.id), "project_id": str(project_id)})
-        return WorkspaceSaved(sha=sha, repo_url=repo.html_url)
+        return WorkspaceSaved(
+            sha=git_blob_sha(state_content) if state_content else save.base_sha, repo_url=repo.html_url
+        )
 
     async def _token(self, user: UserRead) -> str:
         credential = await self._credentials.get(user.id)
@@ -262,19 +301,36 @@ class WorkspaceService:
         self._verified.add(user, repo)
         return repo
 
-    async def _read(self, token: str, repo: GithubRepo, path: str) -> WorkspaceSession | None:
-        file = await self._github.get_file(token, repo.full_name, path)
-        if file is None:
-            return None
-        try:
-            snapshot = SessionSnapshot.model_validate(json.loads(file.content))
-        except ValueError, ValidationError:
-            # Edited by hand into something invalid: treat it as missing rather than failing every load.
-            logger.warning("unreadable workspace session", extra={"path": path})
-            return None
-        return WorkspaceSession(snapshot=snapshot, sha=file.sha)
+    async def _read_state(self, token: str, repo: GithubRepo, project_id: str) -> WorkspaceStateRead | None:
+        file = await self._github.get_file(token, repo.full_name, f"{project_dir(project_id)}/{STATE_FILE}")
+        state = _parse_state(file)
+        return WorkspaceStateRead(state=state, sha=file.sha) if file and state else None
 
 
-def _serialize(snapshot: SessionSnapshot) -> str:
+def _parse_state(file: GithubFile | None) -> WorkspaceState | None:
+    if file is None:
+        return None
+    try:
+        return WorkspaceState.model_validate(json.loads(file.content))
+    except ValueError, ValidationError:
+        # Edited by hand into something invalid: treat it as missing rather than failing every load.
+        logger.warning("unreadable workspace state")
+        return None
+
+
+def _conflict_details(current: GithubFile | None) -> dict[str, str] | None:
+    state = _parse_state(current)
+    if current is None:
+        return None
+    return {"sha": current.sha, **({"savedAt": state.saved_at} if state else {})}
+
+
+def _serialize(state: WorkspaceState) -> str:
     # exclude_unset keeps explicit nulls (a draft with no portfolio yet) and leaves out fields the SPA omitted.
-    return json.dumps(snapshot.model_dump(mode="json", by_alias=True, exclude_unset=True), indent=2) + "\n"
+    return json.dumps(state.model_dump(mode="json", by_alias=True, exclude_unset=True), indent=2) + "\n"
+
+
+def git_blob_sha(content: str) -> str:
+    """The SHA git (and so GitHub) gives a file with this content: what the next save must send back."""
+    data = content.encode()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()

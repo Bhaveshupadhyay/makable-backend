@@ -9,8 +9,16 @@ from app.core.database import utc_now
 from app.core.security import InvalidTokenError, generate_token, pkce_challenge
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
-from app.schemas.github import GithubDirEntry, GithubFile, GithubRepo, GithubUser
+from app.schemas.github import (
+    GithubBranchHead,
+    GithubDirEntry,
+    GithubFile,
+    GithubRepo,
+    GithubTreeChange,
+    GithubUser,
+)
 from app.schemas.supabase import SupabaseSession, SupabaseUser
+from app.services.workspace_service import git_blob_sha
 
 VALID_CODE = "good-code"
 GITHUB_TOKEN = "gho_access"
@@ -75,8 +83,8 @@ class FakeSupabaseClient:
 
 
 class FakeGithubClient:
-    """An in-memory GitHub: users' repos with files and blob SHAs. Like GitHub, a file write must send the SHA
-    of the version it replaces, or it's refused as a conflict."""
+    """An in-memory GitHub: users' repos with a branch, commits and files. Like GitHub, a file write must send the
+    SHA of the version it replaces, and a commit must be based on the branch's current head."""
 
     def __init__(self) -> None:
         self.user = GithubUser(
@@ -84,14 +92,20 @@ class FakeGithubClient:
         )
         self.tokens_seen: list[str] = []
         self.repos: dict[str, GithubRepo] = {}
+        # The files on each repo's branch, its head commit, and every tree by SHA.
         self.files: dict[str, dict[str, GithubFile]] = {}
-        # Writes to a repo created this many writes ago fail with 404, like a repo GitHub is still setting up.
+        self.heads: dict[str, GithubBranchHead] = {}
+        self.trees: dict[str, dict[str, GithubFile]] = {}
+        # Writes to a new repo fail with 404 this many times, like a repo GitHub is still setting up.
         self.not_ready_writes = 0
-        self.writes: list[tuple[str, str, str]] = []
+        # Commits: (repo, message, changed paths).
+        self.commits: list[tuple[str, str, list[str]]] = []
         # How often the workspace repo was looked up (the check a cache saves).
         self.repo_lookups = 0
-        # Raised by the next file write, e.g. a rate limit.
+        # Raised by the next write, e.g. a rate limit.
         self.fail_next_write: Exception | None = None
+        # The branch moves this many times just before a commit lands (another save got in first).
+        self.races = 0
 
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
@@ -103,44 +117,61 @@ class FakeGithubClient:
         return self.repos.get(full_name)
 
     async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo:
-        full_name = f"{self.user.login}/{name}"
-        if full_name in self.repos:
+        if f"{self.user.login}/{name}" in self.repos:
             raise GithubRepoExistsError()
-        return self.add_repo(name, private=True)
+        return self.add_repo(name, private=True, files={"README.md": f"# {name}\n"})
 
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
         return self.files.get(full_name, {}).get(path)
 
     async def list_dir(self, access_token: str, full_name: str, path: str) -> list[GithubDirEntry]:
         prefix = f"{path}/"
-        names = sorted({p[len(prefix) :].split("/")[0] for p in self.files.get(full_name, {}) if p.startswith(prefix)})
-        return [
-            GithubDirEntry(
-                name=n,
-                path=prefix + n,
-                type="file" if f"{prefix}{n}" in self.files[full_name] else "dir",
-            )
-            for n in names
-        ]
+        files = self.files.get(full_name, {})
+        names = sorted({p[len(prefix) :].split("/")[0] for p in files if p.startswith(prefix)})
+        return [GithubDirEntry(name=n, path=prefix + n, type="file" if prefix + n in files else "dir") for n in names]
 
     async def put_file(
         self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
     ) -> str:
-        if self.fail_next_write is not None:
-            error, self.fail_next_write = self.fail_next_write, None
-            raise error
-        if full_name not in self.repos:
-            raise GithubNotFoundError()
+        self._before_write(full_name)
         if self.not_ready_writes:
             self.not_ready_writes -= 1
             raise GithubNotFoundError()
         current = self.files[full_name].get(path)
         if (current.sha if current else None) != sha:
             raise GithubConflictError()
-        new_sha = hashlib.sha1(f"blob {content}".encode(), usedforsecurity=False).hexdigest()
-        self.files[full_name][path] = GithubFile(content=content, sha=new_sha)
-        self.writes.append((full_name, path, message))
-        return new_sha
+        self._commit(full_name, message, {**self.files[full_name], path: _file(content)}, [path])
+        return self.files[full_name][path].sha
+
+    async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead:
+        if full_name not in self.repos or branch != self.repos[full_name].default_branch:
+            raise GithubNotFoundError()
+        return self.heads[full_name]
+
+    async def commit_changes(
+        self,
+        access_token: str,
+        full_name: str,
+        branch: str,
+        head: GithubBranchHead,
+        changes: list[GithubTreeChange],
+        *,
+        message: str,
+    ) -> str:
+        self._before_write(full_name)
+        if self.races:
+            self.races -= 1
+            self._commit(full_name, "Another save", dict(self.files[full_name]), [])
+        if head != self.heads[full_name]:
+            raise GithubConflictError()
+        files = dict(self.trees[head.tree_sha])
+        for change in changes:
+            if change.content is None:
+                files.pop(change.path, None)
+            else:
+                files[change.path] = _file(change.content)
+        self._commit(full_name, message, files, [c.path for c in changes])
+        return self.heads[full_name].commit_sha
 
     def add_repo(self, name: str, *, private: bool, files: dict[str, str] | None = None) -> GithubRepo:
         """Sets up a repo directly, as if the user made it on GitHub."""
@@ -151,13 +182,35 @@ class FakeGithubClient:
             full_name=full_name,
             private=private,
             html_url=f"https://github.com/{full_name}",
+            default_branch="main",
         )
         self.repos[full_name] = repo
-        self.files[full_name] = {
-            path: GithubFile(content=text, sha=hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest())
-            for path, text in (files or {}).items()
-        }
+        self._commit(full_name, "Initial commit", {p: _file(t) for p, t in (files or {}).items()}, [], record=False)
         return repo
+
+    def _before_write(self, full_name: str) -> None:
+        if self.fail_next_write is not None:
+            error, self.fail_next_write = self.fail_next_write, None
+            raise error
+        if full_name not in self.repos:
+            raise GithubNotFoundError()
+
+    def _commit(
+        self, full_name: str, message: str, files: dict[str, GithubFile], paths: list[str], *, record: bool = True
+    ) -> None:
+        tree = hashlib.sha1(repr(sorted((p, f.sha) for p, f in files.items())).encode(), usedforsecurity=False)
+        parent = self.heads[full_name].commit_sha if full_name in self.heads else ""
+        commit = hashlib.sha1(f"{parent}{tree.hexdigest()}{message}".encode(), usedforsecurity=False).hexdigest()
+        self.trees[tree.hexdigest()] = files
+        self.heads[full_name] = GithubBranchHead(commit_sha=commit, tree_sha=tree.hexdigest())
+        self.files[full_name] = files
+        if record:
+            self.commits.append((full_name, message, paths))
+
+
+def _file(content: str) -> GithubFile:
+    """A file with the SHA git gives that content."""
+    return GithubFile(content=content, sha=git_blob_sha(content))
 
 
 class FakeModelClient:
