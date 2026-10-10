@@ -40,8 +40,8 @@ async def get_session(
 async def get_session_part(
     project_id: UUID, path: str, user: CurrentUserDep, workspace: WorkspaceServiceDep
 ) -> ApiResponse[WorkspacePartRead]:
-    """A message chunk (`messages/0001.json`), the AI history (`ai-history.json`) or an AI-edited file
-    (`files/<template>/<path>`), as saved."""
+    """A message chunk (`messages/0001.json`), a template's AI history (`ai-history/<template>.json`) or an
+    AI-edited file (`files/<template>/<path>`), as saved."""
     return ApiResponse(data=await workspace.get_part(user, project_id, path))
 
 

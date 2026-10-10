@@ -24,6 +24,7 @@ class GithubRepo(BaseModel):
     private: bool
     html_url: str
     default_branch: str
+    description: str | None = None
 
 
 class GithubFile(BaseModel):

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import status
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from app.clients.github import GithubClient, GithubConflictError, GithubNotFoundError, GithubRepoExistsError
 from app.constants.workspace import (
+    LATEST_FILE,
     MARKER_CONTENT,
     MARKER_PATH,
     MAX_PROJECTS,
@@ -174,17 +176,21 @@ class WorkspaceService:
         repo = await self._workspace(token, user)
         if repo is None:
             raise WorkspaceSessionNotFoundError()
+        latest = _latest_project(await self._github.get_file(token, repo.full_name, LATEST_FILE))
+        state = await self._read_state(token, repo, latest) if latest else None
+        if state is not None:
+            return state
+        # No pointer (or it was edited by hand): compare the saved states themselves.
         entries = await self._github.list_dir(token, repo.full_name, PROJECTS_DIR)
         folders = [e.name for e in entries if e.type == "dir"][:MAX_PROJECTS]
         states = await asyncio.gather(*(self._read_state(token, repo, folder) for folder in folders))
         found = [s for s in states if s is not None]
         if not found:
             raise WorkspaceSessionNotFoundError()
-        # The SPA writes `savedAt` with `toISOString()` (always UTC, same format), so strings sort by time.
-        return max(found, key=lambda s: s.state.saved_at)
+        return max(found, key=lambda s: datetime.fromisoformat(s.state.saved_at))
 
     async def get_part(self, user: UserRead, project_id: UUID, path: str) -> WorkspacePartRead:
-        """One file of a saved session: a message chunk, the AI history or an AI-edited file.
+        """One file of a saved session: a message chunk, a template's AI history or an AI-edited file.
 
         Raises:
             WorkspaceInvalidError: `path` isn't a session file.
@@ -223,8 +229,13 @@ class WorkspaceService:
         changes = [
             *(GithubTreeChange(path=f"{folder}/{p.path}", content=p.content) for p in save.parts),
             *(GithubTreeChange(path=f"{folder}/{p}", content=None) for p in save.deletes),
-            *([GithubTreeChange(path=f"{folder}/{STATE_FILE}", content=state_content)] if state_content else []),
         ]
+        if save.state is not None and state_content is not None:
+            latest = {"projectId": str(project_id), "savedAt": save.state.saved_at}
+            changes += [
+                GithubTreeChange(path=f"{folder}/{STATE_FILE}", content=state_content),
+                GithubTreeChange(path=LATEST_FILE, content=json.dumps(latest, indent=2) + "\n"),
+            ]
         if not changes:
             raise WorkspaceInvalidError("Nothing to save")
         message = f"Save session ({len(save.parts)} changed, {len(save.deletes)} removed)"
@@ -273,9 +284,20 @@ class WorkspaceService:
         if not repo.private:
             raise WorkspaceRepoPublicError()
         if await self._github.get_file(token, repo.full_name, MARKER_PATH) is None:
-            raise WorkspaceRepoTakenError()
+            if not await self._unfinished_setup(token, repo):
+                raise WorkspaceRepoTakenError()
+            await self._write_marker(token, repo)
         self._verified.add(user, repo)
         return repo
+
+    async def _unfinished_setup(self, token: str, repo: GithubRepo) -> bool:
+        """Whether a repo without the marker is one makable created whose setup didn't finish (the marker write
+        failed, or another tab is still writing it): makable's description and nothing but the README GitHub
+        adds. Taking it over writes nothing a person made."""
+        if repo.description != WORKSPACE_DESCRIPTION:
+            return False
+        entries = await self._github.list_dir(token, repo.full_name, "")
+        return [e.name for e in entries] == ["README.md"]
 
     async def _create_workspace(self, token: str, user: UserRead) -> GithubRepo:
         try:
@@ -286,20 +308,29 @@ class WorkspaceService:
             if existing is None:
                 raise
             return existing
+        await self._write_marker(token, repo)
+        logger.info("workspace repo created", extra={"user_id": str(user.id)})
+        self._verified.add(user, repo)
+        return repo
+
+    async def _write_marker(self, token: str, repo: GithubRepo) -> None:
         # A new repo can take a moment to accept writes.
         for delay in (*self._retry_delays, None):
             try:
                 await self._github.put_file(
                     token, repo.full_name, MARKER_PATH, MARKER_CONTENT, message="Set up makable workspace", sha=None
                 )
-                break
+                return
+            except GithubConflictError:
+                # Written meanwhile: fine if it's makable's marker (another tab finished the setup).
+                marker = await self._github.get_file(token, repo.full_name, MARKER_PATH)
+                if marker is None or marker.content != MARKER_CONTENT:
+                    raise WorkspaceRepoTakenError() from None
+                return
             except GithubNotFoundError:
                 if delay is None:
                     raise
                 await self._sleep(delay)
-        logger.info("workspace repo created", extra={"user_id": str(user.id)})
-        self._verified.add(user, repo)
-        return repo
 
     async def _read_state(self, token: str, repo: GithubRepo, project_id: str) -> WorkspaceStateRead | None:
         file = await self._github.get_file(token, repo.full_name, f"{project_dir(project_id)}/{STATE_FILE}")
@@ -315,6 +346,15 @@ def _parse_state(file: GithubFile | None) -> WorkspaceState | None:
     except ValueError, ValidationError:
         # Edited by hand into something invalid: treat it as missing rather than failing every load.
         logger.warning("unreadable workspace state")
+        return None
+
+
+def _latest_project(file: GithubFile | None) -> str | None:
+    """The project id `LATEST_FILE` points to, if it's readable."""
+    try:
+        data = json.loads(file.content) if file else None
+        return str(UUID(data["projectId"])) if isinstance(data, dict) else None
+    except ValueError, KeyError, TypeError:
         return None
 
 

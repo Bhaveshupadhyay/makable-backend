@@ -119,13 +119,13 @@ class FakeGithubClient:
     async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo:
         if f"{self.user.login}/{name}" in self.repos:
             raise GithubRepoExistsError()
-        return self.add_repo(name, private=True, files={"README.md": f"# {name}\n"})
+        return self.add_repo(name, private=True, files={"README.md": f"# {name}\n"}, description=description)
 
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
         return self.files.get(full_name, {}).get(path)
 
     async def list_dir(self, access_token: str, full_name: str, path: str) -> list[GithubDirEntry]:
-        prefix = f"{path}/"
+        prefix = f"{path}/" if path else ""
         files = self.files.get(full_name, {})
         names = sorted({p[len(prefix) :].split("/")[0] for p in files if p.startswith(prefix)})
         return [GithubDirEntry(name=n, path=prefix + n, type="file" if prefix + n in files else "dir") for n in names]
@@ -173,7 +173,9 @@ class FakeGithubClient:
         self._commit(full_name, message, files, [c.path for c in changes])
         return self.heads[full_name].commit_sha
 
-    def add_repo(self, name: str, *, private: bool, files: dict[str, str] | None = None) -> GithubRepo:
+    def add_repo(
+        self, name: str, *, private: bool, files: dict[str, str] | None = None, description: str | None = None
+    ) -> GithubRepo:
         """Sets up a repo directly, as if the user made it on GitHub."""
         full_name = f"{self.user.login}/{name}"
         repo = GithubRepo(
@@ -183,6 +185,7 @@ class FakeGithubClient:
             private=private,
             html_url=f"https://github.com/{full_name}",
             default_branch="main",
+            description=description,
         )
         self.repos[full_name] = repo
         self._commit(full_name, "Initial commit", {p: _file(t) for p, t in (files or {}).items()}, [], record=False)

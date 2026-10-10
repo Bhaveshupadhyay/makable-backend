@@ -5,11 +5,12 @@ from uuid import UUID, uuid4
 import pytest
 from cryptography.fernet import Fernet
 
+from app.clients.github import GithubConflictError
 from app.constants.auth import Role
-from app.constants.workspace import MARKER_PATH
+from app.constants.workspace import LATEST_FILE, MARKER_CONTENT, MARKER_PATH, MAX_PROJECTS, WORKSPACE_DESCRIPTION
 from app.core.security import TokenCipher
 from app.models.github_credential import GithubCredential
-from app.schemas.github import GithubCredentialUpsert
+from app.schemas.github import GithubCredentialUpsert, GithubFile
 from app.schemas.user import UserRead
 from app.schemas.workspace import WorkspaceSave
 from app.services.workspace_service import (
@@ -90,6 +91,7 @@ async def test_the_first_save_creates_the_private_repo_and_writes_the_session_as
         f"{DIR}/ai-history/minimal.json",
         f"{DIR}/files/minimal/src/index.css",
         f"{DIR}/state.json",
+        LATEST_FILE,
     ]
 
 
@@ -116,6 +118,7 @@ async def test_later_saves_write_only_what_changed_and_remove_what_went_away() -
         f"{DIR}/messages/0002.json",
         f"{DIR}/files/minimal/src/index.css",
         f"{DIR}/state.json",
+        LATEST_FILE,
     ]
     files = github.files[REPO]
     assert f"{DIR}/messages/0001.json" in files  # untouched, still there
@@ -192,6 +195,78 @@ async def test_reads_the_newest_state_and_each_part() -> None:
         await workspace.get_part(USER, PROJECT_ID, "../../.makable-workspace.json")
     with pytest.raises(WorkspaceSessionNotFoundError):
         await workspace.get_state(USER, uuid4())
+
+
+async def test_the_newest_session_is_found_among_any_number_of_sites() -> None:
+    github = FakeGithubClient()
+    workspace = service(github)
+    ids = sorted(uuid4() for _ in range(MAX_PROJECTS + 1))
+    for i, project in enumerate(ids):
+        await workspace.save(USER, project, save(project_id=project, saved_at=f"2026-10-10T12:{i:02d}:00.000Z"))
+    # The newest site sorts last, past the folders a scan reads.
+    assert (await workspace.get_latest_state(USER)).state.project_id == ids[-1]
+
+    # Without the pointer, the states are compared as times, not as text.
+    files = {p: f for p, f in github.files[REPO].items() if not p.startswith("projects/") and p != LATEST_FILE}
+    other = UUID("11111111-2222-4333-8444-555555555555")
+    files[f"{DIR}/state.json"] = state_file(save(saved_at="2026-10-10T12:00:00.000+09:00"))
+    files[f"projects/{other}/state.json"] = state_file(save(project_id=other, saved_at="2026-10-10T04:00:00.000Z"))
+    github.files[REPO] = files
+    assert (await workspace.get_latest_state(USER)).state.project_id == other
+
+
+def state_file(body: WorkspaceSave) -> GithubFile:
+    assert body.state is not None
+    content = body.state.model_dump_json(by_alias=True, exclude_unset=True)
+    return GithubFile(content=content, sha=git_blob_sha(content))
+
+
+async def test_a_repo_whose_setup_did_not_finish_is_set_up_on_the_next_save() -> None:
+    github = FakeGithubClient()
+    # Created by makable, but the marker write failed (rate limit, network).
+    readme = {"README.md": "# makable-workspace\n"}
+    github.add_repo("makable-workspace", private=True, files=readme, description=WORKSPACE_DESCRIPTION)
+
+    await service(github).save(USER, PROJECT_ID, save())
+
+    assert github.files[REPO][MARKER_PATH].content == MARKER_CONTENT
+    assert f"{DIR}/state.json" in github.files[REPO]
+
+
+async def test_a_repo_with_makables_description_but_other_files_is_not_taken_over() -> None:
+    github = FakeGithubClient()
+    files = {"README.md": "# mine\n", "notes.md": "x"}
+    github.add_repo("makable-workspace", private=True, files=files, description=WORKSPACE_DESCRIPTION)
+    with pytest.raises(WorkspaceRepoTakenError):
+        await service(github).save(USER, PROJECT_ID, save())
+    assert github.commits == []
+
+
+class RacingSetup(FakeGithubClient):
+    """Another tab writes the marker (`marker`) just before this one does."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+
+    async def put_file(
+        self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
+    ) -> str:
+        if path == MARKER_PATH and path not in self.files[full_name]:
+            await super().put_file(access_token, full_name, path, self.marker, message=message, sha=None)
+            raise GithubConflictError()
+        return await super().put_file(access_token, full_name, path, content, message=message, sha=sha)
+
+
+async def test_a_marker_written_by_another_tab_is_accepted_only_if_it_is_makables() -> None:
+    ours = RacingSetup(MARKER_CONTENT)
+    await service(ours).save(USER, PROJECT_ID, save())
+    assert f"{DIR}/state.json" in ours.files[REPO]
+
+    other = RacingSetup('{"mine": true}')
+    with pytest.raises(WorkspaceRepoTakenError):
+        await service(other).save(USER, PROJECT_ID, save())
+    assert f"{DIR}/state.json" not in other.files[REPO]
 
 
 async def test_never_writes_to_a_repo_makable_did_not_create_or_that_is_public() -> None:

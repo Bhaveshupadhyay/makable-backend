@@ -6,6 +6,9 @@ WORKSPACE_DESCRIPTION = "Your makable chat history and site drafts. Private; man
 MARKER_PATH = ".makable-workspace.json"
 MARKER_CONTENT = '{\n  "managedBy": "makable",\n  "version": 1\n}\n'
 PROJECTS_DIR = "projects"
+# Which site was saved last ({"projectId", "savedAt"}), rewritten in the same commit as every state, so a new
+# device restores the newest session in two reads however many sites there are.
+LATEST_FILE = "latest.json"
 
 
 def project_dir(project_id: str) -> str:
@@ -34,7 +37,7 @@ MAX_FILES_PER_TEMPLATE = 500
 # The same caps as the SPA's `@makable/shared` `session.ts`.
 MAX_MESSAGE_CHARS = 10_000
 MAX_STORED_TURNS = 50
-# States read when looking for the newest session (one per site).
+# States read when looking for the newest session without `LATEST_FILE` (one per site).
 MAX_PROJECTS = 20
 # How long (seconds) a checked workspace repo (exists, private, has the marker) is trusted before checking again.
 # Saves in between take one request instead of three. A failed write throws the check away early.

@@ -115,7 +115,7 @@ edits the SPA applies) or `{tier: 2, reason}` (the change needs a deeper edit, w
 Signed-in users' builder sessions are saved to a private `makable-workspace` repo on their GitHub account, with their
 own token. Each site is a folder, `projects/<projectId>/`, split into files so a save only writes what changed:
 `state.json`, `messages/NNNN.json` (chat chunks), `ai-history/<template>.json` and `files/<template>/<path>`. Each save
-is one commit.
+is one commit. `latest.json` at the root names the site saved last.
 
 | Endpoint | |
 |---|---|
