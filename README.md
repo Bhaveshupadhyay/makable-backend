@@ -126,6 +126,13 @@ is one commit. `latest.json` at the root names the site saved last.
 
 makable never writes to a `makable-workspace` repo it didn't create (no marker file) or one that's public.
 
+## Request limits
+
+Bodies are read up to 64 KB (2 MB for AI edits and workspace saves) and refused with 413 past that, before
+anything is parsed. Each worker allows 50 AI edits and 100 workspace requests at once (more get 503 with
+`Retry-After`), one save at a time per user (bursts of 20, then one per 15 s; more get 429), and 200 outgoing
+connections with a 5 s wait for a free one.
+
 ## Checks
 
 ```sh

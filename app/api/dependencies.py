@@ -5,7 +5,7 @@ settings (`get_settings`). Everything else is built per request. Tests replace a
 `app.dependency_overrides`.
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from typing import Annotated
 
@@ -17,10 +17,17 @@ from app.api.cookies import AuthCookies
 from app.clients.github import GithubClient, HttpGithubClient
 from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
+from app.constants.api import (
+    MAX_CONCURRENT_AI_EDITS,
+    MAX_CONCURRENT_WORKSPACE_REQUESTS,
+    WORKSPACE_SAVE_BURST,
+    WORKSPACE_SAVE_EVERY_SECONDS,
+)
 from app.constants.auth import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, Role
 from app.core.client import get_db_session, get_http_client
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ForbiddenError
+from app.core.limits import ConcurrencyLimit, PerKeyLimit
 from app.core.security import PayloadSigner, TokenCipher
 from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
 from app.repositories.health import HealthRepository, SqlHealthRepository
@@ -174,3 +181,41 @@ def require_roles(*roles: Role) -> Callable[[UserRead], Awaitable[UserRead]]:
         return user
 
     return check
+
+
+# --- Limits (per worker; see `core/limits.py`) ---
+
+AI_EDIT_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS)
+WORKSPACE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS)
+WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS)
+
+
+async def ai_edit_slot() -> AsyncIterator[None]:
+    """A slot for an AI edit, held until the response is done.
+
+    Raises:
+        ServiceBusyError: This worker has as many AI edits in progress as it allows.
+    """
+    async with AI_EDIT_SLOTS.slot():
+        yield
+
+
+async def workspace_slot() -> AsyncIterator[None]:
+    """A slot for a workspace request (it waits on GitHub), held until the response is done.
+
+    Raises:
+        ServiceBusyError: This worker has as many in progress as it allows.
+    """
+    async with WORKSPACE_SLOTS.slot():
+        yield
+
+
+async def workspace_save_limit(user: CurrentUserDep) -> AsyncIterator[None]:
+    """One save at a time per user, in bursts of at most `WORKSPACE_SAVE_BURST`, then one per
+    `WORKSPACE_SAVE_EVERY_SECONDS`. The SPA already saves far less often; this is for clients that don't.
+
+    Raises:
+        TooManyRequestsError: The user has a save in progress, or saved too often.
+    """
+    async with WORKSPACE_SAVES.hold(user.id):
+        yield

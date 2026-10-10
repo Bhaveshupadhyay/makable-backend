@@ -11,6 +11,7 @@ from fastapi import status
 from pydantic import BaseModel
 
 from app.core.exceptions import ExternalServiceError
+from app.core.limits import ServiceBusyError
 from app.schemas.github import (
     GithubBranchHead,
     GithubDirEntry,
@@ -280,6 +281,9 @@ class HttpGithubClient:
                     "X-GitHub-Api-Version": API_VERSION,
                 },
             )
+        except httpx.PoolTimeout as err:
+            # Every connection to GitHub from this worker is busy: back off rather than wait.
+            raise ServiceBusyError() from err
         except httpx.HTTPError as err:
             raise GithubError(f"GitHub couldn't be reached: {err}") from err
         if res.status_code == status.HTTP_401_UNAUTHORIZED:
