@@ -110,6 +110,22 @@ edits the SPA applies) or `{tier: 2, reason}` (the change needs a deeper edit, w
 - If the browser disconnects (the user pressed Stop), the model call is cancelled.
 - `AI_DEBUG=true` adds `debug: {modelInput, attempts, model}` to the response.
 
+## Workspace sync
+
+Signed-in users' builder sessions are saved to a private `makable-workspace` repo on their GitHub account, with their
+own token. Each site is a folder, `projects/<projectId>/`, split into files so a save only writes what changed:
+`state.json`, `messages/NNNN.json` (chat chunks), `ai-history/<template>.json` and `files/<template>/<path>`. Each save
+is one commit. `latest.json` at the root names the site saved last.
+
+| Endpoint | |
+|---|---|
+| `PUT /api/v1/workspace/sessions/{projectId}` | `{baseSha, state, parts, deletes}`: writes the changed files and the state as one commit, creating the repo on first use. 409 `workspace_conflict` when the state changed since `baseSha` |
+| `GET /api/v1/workspace/sessions/latest` | the newest saved state (`{state, sha}`), or 404 `workspace_session_not_found` |
+| `GET /api/v1/workspace/sessions/{projectId}` | one site's saved state |
+| `GET /api/v1/workspace/sessions/{projectId}/parts/{path}` | one file of a saved session |
+
+makable never writes to a `makable-workspace` repo it didn't create (no marker file) or one that's public.
+
 ## Checks
 
 ```sh
