@@ -1,13 +1,15 @@
+import hashlib
 from datetime import timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
+from app.clients.github import GithubConflictError, GithubNotFoundError, GithubRepoExistsError
 from app.clients.supabase import SupabaseRejectedError
 from app.core.database import utc_now
 from app.core.security import InvalidTokenError, generate_token, pkce_challenge
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
-from app.schemas.github import GithubUser
+from app.schemas.github import GithubDirEntry, GithubFile, GithubRepo, GithubUser
 from app.schemas.supabase import SupabaseSession, SupabaseUser
 
 VALID_CODE = "good-code"
@@ -73,15 +75,89 @@ class FakeSupabaseClient:
 
 
 class FakeGithubClient:
+    """An in-memory GitHub: users' repos with files and blob SHAs. Like GitHub, a file write must send the SHA
+    of the version it replaces, or it's refused as a conflict."""
+
     def __init__(self) -> None:
         self.user = GithubUser(
             id=583231, login="octocat", name="The Octocat", avatar_url="https://github.com/octocat.png"
         )
         self.tokens_seen: list[str] = []
+        self.repos: dict[str, GithubRepo] = {}
+        self.files: dict[str, dict[str, GithubFile]] = {}
+        # Writes to a repo created this many writes ago fail with 404, like a repo GitHub is still setting up.
+        self.not_ready_writes = 0
+        self.writes: list[tuple[str, str, str]] = []
+        # How often the workspace repo was looked up (the check a cache saves).
+        self.repo_lookups = 0
+        # Raised by the next file write, e.g. a rate limit.
+        self.fail_next_write: Exception | None = None
 
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
         return self.user
+
+    async def get_repo(self, access_token: str, full_name: str) -> GithubRepo | None:
+        self.tokens_seen.append(access_token)
+        self.repo_lookups += 1
+        return self.repos.get(full_name)
+
+    async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo:
+        full_name = f"{self.user.login}/{name}"
+        if full_name in self.repos:
+            raise GithubRepoExistsError()
+        return self.add_repo(name, private=True)
+
+    async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
+        return self.files.get(full_name, {}).get(path)
+
+    async def list_dir(self, access_token: str, full_name: str, path: str) -> list[GithubDirEntry]:
+        prefix = f"{path}/"
+        names = sorted({p[len(prefix) :].split("/")[0] for p in self.files.get(full_name, {}) if p.startswith(prefix)})
+        return [
+            GithubDirEntry(
+                name=n,
+                path=prefix + n,
+                type="file" if f"{prefix}{n}" in self.files[full_name] else "dir",
+            )
+            for n in names
+        ]
+
+    async def put_file(
+        self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
+    ) -> str:
+        if self.fail_next_write is not None:
+            error, self.fail_next_write = self.fail_next_write, None
+            raise error
+        if full_name not in self.repos:
+            raise GithubNotFoundError()
+        if self.not_ready_writes:
+            self.not_ready_writes -= 1
+            raise GithubNotFoundError()
+        current = self.files[full_name].get(path)
+        if (current.sha if current else None) != sha:
+            raise GithubConflictError()
+        new_sha = hashlib.sha1(f"blob {content}".encode(), usedforsecurity=False).hexdigest()
+        self.files[full_name][path] = GithubFile(content=content, sha=new_sha)
+        self.writes.append((full_name, path, message))
+        return new_sha
+
+    def add_repo(self, name: str, *, private: bool, files: dict[str, str] | None = None) -> GithubRepo:
+        """Sets up a repo directly, as if the user made it on GitHub."""
+        full_name = f"{self.user.login}/{name}"
+        repo = GithubRepo(
+            id=len(self.repos) + 1,
+            name=name,
+            full_name=full_name,
+            private=private,
+            html_url=f"https://github.com/{full_name}",
+        )
+        self.repos[full_name] = repo
+        self.files[full_name] = {
+            path: GithubFile(content=text, sha=hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest())
+            for path, text in (files or {}).items()
+        }
+        return repo
 
 
 class FakeModelClient:

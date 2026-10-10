@@ -15,3 +15,24 @@ class GithubCredentialUpsert(BaseModel):
 
     user_id: UUID
     access_token: str
+
+
+class GithubRepo(BaseModel):
+    id: int
+    name: str
+    full_name: str
+    private: bool
+    html_url: str
+
+
+class GithubFile(BaseModel):
+    """A file's text and its blob SHA, which a later write must send back."""
+
+    content: str
+    sha: str
+
+
+class GithubDirEntry(BaseModel):
+    name: str
+    path: str
+    type: str
