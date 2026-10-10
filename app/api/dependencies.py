@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.cookies import AuthCookies
 from app.clients.github import GithubClient, HttpGithubClient
+from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
 from app.constants.auth import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, Role
 from app.core.client import get_db_session, get_http_client
@@ -26,6 +27,7 @@ from app.repositories.health import HealthRepository, SqlHealthRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
 from app.repositories.user import SqlUserRepository, UserRepository
 from app.schemas.user import UserRead
+from app.services.ai_edit_service import AiEditService
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 
@@ -55,6 +57,16 @@ def get_oauth_state_signer(settings: SettingsDep) -> PayloadSigner:
 
 def get_github_client(http: HttpClientDep) -> GithubClient:
     return HttpGithubClient(http)
+
+
+def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient:
+    return HttpModelClient(
+        http,
+        base_url=settings.ai_base_url,
+        api_key=settings.ai_api_key.get_secret_value() if settings.ai_api_key else None,
+        model=settings.ai_model,
+        timeout_seconds=settings.ai_timeout_seconds,
+    )
 
 
 def get_supabase_client(http: HttpClientDep, settings: SettingsDep) -> SupabaseAuthClient:
@@ -114,7 +126,14 @@ def get_health_service(health: Annotated[HealthRepository, Depends(get_health_re
     return HealthService(health)
 
 
+def get_ai_edit_service(
+    model: Annotated[ModelClient, Depends(get_model_client)], settings: SettingsDep
+) -> AiEditService:
+    return AiEditService(model, debug=settings.ai_debug)
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
 
 # --- Authentication ---

@@ -92,6 +92,24 @@ Users are matched by `users.auth_user_id` (Supabase's `auth.users.id`, the JWT `
 
 Roles: `require_roles(Role.ADMIN)` in `api/dependencies.py` guards a route.
 
+## AI edits
+
+`POST /api/v1/ai/edit` (signed in) takes the SPA's `AiEditRequest`: the instruction, the element the user selected in
+the preview, the template, and the files most likely to change. It answers `{tier: 1, summary, edits}` (search/replace
+edits the SPA applies) or `{tier: 2, reason}` (the change needs a deeper edit, which isn't built yet).
+
+- Requests that are clearly site-wide ("add a page", "install") go to Tier 2 without a model call.
+- Otherwise the prompt (server-only) goes to an OpenAI-compatible model (`AI_*` in `.env`; a local OmniRoute by
+  default) as one user turn.
+- The answer's edits are dry-run before they're sent: only files that were sent, never `package.json`, lockfiles or
+  `.github/`; each search must match exactly once; the content file must still be a valid portfolio; scripts must
+  parse (tree-sitter); CSS braces must balance. A rejected answer is retried once with the error, then it's a 502
+  `ai_edit_rejected`. An unreachable model is a 502 `ai_unavailable`.
+- `history`: up to 10 earlier requests (instruction, selection, what happened) that the browser keeps and sends back, so
+  follow-ups like "make it bigger" work. The server stores no conversation.
+- If the browser disconnects (the user pressed Stop), the model call is cancelled.
+- `AI_DEBUG=true` adds `debug: {modelInput, attempts, model}` to the response.
+
 ## Checks
 
 ```sh
