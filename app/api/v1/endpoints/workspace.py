@@ -1,13 +1,14 @@
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
-from app.api.dependencies import CurrentUserDep, WorkspaceServiceDep
+from app.api.dependencies import CurrentUserDep, WorkspaceServiceDep, workspace_save_limit, workspace_slot
 from app.schemas.common import ApiResponse, ErrorResponse
 from app.schemas.workspace import WorkspacePartRead, WorkspaceSave, WorkspaceSaved, WorkspaceStateRead
 
-router = APIRouter(prefix="/workspace", tags=["workspace"])
+# Every workspace request waits on GitHub, so each holds one of the worker's slots.
+router = APIRouter(prefix="/workspace", tags=["workspace"], dependencies=[Depends(workspace_slot)])
 
 ERRORS: dict[int | str, dict[str, Any]] = {
     code: {"model": ErrorResponse}
@@ -17,6 +18,7 @@ ERRORS: dict[int | str, dict[str, Any]] = {
         status.HTTP_409_CONFLICT,
         status.HTTP_429_TOO_MANY_REQUESTS,
         status.HTTP_502_BAD_GATEWAY,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
     )
 }
 
@@ -45,7 +47,12 @@ async def get_session_part(
     return ApiResponse(data=await workspace.get_part(user, project_id, path))
 
 
-@router.put("/sessions/{project_id}", summary="Save a site's session", responses=ERRORS)
+@router.put(
+    "/sessions/{project_id}",
+    summary="Save a site's session",
+    responses=ERRORS,
+    dependencies=[Depends(workspace_save_limit)],
+)
 async def save_session(
     project_id: UUID, body: WorkspaceSave, user: CurrentUserDep, workspace: WorkspaceServiceDep
 ) -> ApiResponse[WorkspaceSaved]:
