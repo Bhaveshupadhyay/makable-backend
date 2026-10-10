@@ -45,7 +45,8 @@ def classify(request: AiEditRequest) -> str | None:
 def check_edits(request: AiEditRequest, edits: list[FileEdit]) -> AppliedEdits:
     """Dry-runs the edits on the files that were sent, the way the browser will apply them, and checks the
     result still parses: the content file must stay a valid portfolio, scripts must have no syntax errors, and
-    CSS braces must balance.
+    CSS braces must balance. Edits that change nothing are rejected too, so the user is never told about a
+    change that wasn't made.
 
     Raises:
         FileEditError: An edit can't be applied, or it breaks a file. The message is written for the model.
@@ -54,6 +55,8 @@ def check_edits(request: AiEditRequest, edits: list[FileEdit]) -> AppliedEdits:
     if forbidden:
         raise FileEditError(f"{forbidden.path} can't be edited")
     applied = apply_file_edits({f.path: f.content for f in request.files}, edits)
+    if not applied.changed:
+        raise FileEditError("the edits don't change any file; make the requested change, or escalate if you can't")
     for path in applied.changed:
         problem = _problem_in(path, applied.files[path], request.template.content_path)
         if problem:

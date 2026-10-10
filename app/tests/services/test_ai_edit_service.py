@@ -65,11 +65,17 @@ def test_check_edits_dry_runs_the_edits() -> None:
         (FileEdit(path="src/index.css", search="}", replace=""), "braces"),
         (FileEdit(path="package.json", search="a", replace="b"), "can't be edited"),
         (FileEdit(path=".github/workflows/deploy.yml", search="a", replace="b"), "can't be edited"),
+        (FileEdit(path=HERO_PATH, search="bg-blue-600", replace="bg-blue-600"), "don't change any file"),
     ],
 )
 def test_check_edits_rejects_broken_results(edit: FileEdit, error: str) -> None:
     with pytest.raises(FileEditError, match=error):
         check_edits(make_request(), [edit])
+
+
+def test_an_empty_edit_list_is_rejected() -> None:
+    with pytest.raises(FileEditError, match="don't change any file"):
+        check_edits(make_request(), [])
 
 
 def test_extract_json_handles_fences_and_prose() -> None:
