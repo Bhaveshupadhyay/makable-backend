@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -106,6 +107,9 @@ class FakeGithubClient:
         self.fail_next_write: Exception | None = None
         # The branch moves this many times just before a commit lands (another save got in first).
         self.races = 0
+        # Seconds that reading the branch head and committing take (a slow GitHub).
+        self.head_delay = 0.0
+        self.commit_delay = 0.0
 
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
@@ -144,6 +148,7 @@ class FakeGithubClient:
         return self.files[full_name][path].sha
 
     async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead:
+        await asyncio.sleep(self.head_delay)
         if full_name not in self.repos or branch != self.repos[full_name].default_branch:
             raise GithubNotFoundError()
         return self.heads[full_name]
@@ -158,6 +163,7 @@ class FakeGithubClient:
         *,
         message: str,
     ) -> str:
+        await asyncio.sleep(self.commit_delay)
         self._before_write(full_name)
         if self.races:
             self.races -= 1

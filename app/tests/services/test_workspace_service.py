@@ -21,6 +21,7 @@ from app.services.workspace_service import (
     WorkspacePartNotFoundError,
     WorkspaceRepoPublicError,
     WorkspaceRepoTakenError,
+    WorkspaceSaveTimeoutError,
     WorkspaceService,
     WorkspaceSessionNotFoundError,
     git_blob_sha,
@@ -52,7 +53,10 @@ async def no_sleep(_: float) -> None:
 
 
 def service(
-    github: FakeGithubClient, stored: str | None = "gho_token", verified: VerifiedRepos | None = None
+    github: FakeGithubClient,
+    stored: str | None = "gho_token",
+    verified: VerifiedRepos | None = None,
+    save_deadline: float = 20.0,
 ) -> WorkspaceService:
     return WorkspaceService(
         github,
@@ -61,6 +65,7 @@ def service(
         sleep=no_sleep,
         retry_delays=(0.1, 0.1),
         verified=verified or VerifiedRepos(),
+        save_deadline=save_deadline,
     )
 
 
@@ -172,6 +177,23 @@ async def test_a_branch_that_moves_mid_save_is_retried_once() -> None:
     current = github.files[REPO][f"{DIR}/state.json"].sha
     with pytest.raises(WorkspaceConflictError):
         await workspace.save(USER, PROJECT_ID, save(base_sha=current, saved_at="2026-10-10T12:02:00.000Z"))
+
+
+async def test_a_save_gives_up_when_github_is_too_slow_before_the_commit() -> None:
+    github = FakeGithubClient()
+    github.head_delay = 1.0
+
+    with pytest.raises(WorkspaceSaveTimeoutError):
+        await service(github, save_deadline=0.05).save(USER, PROJECT_ID, save())
+    assert f"{DIR}/state.json" not in github.files[REPO]
+
+
+async def test_a_slow_commit_is_not_cut_short_by_the_deadline() -> None:
+    github = FakeGithubClient()
+    github.commit_delay = 0.1
+
+    saved = await service(github, save_deadline=0.05).save(USER, PROJECT_ID, save())
+    assert github.files[REPO][f"{DIR}/state.json"].sha == saved.sha
 
 
 async def test_reads_the_newest_state_and_each_part() -> None:

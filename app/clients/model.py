@@ -5,7 +5,9 @@ from typing import Protocol
 
 import httpx
 
+from app.core.client import HTTP_POOL_TIMEOUT_SECONDS
 from app.core.exceptions import ExternalServiceError
+from app.core.limits import ServiceBusyError
 from app.schemas.chat import ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,14 @@ class HttpModelClient:
             "stream": False,
         }
         try:
-            res = await self._http.post(self._url, json=body, headers=headers, timeout=self._timeout)
+            res = await self._http.post(
+                self._url,
+                json=body,
+                headers=headers,
+                timeout=httpx.Timeout(self._timeout, pool=HTTP_POOL_TIMEOUT_SECONDS),
+            )
+        except httpx.PoolTimeout as err:
+            raise ServiceBusyError() from err
         except httpx.HTTPError as err:
             logger.warning("model unreachable", extra={"url": self._url, "error": repr(err)})
             raise ModelUnavailableError() from err

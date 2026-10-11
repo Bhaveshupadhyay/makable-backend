@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from app.clients import supabase as supabase_module
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseError, SupabaseRejectedError
 from app.core.database import utc_now
+from app.core.limits import ServiceBusyError
 from app.core.security import InvalidTokenError
 
 URL = "https://project.supabase.co"
@@ -161,3 +162,15 @@ async def test_sign_out_sends_the_access_token(client: HttpSupabaseAuthClient, r
     request = recorder.requests[0]
     assert request.headers["authorization"] == "Bearer at"
     assert request.url.params["scope"] == "local"
+
+
+async def test_a_full_connection_pool_is_service_busy_not_a_supabase_error() -> None:
+    def no_connection(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no free connection", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(no_connection)) as http:
+        client = HttpSupabaseAuthClient(http, url=URL, api_key="k")
+        with pytest.raises(ServiceBusyError):
+            await client.refresh("r")
+        with pytest.raises(ServiceBusyError):
+            await client.verify(sign())

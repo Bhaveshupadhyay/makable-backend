@@ -17,6 +17,11 @@ from app.core.config import DatabaseSettings
 # Shows up in pg_stat_activity, so our connections are easy to spot.
 APPLICATION_NAME = "makable-backend"
 HTTP_TIMEOUT_SECONDS = 10
+# Outgoing connections (GitHub, Supabase, the AI model) per worker, and how long a request waits for a free one
+# before giving up with a 503. Bounds the queue instead of letting requests pile up behind a slow upstream.
+HTTP_MAX_CONNECTIONS = 200
+HTTP_MAX_KEEPALIVE_CONNECTIONS = 50
+HTTP_POOL_TIMEOUT_SECONDS = 5
 
 _postgres_engine: AsyncEngine | None = None
 _postgres_sessionmaker: async_sessionmaker[AsyncSession] | None = None
@@ -78,7 +83,12 @@ def get_http_client() -> httpx.AsyncClient:
     """One HTTP client for outbound calls (GitHub), so its connections are pooled and reused."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, pool=HTTP_POOL_TIMEOUT_SECONDS),
+            limits=httpx.Limits(
+                max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS
+            ),
+        )
     return _http_client
 
 

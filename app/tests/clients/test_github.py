@@ -16,6 +16,7 @@ from app.clients.github import (
     GithubUnauthorizedError,
     HttpGithubClient,
 )
+from app.core.limits import ServiceBusyError
 from app.schemas.github import GithubBranchHead, GithubTreeChange
 
 REPO = "octocat/makable-workspace"
@@ -165,3 +166,11 @@ async def test_a_branch_that_moved_is_a_conflict_and_the_head_is_read_in_one_req
     assert head == GithubBranchHead(commit_sha="c1", tree_sha="t1")
     with pytest.raises(GithubConflictError):
         await github.commit_changes("tok", REPO, "main", head, [], message="m")
+
+
+async def test_no_free_connection_is_a_quick_busy_answer() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no free connection")
+
+    with pytest.raises(ServiceBusyError):
+        await client(handler).get_repo("tok", REPO)

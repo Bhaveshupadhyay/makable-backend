@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from app.clients.model import HttpModelClient, ModelUnavailableError
+from app.core.limits import ServiceBusyError
 from app.schemas.chat import ChatMessage
 
 URL = "http://model.test/v1"
@@ -63,4 +64,12 @@ async def test_an_unreachable_model_is_unavailable() -> None:
         raise httpx.ConnectError("refused", request=request)
 
     with pytest.raises(ModelUnavailableError):
+        await client(handler).complete(MESSAGES)
+
+
+async def test_no_free_connection_is_a_quick_busy_answer() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no free connection")
+
+    with pytest.raises(ServiceBusyError):
         await client(handler).complete(MESSAGES)

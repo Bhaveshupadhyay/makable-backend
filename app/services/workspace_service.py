@@ -3,7 +3,8 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from app.constants.workspace import (
     MAX_PROJECTS,
     NEW_REPO_RETRY_DELAYS,
     PROJECTS_DIR,
+    SAVE_DEADLINE_SECONDS,
     STATE_FILE,
     VERIFIED_REPO_TTL,
     WORKSPACE_DESCRIPTION,
@@ -84,6 +86,12 @@ class WorkspaceInvalidError(AppError):
     message = "That session doesn't belong here"
 
 
+class WorkspaceSaveTimeoutError(AppError):
+    status_code = status.HTTP_504_GATEWAY_TIMEOUT
+    code = "github_timeout"
+    message = "GitHub is slow right now, so this save didn't go through. Nothing was changed; try again in a moment."
+
+
 class VerifiedRepos:
     """Workspace repos checked recently (exist, private, have the marker), per user and login, so saves skip
     the two checking requests. Process-wide: each worker keeps its own. Entries expire after `ttl` seconds."""
@@ -137,6 +145,7 @@ class WorkspaceService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         retry_delays: Sequence[float] = NEW_REPO_RETRY_DELAYS,
         verified: VerifiedRepos = VERIFIED_REPOS,
+        save_deadline: float = SAVE_DEADLINE_SECONDS,
     ) -> None:
         self._github = github
         self._credentials = credentials
@@ -144,6 +153,7 @@ class WorkspaceService:
         self._sleep = sleep
         self._retry_delays = retry_delays
         self._verified = verified
+        self._save_deadline = save_deadline
 
     async def get_state(self, user: UserRead, project_id: UUID) -> WorkspaceStateRead:
         """A site's saved state (its chat chunks, AI history and files are read with `get_part`).
@@ -220,6 +230,7 @@ class WorkspaceService:
             WorkspaceRepoTakenError: The repo exists but makable didn't create it.
             WorkspaceRepoPublicError: The repo is public.
             GithubNotConnectedError: No usable GitHub token.
+            WorkspaceSaveTimeoutError: GitHub was too slow to get to the commit within `SAVE_DEADLINE_SECONDS`.
             GithubError: GitHub failed.
         """
         if save.state is not None and save.state.project_id != project_id:
@@ -239,18 +250,22 @@ class WorkspaceService:
         if not changes:
             raise WorkspaceInvalidError("Nothing to save")
         message = f"Save session ({len(save.parts)} changed, {len(save.deletes)} removed)"
-        token = await self._token(user)
-        repo = await self._workspace(token, user) or await self._create_workspace(token, user)
+        # Everything before the commit shares one deadline; the commit runs to the end (see SAVE_DEADLINE_SECONDS).
+        deadline = asyncio.get_running_loop().time() + self._save_deadline
+        async with _before(deadline):
+            token = await self._token(user)
+            repo = await self._workspace(token, user) or await self._create_workspace(token, user)
         # Two tries: the branch can move between reading it and committing (another site's save got in first).
         for attempt in range(2):
-            try:
-                head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
-            except GithubNotFoundError:
-                # The repo checked earlier is gone (deleted or renamed on GitHub): check it again.
-                self._verified.discard(user)
-                repo = await self._workspace(token, user) or await self._create_workspace(token, user)
-                head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
-            current = await self._github.get_file(token, repo.full_name, f"{folder}/{STATE_FILE}")
+            async with _before(deadline):
+                try:
+                    head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
+                except GithubNotFoundError:
+                    # The repo checked earlier is gone (deleted or renamed on GitHub): check it again.
+                    self._verified.discard(user)
+                    repo = await self._workspace(token, user) or await self._create_workspace(token, user)
+                    head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
+                current = await self._github.get_file(token, repo.full_name, f"{folder}/{STATE_FILE}")
             if (current.sha if current else None) != save.base_sha:
                 raise WorkspaceConflictError(details=_conflict_details(current))
             try:
@@ -336,6 +351,16 @@ class WorkspaceService:
         file = await self._github.get_file(token, repo.full_name, f"{project_dir(project_id)}/{STATE_FILE}")
         state = _parse_state(file)
         return WorkspaceStateRead(state=state, sha=file.sha) if file and state else None
+
+
+@asynccontextmanager
+async def _before(deadline: float) -> AsyncIterator[None]:
+    """Runs the block until `deadline` (event-loop time), then gives up with `WorkspaceSaveTimeoutError`."""
+    try:
+        async with asyncio.timeout_at(deadline):
+            yield
+    except TimeoutError:
+        raise WorkspaceSaveTimeoutError() from None
 
 
 def _parse_state(file: GithubFile | None) -> WorkspaceState | None:

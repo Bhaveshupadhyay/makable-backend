@@ -6,6 +6,7 @@ from app.clients.github import GithubClient, GithubError
 from app.clients.supabase import SupabaseAuthClient, SupabaseError, SupabaseRejectedError
 from app.constants.auth import AUTH_PROVIDER, GITHUB_SCOPES, OAUTH_STATE_TTL_SECONDS
 from app.core.exceptions import ConflictError, LoginError, UnauthorizedError
+from app.core.limits import ServiceBusyError
 from app.core.security import InvalidTokenError, PayloadSigner, TokenCipher, generate_token, pkce_challenge
 from app.repositories.github_credential import GithubCredentialRepository
 from app.repositories.unit_of_work import UnitOfWork
@@ -93,8 +94,11 @@ class AuthService:
 
         try:
             session = await self._supabase.exchange_code(auth_code=code, code_verifier=oauth.code_verifier)
-        except SupabaseError as err:
-            raise LoginError("auth_error", err.message, return_to=oauth.return_to) from err
+        except (SupabaseError, ServiceBusyError) as err:
+            # The callback is a browser navigation: even a busy server answers with a redirect.
+            raise LoginError(
+                err.code if isinstance(err, ServiceBusyError) else "auth_error", err.message, return_to=oauth.return_to
+            ) from err
         if not session.provider_token:
             raise LoginError("github_error", "Supabase returned no GitHub token", return_to=oauth.return_to)
         try:
@@ -152,7 +156,7 @@ class AuthService:
                 # The access token is missing or expired, and Supabase needs a valid one to sign out.
                 session = await self._supabase.refresh(refresh_token)
                 await self._supabase.sign_out(session.access_token)
-        except SupabaseError as err:
+        except (SupabaseError, ServiceBusyError) as err:
             logger.warning("sign-out failed", extra={"error": err.message})
 
     async def _sign_out(self, access_token: str) -> bool:
