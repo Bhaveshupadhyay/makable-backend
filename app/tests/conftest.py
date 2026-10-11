@@ -13,6 +13,7 @@ from app.api.dependencies import get_github_client, get_supabase_client
 from app.core.client import close_connection, get_postgres_client, open_connection
 from app.core.config import Settings, get_settings
 from app.core.database import Base
+from app.services.workspace_service import VERIFIED_REPOS
 from app.tests.fakes import FakeGithubClient, FakeSupabaseClient
 from main import create_app
 
@@ -42,6 +43,14 @@ def settings(db_path: Path) -> Settings:
         supabase_url="https://project.supabase.co",
         supabase_publishable_key="sb_publishable_test",
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_verified_repos() -> Iterator[None]:
+    """The checked-repo cache is process-wide too; tests mustn't see each other's repos."""
+    VERIFIED_REPOS.clear()
+    yield
+    VERIFIED_REPOS.clear()
 
 
 @pytest.fixture(autouse=True)

@@ -15,3 +15,40 @@ class GithubCredentialUpsert(BaseModel):
 
     user_id: UUID
     access_token: str
+
+
+class GithubRepo(BaseModel):
+    id: int
+    name: str
+    full_name: str
+    private: bool
+    html_url: str
+    default_branch: str
+    description: str | None = None
+
+
+class GithubFile(BaseModel):
+    """A file's text and its blob SHA, which a later write must send back."""
+
+    content: str
+    sha: str
+
+
+class GithubDirEntry(BaseModel):
+    name: str
+    path: str
+    type: str
+
+
+class GithubBranchHead(BaseModel):
+    """The commit a branch points to, and that commit's tree."""
+
+    commit_sha: str
+    tree_sha: str
+
+
+class GithubTreeChange(BaseModel):
+    """One file in a new commit: its new text, or None to delete it."""
+
+    path: str
+    content: str | None

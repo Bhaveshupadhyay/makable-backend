@@ -30,6 +30,7 @@ from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiEditService
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
+from app.services.workspace_service import WorkspaceService
 
 # --- App-wide singletons ---
 
@@ -132,7 +133,16 @@ def get_ai_edit_service(
     return AiEditService(model, debug=settings.ai_debug)
 
 
+def get_workspace_service(
+    github: Annotated[GithubClient, Depends(get_github_client)],
+    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+) -> WorkspaceService:
+    return WorkspaceService(github, credentials, cipher)
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
 
