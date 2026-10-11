@@ -44,3 +44,8 @@ MAX_PROJECTS = 20
 VERIFIED_REPO_TTL = 600
 # Waits (seconds) for a repo GitHub just created to accept writes.
 NEW_REPO_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+# How long (seconds) a save may spend before its commit (token, repo checks or setup, branch and state reads).
+# Past it the save fails with 504 and the browser retries later, instead of holding a workspace slot while GitHub
+# is slow. The commit itself isn't cut short: stopping it part-way could move the branch without the browser
+# knowing, and the next save would then look like a conflict. Its requests still have their own timeouts.
+SAVE_DEADLINE_SECONDS = 20.0

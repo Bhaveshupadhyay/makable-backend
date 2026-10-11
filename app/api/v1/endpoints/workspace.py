@@ -19,6 +19,7 @@ ERRORS: dict[int | str, dict[str, Any]] = {
         status.HTTP_429_TOO_MANY_REQUESTS,
         status.HTTP_502_BAD_GATEWAY,
         status.HTTP_503_SERVICE_UNAVAILABLE,
+        status.HTTP_504_GATEWAY_TIMEOUT,
     )
 }
 
