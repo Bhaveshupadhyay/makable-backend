@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -5,6 +6,7 @@ from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import LoginError, UnauthorizedError
+from app.core.limits import ServiceBusyError
 from app.core.security import PayloadSigner, TokenCipher, pkce_challenge
 from app.models.user import User
 from app.repositories.github_credential import SqlGithubCredentialRepository
@@ -124,3 +126,36 @@ async def test_authenticate_rejects_unknown_tokens_and_users(
     session = await supabase.exchange_code(auth_code=VALID_CODE, code_verifier="v")
     with pytest.raises(UnauthorizedError):
         await service.authenticate(session.access_token)
+
+
+class BusySupabase(FakeSupabaseClient):
+    """Supabase behind a full connection pool."""
+
+    async def exchange_code(self, *, auth_code: str, code_verifier: str) -> Any:
+        raise ServiceBusyError()
+
+    async def sign_out(self, access_token: str) -> None:
+        raise ServiceBusyError()
+
+
+async def test_a_busy_server_still_redirects_the_callback_and_signs_out(
+    session: AsyncSession, github: FakeGithubClient
+) -> None:
+    busy = AuthService(
+        supabase=BusySupabase(),
+        github=github,
+        state_signer=PayloadSigner("secret", salt="test"),
+        users=SqlUserRepository(session),
+        credentials=SqlGithubCredentialRepository(session),
+        cipher=CIPHER,
+        uow=SqlAlchemyUnitOfWork(session),
+        callback_url="http://localhost:5173/api/v1/auth/github/callback",
+    )
+    login = busy.start_login("/projects")
+
+    # The callback is a browser navigation: it becomes a redirect with the code, not a JSON 503.
+    with pytest.raises(LoginError) as err:
+        await busy.complete_login(state_cookie=login.state_cookie, code=VALID_CODE, error=None)
+    assert (err.value.code, err.value.return_to) == ("service_busy", "/projects")
+    # Signing out is best effort: the cookies are cleared either way.
+    await busy.logout(access_token="a", refresh_token=None)

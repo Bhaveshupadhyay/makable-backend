@@ -9,6 +9,7 @@ import jwt
 from pydantic import ValidationError
 
 from app.core.exceptions import ExternalServiceError
+from app.core.limits import ServiceBusyError
 from app.core.security import InvalidTokenError
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.supabase import SupabaseSession
@@ -144,6 +145,9 @@ class HttpSupabaseAuthClient:
             res = await self._http.get(url, headers={"apikey": self._api_key})
             res.raise_for_status()
             key_set = jwt.PyJWKSet.from_dict(res.json())
+        except httpx.PoolTimeout as err:
+            # Every connection from this worker is busy: back off rather than call Supabase down.
+            raise ServiceBusyError() from err
         except (httpx.HTTPError, ValueError) as err:
             raise SupabaseError(f"fetching signing keys failed: {err}") from err
         except jwt.PyJWKSetError as err:
@@ -167,6 +171,8 @@ class HttpSupabaseAuthClient:
             headers["Authorization"] = f"Bearer {access_token}"
         try:
             res = await self._http.post(f"{self._auth_url}{path}", params=params, json=json, headers=headers)
+        except httpx.PoolTimeout as err:
+            raise ServiceBusyError() from err
         except httpx.HTTPError as err:
             raise SupabaseError(f"{path} failed: {err}") from err
         if res.is_client_error:

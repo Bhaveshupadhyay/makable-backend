@@ -89,7 +89,7 @@ class WorkspaceInvalidError(AppError):
 class WorkspaceSaveTimeoutError(AppError):
     status_code = status.HTTP_504_GATEWAY_TIMEOUT
     code = "github_timeout"
-    message = "GitHub is slow right now. Your session will be saved in a moment."
+    message = "GitHub is slow right now, so this save didn't go through. Nothing was changed; try again in a moment."
 
 
 class VerifiedRepos:
