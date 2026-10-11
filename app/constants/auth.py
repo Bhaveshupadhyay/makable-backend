@@ -20,6 +20,7 @@ OAUTH_STATE_COOKIE_PATH = f"{API_V1_PREFIX}/auth/github"
 OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 # Supabase signs users in with GitHub, asking for these OAuth App scopes (on top of Supabase's own
-# `user:email`). `repo` lets us create repositories and push commits for the user.
+# `user:email`). `repo` lets us create repositories, push commits and set Actions secrets for the user; `workflow`
+# lets a publish write the site's deploy workflow (GitHub refuses `.github/workflows/` writes without it).
 AUTH_PROVIDER = "github"
-GITHUB_SCOPES = "repo"
+GITHUB_SCOPES = "repo workflow"

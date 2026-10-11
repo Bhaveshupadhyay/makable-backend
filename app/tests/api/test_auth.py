@@ -50,11 +50,11 @@ def test_session_is_401_with_an_error_envelope_when_signed_out(client: TestClien
     assert body["requestId"] == res.headers["x-request-id"]
 
 
-def test_login_asks_supabase_for_github_with_repo_scope(client: TestClient) -> None:
+def test_login_asks_supabase_for_github_with_repo_and_workflow_scopes(client: TestClient) -> None:
     query = start_login(client)
 
     assert query["provider"] == ["github"]
-    assert query["scopes"] == ["repo"]
+    assert query["scopes"] == ["repo workflow"]
     assert query["redirect_to"] == [f"{APP_URL}/api/v1/auth/github/callback"]
 
 

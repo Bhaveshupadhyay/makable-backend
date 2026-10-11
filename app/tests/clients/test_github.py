@@ -10,7 +10,9 @@ import pytest
 
 from app.clients.github import (
     GithubConflictError,
+    GithubError,
     GithubNotFoundError,
+    GithubPagesUnavailableError,
     GithubRateLimitedError,
     GithubRepoExistsError,
     GithubUnauthorizedError,
@@ -81,7 +83,7 @@ async def test_get_file_decodes_content_and_reads_large_files_as_blobs() -> None
     assert await github.get_file("tok", REPO, "missing.json") is None
 
 
-async def test_create_private_repo_and_an_existing_name() -> None:
+async def test_create_repo_and_an_existing_name() -> None:
     bodies: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -99,11 +101,11 @@ async def test_create_private_repo_and_an_existing_name() -> None:
         return httpx.Response(201, json=repo)
 
     github = client(handler)
-    repo = await github.create_private_repo("tok", "makable-workspace", "desc")
+    repo = await github.create_repo("tok", "makable-workspace", "desc", private=True)
     assert repo.private
     assert bodies[0]["private"] is True and bodies[0]["auto_init"] is True
     with pytest.raises(GithubRepoExistsError):
-        await github.create_private_repo("tok", "makable-workspace", "desc")
+        await github.create_repo("tok", "makable-workspace", "desc", private=True)
 
 
 @pytest.mark.parametrize(
@@ -174,3 +176,119 @@ async def test_no_free_connection_is_a_quick_busy_answer() -> None:
 
     with pytest.raises(ServiceBusyError):
         await client(handler).get_repo("tok", REPO)
+
+
+async def test_get_scopes_reads_the_oauth_header() -> None:
+    github = client(lambda _: httpx.Response(200, json={}, headers={"x-oauth-scopes": "repo, workflow"}))
+    assert await github.get_scopes("tok") == {"repo", "workflow"}
+    assert await client(lambda _: httpx.Response(200, json={})).get_scopes("tok") is None
+
+
+async def test_commit_changes_uploads_binary_files_as_blobs() -> None:
+    bodies: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies[request.url.path] = json.loads(request.content)
+        return httpx.Response(201, json={"sha": "c" * 40, "ref": "refs/heads/main"})
+
+    head = GithubBranchHead(commit_sha="a" * 40, tree_sha="b" * 40)
+    changes = [
+        GithubTreeChange(path="a.png", content=b"\x89PNG"),
+        GithubTreeChange(path="index.html", content="<main></main>"),
+    ]
+    await client(handler).commit_changes("tok", REPO, "main", head, changes, message="Publish")
+
+    assert bodies[f"/repos/{REPO}/git/blobs"] == {
+        "content": base64.b64encode(b"\x89PNG").decode(),
+        "encoding": "base64",
+    }
+    assert bodies[f"/repos/{REPO}/git/trees"] == {
+        "base_tree": "b" * 40,
+        "tree": [
+            {"path": "a.png", "mode": "100644", "type": "blob", "sha": "c" * 40},
+            {"path": "index.html", "mode": "100644", "type": "blob", "content": "<main></main>"},
+        ],
+    }
+
+
+async def test_get_tree_lists_files_and_refuses_a_truncated_tree() -> None:
+    tree = [{"path": "src", "type": "tree", "sha": "1"}, {"path": "src/a.ts", "type": "blob", "sha": "2"}]
+    github = client(lambda _: httpx.Response(200, json={"tree": tree, "truncated": False}))
+    assert await github.get_tree("tok", REPO, "t") == {"src/a.ts": "2"}
+    with pytest.raises(GithubError):
+        await client(lambda _: httpx.Response(200, json={"tree": [], "truncated": True})).get_tree("tok", REPO, "t")
+
+
+async def test_actions_secrets() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/public-key"):
+            return httpx.Response(200, json={"key_id": "k1", "key": "S0VZ"})
+        if request.method == "PUT":
+            return httpx.Response(201)
+        return httpx.Response(404 if request.url.path.endswith("/MISSING") else 200, json={"name": "X"})
+
+    github = client(handler)
+    key = await github.get_actions_key("tok", REPO)
+    await github.put_actions_secret("tok", REPO, "VERCEL_TOKEN", "c2VhbGVk", key.key_id)
+
+    assert json.loads(seen[1].content) == {"encrypted_value": "c2VhbGVk", "key_id": "k1"}
+    assert seen[1].url.path == f"/repos/{REPO}/actions/secrets/VERCEL_TOKEN"
+    assert await github.has_actions_secret("tok", REPO, "VERCEL_TOKEN")
+    assert not await github.has_actions_secret("tok", REPO, "MISSING")
+
+
+async def test_enable_pages_switches_an_existing_site_to_workflow_builds() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        assert json.loads(request.content) == {"build_type": "workflow"}
+        return httpx.Response(409 if request.method == "POST" else 204)
+
+    await client(handler).enable_pages_workflow("tok", REPO)
+    assert methods == ["POST", "PUT"]
+    with pytest.raises(GithubPagesUnavailableError):
+        await client(lambda _: httpx.Response(422)).enable_pages_workflow("tok", REPO)
+
+
+async def test_workflow_dispatch_and_runs() -> None:
+    run = {
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": "a" * 40,
+        "html_url": "https://github.com/x/actions/runs/1",
+        "created_at": "2026-10-11T10:00:00Z",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert json.loads(request.content) == {"ref": "main"}
+            return httpx.Response(204)
+        assert request.url.params["branch"] == "main"
+        return httpx.Response(200, json={"workflow_runs": [run]})
+
+    github = client(handler)
+    await github.dispatch_workflow("tok", REPO, "makable-deploy.yml", "main")
+    latest = await github.latest_workflow_run("tok", REPO, "makable-deploy.yml", "main")
+    assert latest is not None and latest.conclusion == "success"
+    with pytest.raises(GithubNotFoundError):
+        await client(lambda _: httpx.Response(404)).dispatch_workflow("tok", REPO, "x.yml", "main")
+    assert (
+        await client(lambda _: httpx.Response(200, json={"workflow_runs": []})).latest_workflow_run(
+            "tok", REPO, "x.yml", "main"
+        )
+        is None
+    )
+
+
+async def test_get_blob_reads_text_by_sha() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/repos/{REPO}/git/blobs/{'a' * 40}"
+        return httpx.Response(200, json={"content": b64("body {}\n"), "encoding": "base64"})
+
+    assert await client(handler).get_blob("tok", REPO, "a" * 40) == "body {}\n"
+    with pytest.raises(GithubNotFoundError):
+        await client(lambda _: httpx.Response(404)).get_blob("tok", REPO, "a" * 40)

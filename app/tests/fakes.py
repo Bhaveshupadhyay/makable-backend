@@ -1,24 +1,38 @@
 import asyncio
+import base64
 import hashlib
 from datetime import timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from app.clients.github import GithubConflictError, GithubNotFoundError, GithubRepoExistsError
+from nacl.public import PrivateKey, SealedBox
+
+from app.clients.deploy_platforms import PlatformTokenInvalidError, PreparedProject
+from app.clients.github import (
+    GithubConflictError,
+    GithubNotFoundError,
+    GithubPagesUnavailableError,
+    GithubRepoExistsError,
+)
 from app.clients.supabase import SupabaseRejectedError
+from app.clients.templates import TemplateNotFoundError
+from app.constants.publish import PublishTarget
 from app.core.database import utc_now
 from app.core.security import InvalidTokenError, generate_token, pkce_challenge
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
 from app.schemas.github import (
+    GithubActionsKey,
     GithubBranchHead,
     GithubDirEntry,
     GithubFile,
     GithubRepo,
     GithubTreeChange,
     GithubUser,
+    GithubWorkflowRun,
 )
 from app.schemas.supabase import SupabaseSession, SupabaseUser
+from app.schemas.template import TemplateEntry, TemplateFiles
 from app.services.workspace_service import git_blob_sha
 
 VALID_CODE = "good-code"
@@ -110,6 +124,16 @@ class FakeGithubClient:
         # Seconds that reading the branch head and committing take (a slow GitHub).
         self.head_delay = 0.0
         self.commit_delay = 0.0
+        # The token's OAuth scopes (None: GitHub didn't say).
+        self.scopes: set[str] | None = {"repo", "workflow"}
+        # Actions secrets per repo, decrypted with the repo's private key (so tests see what was sealed).
+        self._secrets_key = PrivateKey.generate()
+        self.secrets: dict[str, dict[str, str]] = {}
+        self.pages: set[str] = set()
+        self.pages_unavailable = False
+        self.dispatches: list[tuple[str, str, str]] = []
+        self.runs: dict[str, GithubWorkflowRun] = {}
+        self.blob_reads = 0
 
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
@@ -120,10 +144,15 @@ class FakeGithubClient:
         self.repo_lookups += 1
         return self.repos.get(full_name)
 
-    async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo:
+    async def get_scopes(self, access_token: str) -> set[str] | None:
+        return self.scopes
+
+    async def create_repo(
+        self, access_token: str, name: str, description: str, *, private: bool, homepage: str | None = None
+    ) -> GithubRepo:
         if f"{self.user.login}/{name}" in self.repos:
             raise GithubRepoExistsError()
-        return self.add_repo(name, private=True, files={"README.md": f"# {name}\n"}, description=description)
+        return self.add_repo(name, private=private, files={"README.md": f"# {name}\n"}, description=description)
 
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
         return self.files.get(full_name, {}).get(path)
@@ -179,6 +208,56 @@ class FakeGithubClient:
         self._commit(full_name, message, files, [c.path for c in changes])
         return self.heads[full_name].commit_sha
 
+    async def get_tree(self, access_token: str, full_name: str, tree_sha: str) -> dict[str, str]:
+        return {path: file.sha for path, file in self.trees[tree_sha].items()}
+
+    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
+        self.blob_reads += 1
+        for files in self.trees.values():
+            for file in files.values():
+                if file.sha == sha:
+                    return file.content
+        raise GithubNotFoundError()
+
+    async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey:
+        self._before_write(full_name)
+        key = base64.b64encode(bytes(self._secrets_key.public_key)).decode()
+        return GithubActionsKey(key_id="key-1", key=key)
+
+    async def put_actions_secret(
+        self, access_token: str, full_name: str, name: str, encrypted_value: str, key_id: str
+    ) -> None:
+        assert key_id == "key-1"
+        value = SealedBox(self._secrets_key).decrypt(base64.b64decode(encrypted_value)).decode()
+        self.secrets.setdefault(full_name, {})[name] = value
+
+    async def has_actions_secret(self, access_token: str, full_name: str, name: str) -> bool:
+        return name in self.secrets.get(full_name, {})
+
+    async def enable_pages_workflow(self, access_token: str, full_name: str) -> None:
+        if self.pages_unavailable:
+            raise GithubPagesUnavailableError()
+        self.pages.add(full_name)
+
+    async def dispatch_workflow(self, access_token: str, full_name: str, workflow: str, ref: str) -> None:
+        if f".github/workflows/{workflow}" not in self.files.get(full_name, {}):
+            raise GithubNotFoundError()
+        self.dispatches.append((full_name, workflow, ref))
+
+    async def latest_workflow_run(
+        self, access_token: str, full_name: str, workflow: str, branch: str
+    ) -> GithubWorkflowRun | None:
+        return self.runs.get(full_name)
+
+    def edit_on_github(self, full_name: str, path: str, content: str | None) -> None:
+        """A commit the user made on GitHub (None deletes the file)."""
+        files = dict(self.files[full_name])
+        if content is None:
+            files.pop(path)
+        else:
+            files[path] = _file(content)
+        self._commit(full_name, "Edit on GitHub", files, [path], record=False)
+
     def add_repo(
         self, name: str, *, private: bool, files: dict[str, str] | None = None, description: str | None = None
     ) -> GithubRepo:
@@ -217,9 +296,87 @@ class FakeGithubClient:
             self.commits.append((full_name, message, paths))
 
 
-def _file(content: str) -> GithubFile:
-    """A file with the SHA git gives that content."""
-    return GithubFile(content=content, sha=git_blob_sha(content))
+def _file(content: str | bytes) -> GithubFile:
+    """A file with the SHA git gives that content (a binary file's text is its base64)."""
+    text = content if isinstance(content, str) else base64.b64encode(content).decode()
+    return GithubFile(content=text, sha=git_blob_sha(content))
+
+
+class FakeTemplateCatalog:
+    """A catalog with a React template (two themes sharing files, like the real one) and a static one with an
+    image. `unavailable` fails every read."""
+
+    def __init__(self) -> None:
+        self.react_files = TemplateFiles(
+            text={
+                "index.html": "<div id=root></div>\n",
+                "package.json": '{"name": "portfolio"}\n',
+                "src/App.tsx": "export default function App() { return null }\n",
+                "src/content/portfolio.ts": "// placeholder\n",
+                "src/index.css": "body { margin: 0 }\n",
+            },
+            binary={},
+        )
+        self.static_files = TemplateFiles(
+            text={"index.html": "<main></main>\n", "content/portfolio.js": "// placeholder\n", "css/style.css": ""},
+            binary={"assets/me.png": b"\x89PNG\r\n\x1a\n"},
+        )
+        self.entries = {
+            "minimal": self._entry("minimal", "react", theme="minimal"),
+            "terminal": self._entry("terminal", "react", theme="terminal"),
+            "paper": self._entry("paper", "static"),
+        }
+        self.version = 1
+
+    @staticmethod
+    def _entry(id: str, kind: str, theme: str | None = None) -> TemplateEntry:
+        content_path = "src/content/portfolio.ts" if kind == "react" else "content/portfolio.js"
+        folder = "portfolio" if kind == "react" else id
+        return TemplateEntry.model_validate(
+            {
+                "id": id,
+                "kind": kind,
+                "version": 1,
+                "theme": theme,
+                "contentPath": content_path,
+                "filesUrl": f"https://templates.example/{folder}/1/files.json",
+            }
+        )
+
+    async def get_template(self, template_id: str) -> TemplateEntry:
+        entry = self.entries.get(template_id)
+        if entry is None:
+            raise TemplateNotFoundError()
+        return entry.model_copy(update={"version": self.version})
+
+    async def get_files(self, entry: TemplateEntry) -> TemplateFiles:
+        return self.react_files if entry.kind == "react" else self.static_files
+
+
+class FakeDeployPlatforms:
+    """Accepts `VALID_PLATFORM_TOKEN` and records the projects it was asked to prepare."""
+
+    def __init__(self) -> None:
+        self.prepared: list[tuple[PublishTarget, str, str, str | None]] = []
+
+    async def prepare(
+        self, target: PublishTarget, token: str, *, project_name: str, branch: str, account_id: str | None
+    ) -> PreparedProject:
+        if token != VALID_PLATFORM_TOKEN:
+            raise PlatformTokenInvalidError()
+        self.prepared.append((target, project_name, branch, account_id))
+        secrets = {
+            PublishTarget.VERCEL: {"VERCEL_TOKEN": token},
+            PublishTarget.CLOUDFLARE_PAGES: {
+                "CLOUDFLARE_API_TOKEN": token,
+                "CLOUDFLARE_ACCOUNT_ID": account_id or "a" * 32,
+            },
+            PublishTarget.NETLIFY: {"NETLIFY_AUTH_TOKEN": token},
+        }[target]
+        return PreparedProject(site_url=f"https://{project_name}-1a2b.example.app", secrets=secrets)
+
+
+VALID_PLATFORM_TOKEN = "platform-token-123"
 
 
 class FakeModelClient:

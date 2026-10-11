@@ -7,6 +7,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet
 from itsdangerous import BadSignature, URLSafeTimedSerializer
+from nacl.public import PublicKey, SealedBox
 
 
 class InvalidTokenError(Exception):
@@ -58,3 +59,10 @@ class TokenCipher:
 
     def decrypt(self, ciphertext: str) -> str:
         return self._fernet.decrypt(ciphertext.encode()).decode()
+
+
+def seal_for_github(public_key: str, value: str) -> str:
+    """Encrypts a secret for a GitHub repo's Actions (a libsodium sealed box to the repo's base64 public key), so
+    only GitHub can read it. Returns the base64 ciphertext GitHub's secrets API takes."""
+    box = SealedBox(PublicKey(base64.b64decode(public_key)))
+    return base64.b64encode(box.encrypt(value.encode())).decode()
