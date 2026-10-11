@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import status
@@ -13,6 +14,7 @@ from app.clients.github import GithubClient, GithubConflictError, GithubNotFound
 from app.clients.templates import TemplateCatalogClient
 from app.constants.publish import (
     DEFAULT_REPO,
+    DISPATCH_RETRY_DELAYS,
     MANIFEST_FORMAT,
     MANIFEST_PATH,
     MANIFEST_VERSION,
@@ -30,7 +32,8 @@ from app.constants.publish import (
     PublishTarget,
 )
 from app.constants.workspace import WORKSPACE_REPO
-from app.core.exceptions import AppError, ConflictError, NotFoundError
+from app.core.database import utc_now
+from app.core.exceptions import AppError, ConflictError, NotFoundError, ServiceUnavailableError
 from app.core.security import TokenCipher, seal_for_github
 from app.repositories.github_credential import GithubCredentialRepository
 from app.schemas.github import GithubBranchHead, GithubRepo, GithubTreeChange
@@ -114,13 +117,22 @@ class PublishSecretsMissingError(ConflictError):
     message = "Add the deploy secrets to the repository on GitHub first."
 
 
+class PublishDeployNotStartedError(ServiceUnavailableError):
+    """The site is on GitHub, but GitHub wouldn't start its deploy workflow in time. `details` has the `repoName`
+    and `actionsUrl`; running the deploy again (`POST /publish/{id}/deploy`) usually works a moment later."""
+
+    code = "publish_deploy_not_started"
+    message = "Your site's code is on GitHub, but GitHub didn't start the deploy. Try deploying again in a moment."
+
+
 class PublishService:
     """Publishes a site to a repo on the user's GitHub, with a workflow that deploys it to the platform they picked
     (GitHub Pages, Vercel, Cloudflare Pages or Netlify) on every push.
 
     The site is published as saved in the user's private `makable-workspace` repo (the browser saves, then sends
     the saved state's SHA): its content and AI-edited files are read from there, the template comes from the
-    catalog, and the deploy workflow is written here. A publish is one commit.
+    catalog, and the deploy workflow is written here. A publish is one commit (none if nothing changed), then makable
+    starts the deploy. The workflow has no push trigger, so changes made on GitHub only go live with a publish.
 
     A platform token pasted in the chat is checked, used to create the platform project, and saved as an Actions
     secret (sealed so only GitHub can read it); makable stores nothing. Otherwise the user adds the secrets on
@@ -141,6 +153,8 @@ class PublishService:
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         retry_delays: Sequence[float] = NEW_REPO_RETRY_DELAYS,
+        dispatch_delays: Sequence[float] = DISPATCH_RETRY_DELAYS,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._github = github
         self._credentials = credentials
@@ -150,6 +164,8 @@ class PublishService:
         self._workspace = workspace
         self._sleep = sleep
         self._retry_delays = retry_delays
+        self._dispatch_delays = dispatch_delays
+        self._clock = clock
 
     def targets(self) -> list[PublishTargetInfo]:
         """The platforms a site can be published to, with the secrets each one's workflow reads."""
@@ -165,8 +181,9 @@ class PublishService:
 
     async def publish(self, user: UserRead, project_id: UUID, request: PublishRequest) -> PublishResult:
         """Commits the site as saved with `request.state_sha` and its deploy workflow to the site repo (created on
-        first publish), which starts the deploy. With `request.credentials`, first checks the token, creates the
-        platform project and saves the token as an Actions secret.
+        first publish), then starts the deploy, even when nothing changed (it deploys what's on GitHub). With
+        `request.credentials`, first checks the token, creates the platform project and saves the token as an
+        Actions secret. Without the platform's secrets on the repo, the deploy isn't started.
 
         Raises:
             PublishInvalidError: No template picked yet, an edited file isn't a template file, or the repo or
@@ -188,6 +205,7 @@ class PublishService:
             PlatformProjectTakenError: The platform project name belongs to someone else.
             PlatformError: The platform failed.
             GithubPagesUnavailableError: GitHub won't turn Pages on for the repo.
+            PublishDeployNotStartedError: The site was committed, but GitHub wouldn't start the deploy.
             GithubError: GitHub failed.
         """
         target = request.target
@@ -288,20 +306,17 @@ class PublishService:
                     raise PublishChangedOnGithubError() from None
 
         missing = [] if prepared else await self._missing_secrets(token, repo.full_name, target)
-        deploy: DeployState
-        if missing:
-            deploy = "waiting_for_secrets"
-        elif committed:
-            deploy = "started"
-        elif prepared is not None:
-            # Nothing to commit, but there's a new token: deploy with it.
-            await self._github.dispatch_workflow(token, repo.full_name, WORKFLOW_FILE, branch)
-            deploy = "started"
-        else:
-            deploy = "unchanged"
+        deploy: DeployState = "waiting_for_secrets" if missing else "started"
+        started_at = None if missing else await self._start_deploy(token, repo, branch)
         logger.info(
             "site published",
-            extra={"user_id": str(user.id), "project_id": str(project_id), "target": target, "deploy": deploy},
+            extra={
+                "user_id": str(user.id),
+                "project_id": str(project_id),
+                "target": target,
+                "changed": committed,
+                "deploy": deploy,
+            },
         )
         return PublishResult(
             target=target,
@@ -309,7 +324,9 @@ class PublishService:
             repo_url=repo.html_url,
             branch=branch,
             commit_sha=commit_sha,
+            changed=committed,
             deploy=deploy,
+            deploy_started_at=started_at,
             site_url=site_url,
             project_name=project_name,
             missing_secrets=missing,
@@ -329,6 +346,7 @@ class PublishService:
             PublishGithubNotConnectedError: No usable GitHub token.
             PlatformTokenInvalidError: The platform refused the pasted token.
             PlatformError: The platform failed.
+            PublishDeployNotStartedError: GitHub wouldn't start the deploy.
             GithubError: GitHub failed.
         """
         token = await self._token(user)
@@ -342,14 +360,16 @@ class PublishService:
                 raise PublishSecretsMissingError(
                     details={"missing": missing, "secretsUrl": f"{repo.html_url}/settings/secrets/actions"}
                 )
-        try:
-            await self._github.dispatch_workflow(token, repo.full_name, WORKFLOW_FILE, repo.default_branch)
-        except GithubNotFoundError:
-            raise PublishRepoNotFoundError("The deploy workflow is missing. Publish the site again.") from None
-        return DeployStarted(repo_url=repo.html_url, actions_url=f"{repo.html_url}/actions/workflows/{WORKFLOW_FILE}")
+        started_at = await self._start_deploy(token, repo, repo.default_branch)
+        return DeployStarted(
+            repo_url=repo.html_url,
+            actions_url=f"{repo.html_url}/actions/workflows/{WORKFLOW_FILE}",
+            started_at=started_at,
+        )
 
-    async def status(self, user: UserRead, project_id: UUID, repo_name: str) -> PublishStatus:
-        """Where a published site is deployed, and how its latest deploy run went.
+    async def status(self, user: UserRead, project_id: UUID, repo_name: str, since: str | None = None) -> PublishStatus:
+        """Where a published site is deployed, and how its latest deploy run went. With `since` (a deploy's
+        `startedAt`), only a run started then or later, so an earlier run of the same commit isn't taken for it.
 
         Raises:
             PublishRepoNotFoundError: The repo doesn't exist, or holds no makable site.
@@ -359,12 +379,33 @@ class PublishService:
         """
         token = await self._token(user)
         repo, manifest = await self._published(token, user, project_id, repo_name)
-        run = await self._github.latest_workflow_run(token, repo.full_name, WORKFLOW_FILE, repo.default_branch)
+        run = await self._github.latest_workflow_run(
+            token, repo.full_name, WORKFLOW_FILE, repo.default_branch, created_since=since
+        )
         return PublishStatus(
             target=manifest.target,
             site_url=manifest.site_url,
             run=WorkflowRun.model_validate(run.model_dump()) if run else None,
         )
+
+    async def _start_deploy(self, token: str, repo: GithubRepo, branch: str) -> str:
+        """Starts the deploy workflow and returns when (UTC, to the second, as GitHub filters runs).
+
+        Raises:
+            PublishDeployNotStartedError: GitHub still wouldn't start it after the retries.
+        """
+        started_at = self._clock().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # A workflow file that was just written can take GitHub a few seconds to register.
+        for delay in (*self._dispatch_delays, None):
+            try:
+                await self._github.dispatch_workflow(token, repo.full_name, WORKFLOW_FILE, branch)
+                return started_at
+            except GithubNotFoundError:
+                if delay is None:
+                    break
+                await self._sleep(delay)
+        details = {"repoName": repo.name, "actionsUrl": f"{repo.html_url}/actions/workflows/{WORKFLOW_FILE}"}
+        raise PublishDeployNotStartedError(details=details)
 
     async def _token(self, user: UserRead) -> str:
         credential = await self._credentials.get(user.id)

@@ -22,8 +22,8 @@ def steps(job: dict[str, Any]) -> str:
 def test_github_pages_builds_and_deploys_with_pages_permissions() -> None:
     wf = workflow(PublishTarget.GITHUB_PAGES, base_path="/site/")
 
-    # YAML reads the `on` key as True.
-    assert wf[True] == {"push": {"branches": ["main"]}, "workflow_dispatch": None}
+    # YAML reads the `on` key as True. Only started runs: a push never deploys.
+    assert wf[True] == {"workflow_dispatch": None}
     assert wf["permissions"] == {"contents": "read", "pages": "write", "id-token": "write"}
     assert wf["env"] == {"BRANCH": "main", "BASE_PATH": "/site/"}
     job = wf["jobs"]["deploy"]
@@ -31,6 +31,11 @@ def test_github_pages_builds_and_deploys_with_pages_permissions() -> None:
     assert 'npx vite build --base "$BASE_PATH"' in steps(job)
     assert "actions/deploy-pages@v4" in steps(job)
     assert set(wf["jobs"]) == {"deploy"}
+
+
+@pytest.mark.parametrize("target", list(PublishTarget))
+def test_no_workflow_deploys_on_push(target: PublishTarget) -> None:
+    assert workflow(target)[True] == {"workflow_dispatch": None}
 
 
 @pytest.mark.parametrize("target", [PublishTarget.VERCEL, PublishTarget.CLOUDFLARE_PAGES, PublishTarget.NETLIFY])
@@ -71,5 +76,4 @@ def test_values_stay_data() -> None:
     wf = workflow(PublishTarget.VERCEL, branch='x"\n  evil: true', project_name="a")
 
     assert wf["env"]["BRANCH"] == 'x"\n  evil: true'
-    assert wf[True]["push"]["branches"] == ['x"\n  evil: true']
     assert "evil" not in wf

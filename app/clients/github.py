@@ -129,7 +129,7 @@ class GithubClient(Protocol):
     async def dispatch_workflow(self, access_token: str, full_name: str, workflow: str, ref: str) -> None: ...
 
     async def latest_workflow_run(
-        self, access_token: str, full_name: str, workflow: str, branch: str
+        self, access_token: str, full_name: str, workflow: str, branch: str, *, created_since: str | None = None
     ) -> GithubWorkflowRun | None: ...
 
 
@@ -409,7 +409,8 @@ class HttpGithubClient:
         """Starts a workflow that has a `workflow_dispatch` trigger.
 
         Raises:
-            GithubNotFoundError: The workflow isn't on that branch.
+            GithubNotFoundError: The workflow isn't on that branch, or GitHub hasn't registered it (or its
+                `workflow_dispatch` trigger) yet: a workflow file that was just pushed can take a few seconds.
             GithubError: The request failed.
         """
         res = await self._request(
@@ -418,23 +419,26 @@ class HttpGithubClient:
             access_token,
             json={"ref": ref},
         )
-        if res.status_code == status.HTTP_404_NOT_FOUND:
+        # 422 "Workflow does not have 'workflow_dispatch' trigger": GitHub still has the file's previous version.
+        if res.status_code in (status.HTTP_404_NOT_FOUND, status.HTTP_422_UNPROCESSABLE_CONTENT):
             raise GithubNotFoundError()
         if res.is_error:
             raise GithubError(f"starting the workflow failed: HTTP {res.status_code}")
 
     async def latest_workflow_run(
-        self, access_token: str, full_name: str, workflow: str, branch: str
+        self, access_token: str, full_name: str, workflow: str, branch: str, *, created_since: str | None = None
     ) -> GithubWorkflowRun | None:
-        """The newest run of a workflow on a branch, or None if it never ran (or doesn't exist).
+        """The newest run of a workflow on a branch, or None if it never ran (or doesn't exist). With
+        `created_since` (ISO 8601, UTC), only a run created then or later.
 
         Raises:
             GithubError: The request failed.
         """
+        query = f"branch={quote(branch)}&per_page=1"
+        if created_since:
+            query += f"&created={quote('>=' + created_since)}"
         res = await self._request(
-            "GET",
-            f"/repos/{full_name}/actions/workflows/{quote(workflow)}/runs?branch={quote(branch)}&per_page=1",
-            access_token,
+            "GET", f"/repos/{full_name}/actions/workflows/{quote(workflow)}/runs?{query}", access_token
         )
         if res.status_code == status.HTTP_404_NOT_FOUND:
             return None

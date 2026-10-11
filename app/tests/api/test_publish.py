@@ -42,7 +42,8 @@ def test_publish_with_a_token_from_the_chat(client: TestClient, github: FakeGith
 
     assert res.status_code == 200
     data = res.json()["data"]
-    assert data["deploy"] == "started"
+    assert data["deploy"] == "started" and data["changed"] is True and data["deployStartedAt"]
+    assert github.dispatches == [("octocat/portfolio", "makable-deploy.yml", "main")]
     assert data["repoFullName"] == "octocat/portfolio"
     assert data["missingSecrets"] == []
     assert VALID_PLATFORM_TOKEN not in res.text  # never sent back
@@ -64,6 +65,11 @@ def test_publish_then_add_the_secrets_on_github_and_deploy(client: TestClient, g
     assert client.post(f"{PUBLISH}/deploy", json={"repoName": "portfolio"}).status_code == 200
     status = client.get(f"{PUBLISH}/status", params={"repoName": "portfolio"}).json()["data"]
     assert status == {"target": "netlify", "siteUrl": "https://octocat-portfolio.netlify.app", "run": None}
+    started = client.post(f"{PUBLISH}/deploy", json={"repoName": "portfolio"}).json()["data"]["startedAt"]
+    since = client.get(f"{PUBLISH}/status", params={"repoName": "portfolio", "since": started})
+    assert since.status_code == 200 and github.run_queries[-1] == started
+    bad = client.get(f"{PUBLISH}/status", params={"repoName": "portfolio", "since": "yesterday"})
+    assert bad.status_code == 422
 
 
 def test_a_change_on_github_is_a_409_with_the_head_to_confirm(client: TestClient, github: FakeGithubClient) -> None:

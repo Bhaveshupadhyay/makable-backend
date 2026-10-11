@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from app.schemas.publish import DeployRequest, PublishRequest
 from app.schemas.workspace import WorkspaceSave
 from app.services.publish_service import (
     PublishChangedOnGithubError,
+    PublishDeployNotStartedError,
     PublishGithubNotConnectedError,
     PublishInvalidError,
     PublishMissingScopeError,
@@ -36,6 +38,7 @@ from app.tests.services.test_workspace_service import CIPHER, USER, FakeCredenti
 from app.tests.session_fixtures import PROJECT_ID, save_body
 
 PAGES_REPO = "octocat/octocat.github.io"
+NOW = datetime(2026, 10, 11, 13, 45, 7, 512000, tzinfo=UTC)
 SITE_REPO = "octocat/portfolio"
 
 
@@ -55,6 +58,8 @@ class Setup:
             self.workspace,
             sleep=no_sleep,
             retry_delays=(0.1,),
+            dispatch_delays=(0.1, 0.1),
+            clock=lambda: NOW,
         )
         self.sha: str | None = None
         self._saved: Any = None
@@ -124,7 +129,10 @@ async def test_the_first_github_pages_publish_creates_the_user_site_and_commits_
     assert message.startswith("Publish from makable to GitHub Pages")
     assert PAGES_REPO in s.github.pages
     assert s.workflow(PAGES_REPO)["env"]["BASE_PATH"] == "/"
-    assert result.deploy == "started" and result.missing_secrets == []
+    assert result.deploy == "started" and result.missing_secrets == [] and result.changed
+    # makable starts the deploy itself (the workflow has no push trigger), and says when, to the second.
+    assert s.github.dispatches == [(PAGES_REPO, "makable-deploy.yml", "main")]
+    assert result.deploy_started_at == "2026-10-11T13:45:07Z"
     assert result.site_url == "https://octocat.github.io/"
     assert result.repo_url == f"https://github.com/{PAGES_REPO}"
     assert result.actions_url == f"https://github.com/{PAGES_REPO}/actions/workflows/makable-deploy.yml"
@@ -160,7 +168,8 @@ async def test_without_a_token_the_user_adds_the_secrets_on_github_then_deploys(
 
     result = await s.publish(target="cloudflare-pages")
 
-    assert result.deploy == "waiting_for_secrets"
+    assert result.deploy == "waiting_for_secrets" and result.deploy_started_at is None
+    assert s.github.dispatches == []  # not started without the secrets
     assert result.missing_secrets == ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
     assert result.secrets_url == f"https://github.com/{SITE_REPO}/settings/secrets/actions"
     assert result.site_url == "https://octocat-portfolio.pages.dev"
@@ -175,7 +184,10 @@ async def test_without_a_token_the_user_adds_the_secrets_on_github_then_deploys(
 
     assert s.github.dispatches == [(SITE_REPO, "makable-deploy.yml", "main")]
     assert started.actions_url.endswith("/actions/workflows/makable-deploy.yml")
-    assert (await s.publish(target="cloudflare-pages")).deploy == "unchanged"
+    assert started.started_at == "2026-10-11T13:45:07Z"
+    again = await s.publish(target="cloudflare-pages")
+    assert (again.deploy, again.changed) == ("started", False)
+    assert len(s.github.dispatches) == 2
 
 
 async def test_a_token_can_be_pasted_after_publishing() -> None:
@@ -197,20 +209,46 @@ async def test_a_republish_only_commits_what_changed() -> None:
     await s.publish()
 
     unchanged = await s.publish()
-    assert unchanged.deploy == "unchanged" and len(s.commits(PAGES_REPO)) == 1
+    assert not unchanged.changed and len(s.commits(PAGES_REPO)) == 1
 
     await s.publish(portfolio={**PORTFOLIO, "skills": ["Rust"]})
     assert s.commits(PAGES_REPO)[-1][1] == ["src/content/portfolio.ts", MANIFEST_PATH]
 
 
-async def test_a_new_token_with_nothing_to_commit_deploys_again() -> None:
+async def test_every_publish_deploys_even_with_nothing_new_to_commit() -> None:
     s = Setup()
     await s.publish(target="vercel", credentials={"token": VALID_PLATFORM_TOKEN})
+    # A file the user added on GitHub isn't live until they publish (pushes don't deploy).
+    s.github.edit_on_github(SITE_REPO, "CNAME", "me.dev\n")
+    assert len(s.github.dispatches) == 1
 
-    result = await s.publish(target="vercel", credentials={"token": VALID_PLATFORM_TOKEN})
+    result = await s.publish(target="vercel")
 
-    assert result.deploy == "started"
-    assert s.github.dispatches == [(SITE_REPO, "makable-deploy.yml", "main")]
+    assert (result.deploy, result.changed) == ("started", False)
+    assert s.github.dispatches == [(SITE_REPO, "makable-deploy.yml", "main")] * 2
+
+
+async def test_starting_the_deploy_waits_for_github_to_register_the_workflow() -> None:
+    s = Setup()
+    s.github.dispatch_not_ready = 2
+
+    result = await s.publish()
+
+    assert result.deploy == "started" and len(s.github.dispatches) == 1
+
+
+async def test_a_deploy_github_wont_start_says_the_code_is_there() -> None:
+    s = Setup()
+    s.github.dispatch_not_ready = 99
+
+    with pytest.raises(PublishDeployNotStartedError) as err:
+        await s.publish(target="netlify", credentials={"token": VALID_PLATFORM_TOKEN})
+
+    assert err.value.details == {
+        "repoName": "portfolio",
+        "actionsUrl": f"https://github.com/{SITE_REPO}/actions/workflows/makable-deploy.yml",
+    }
+    assert len(s.commits(SITE_REPO)) == 1  # the site is committed; deploying again starts it
 
 
 async def test_switching_template_and_platform_replaces_makables_files_only() -> None:
@@ -352,6 +390,9 @@ async def test_status_reads_the_latest_run() -> None:
     )
 
     status = await s.service.status(USER, PROJECT_ID, "portfolio")
+    # A run from before the deploy being followed isn't taken for it.
+    assert (await s.service.status(USER, PROJECT_ID, "portfolio", since="2026-10-11T10:00:01Z")).run is None
+    assert s.github.run_queries[-1] == "2026-10-11T10:00:01Z"
 
     assert status.target == PublishTarget.NETLIFY
     assert status.site_url == "https://octocat-portfolio.netlify.app"
