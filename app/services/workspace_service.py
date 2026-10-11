@@ -20,6 +20,7 @@ from app.constants.workspace import (
     NEW_REPO_RETRY_DELAYS,
     PROJECTS_DIR,
     SAVE_DEADLINE_SECONDS,
+    SNAPSHOT_READS_AT_ONCE,
     STATE_FILE,
     VERIFIED_REPO_TTL,
     WORKSPACE_DESCRIPTION,
@@ -35,6 +36,7 @@ from app.schemas.workspace import (
     WorkspacePartRead,
     WorkspaceSave,
     WorkspaceSaved,
+    WorkspaceSnapshot,
     WorkspaceState,
     WorkspaceStateRead,
     check_part_path,
@@ -220,6 +222,63 @@ class WorkspaceService:
             raise WorkspacePartNotFoundError()
         return WorkspacePartRead(path=path, content=file.content)
 
+    async def read_snapshot(
+        self, user: UserRead, project_id: UUID, state_sha: str, *, max_files: int
+    ) -> WorkspaceSnapshot:
+        """A site's saved state and the AI-edited files of its current template, exactly as saved with
+        `state_sha` (the files are read from that commit's tree, so they belong to that state). Publishing builds
+        the site from this, so the browser never sends it again.
+
+        Raises:
+            WorkspaceSessionNotFoundError: Nothing is saved for that site.
+            WorkspaceConflictError: The saved state isn't `state_sha` any more (another device saved since).
+            WorkspaceInvalidError: The saved state can't be read, or lists more than `max_files` files.
+            WorkspacePartNotFoundError: A file the state lists isn't saved.
+            WorkspaceRepoTakenError: The repo exists but makable didn't create it.
+            WorkspaceRepoPublicError: The repo is public.
+            GithubNotConnectedError: No usable GitHub token.
+            GithubError: GitHub failed.
+        """
+        token = await self._token(user)
+        repo = await self._workspace(token, user)
+        if repo is None:
+            raise WorkspaceSessionNotFoundError()
+        try:
+            head = await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
+        except GithubNotFoundError:
+            self._verified.discard(user)
+            raise WorkspaceSessionNotFoundError() from None
+        tree = await self._github.get_tree(token, repo.full_name, head.tree_sha)
+        folder = project_dir(str(project_id))
+        current = tree.get(f"{folder}/{STATE_FILE}")
+        if current is None:
+            raise WorkspaceSessionNotFoundError()
+        if current != state_sha:
+            raise WorkspaceConflictError(details={"sha": current})
+        content = await self._github.get_blob(token, repo.full_name, current)
+        state = _parse_state(GithubFile(content=content, sha=current))
+        if state is None or state.project_id != project_id:
+            raise WorkspaceInvalidError("The saved session can't be read")
+        portfolio = state.conversation.portfolio
+        template = portfolio.template if portfolio else None
+        paths = state.files.get(template, []) if template else []
+        if len(paths) > max_files:
+            raise WorkspaceInvalidError(f"The site has more than {max_files} AI-edited files")
+        shas: dict[str, str] = {}
+        for path in paths:
+            sha = tree.get(f"{folder}/files/{template}/{path}")
+            if sha is None:
+                raise WorkspacePartNotFoundError(f"The saved session is missing {path}. Save it again.")
+            shas[path] = sha
+        limit = asyncio.Semaphore(SNAPSHOT_READS_AT_ONCE)
+
+        async def read(path: str, sha: str) -> tuple[str, str]:
+            async with limit:
+                return path, await self._github.get_blob(token, repo.full_name, sha)
+
+        files = await asyncio.gather(*(read(path, sha) for path, sha in shas.items()))
+        return WorkspaceSnapshot(state=state, files=dict(files))
+
     async def save(self, user: UserRead, project_id: UUID, save: WorkspaceSave) -> WorkspaceSaved:
         """Saves the changed files of a site's session and its new state as one commit, creating the private
         workspace repo on first use. Nothing is written if the state changed on GitHub since `save.base_sha`.
@@ -316,7 +375,7 @@ class WorkspaceService:
 
     async def _create_workspace(self, token: str, user: UserRead) -> GithubRepo:
         try:
-            repo = await self._github.create_private_repo(token, WORKSPACE_REPO, WORKSPACE_DESCRIPTION)
+            repo = await self._github.create_repo(token, WORKSPACE_REPO, WORKSPACE_DESCRIPTION, private=True)
         except GithubRepoExistsError:
             # Another tab created it a moment ago, or it isn't ours: check it like any existing repo.
             existing = await self._workspace(token, user)
@@ -395,7 +454,7 @@ def _serialize(state: WorkspaceState) -> str:
     return json.dumps(state.model_dump(mode="json", by_alias=True, exclude_unset=True), indent=2) + "\n"
 
 
-def git_blob_sha(content: str) -> str:
+def git_blob_sha(content: str | bytes) -> str:
     """The SHA git (and so GitHub) gives a file with this content: what the next save must send back."""
-    data = content.encode()
+    data = content.encode() if isinstance(content, str) else content
     return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()

@@ -14,12 +14,17 @@ from fastapi import Cookie, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.cookies import AuthCookies
+from app.clients.deploy_platforms import DeployPlatformClient, HttpDeployPlatformClient
 from app.clients.github import GithubClient, HttpGithubClient
 from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
+from app.clients.templates import HttpTemplateCatalog, TemplateCatalogClient
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
+    MAX_CONCURRENT_PUBLISH_REQUESTS,
     MAX_CONCURRENT_WORKSPACE_REQUESTS,
+    PUBLISH_BURST,
+    PUBLISH_EVERY_SECONDS,
     WORKSPACE_SAVE_BURST,
     WORKSPACE_SAVE_EVERY_SECONDS,
 )
@@ -37,6 +42,7 @@ from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiEditService
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
+from app.services.publish_service import PublishService
 from app.services.workspace_service import WorkspaceService
 
 # --- App-wide singletons ---
@@ -75,6 +81,14 @@ def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient:
         model=settings.ai_model,
         timeout_seconds=settings.ai_timeout_seconds,
     )
+
+
+def get_template_catalog(http: HttpClientDep, settings: SettingsDep) -> TemplateCatalogClient:
+    return HttpTemplateCatalog(http, settings.template_catalog_url)
+
+
+def get_deploy_platform_client(http: HttpClientDep) -> DeployPlatformClient:
+    return HttpDeployPlatformClient(http)
 
 
 def get_supabase_client(http: HttpClientDep, settings: SettingsDep) -> SupabaseAuthClient:
@@ -148,7 +162,19 @@ def get_workspace_service(
     return WorkspaceService(github, credentials, cipher)
 
 
+def get_publish_service(
+    github: Annotated[GithubClient, Depends(get_github_client)],
+    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+    templates: Annotated[TemplateCatalogClient, Depends(get_template_catalog)],
+    platforms: Annotated[DeployPlatformClient, Depends(get_deploy_platform_client)],
+    workspace: Annotated[WorkspaceService, Depends(get_workspace_service)],
+) -> PublishService:
+    return PublishService(github, credentials, cipher, templates, platforms, workspace)
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
@@ -188,6 +214,8 @@ def require_roles(*roles: Role) -> Callable[[UserRead], Awaitable[UserRead]]:
 AI_EDIT_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS)
 WORKSPACE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS)
 WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS)
+PUBLISH_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS)
+PUBLISHES = PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS)
 
 
 async def ai_edit_slot() -> AsyncIterator[None]:
@@ -218,4 +246,25 @@ async def workspace_save_limit(user: CurrentUserDep) -> AsyncIterator[None]:
         TooManyRequestsError: The user has a save in progress, or saved too often.
     """
     async with WORKSPACE_SAVES.hold(user.id):
+        yield
+
+
+async def publish_slot() -> AsyncIterator[None]:
+    """A slot for a publish request (it waits on GitHub and the hosting platform), held until the response is done.
+
+    Raises:
+        ServiceBusyError: This worker has as many in progress as it allows.
+    """
+    async with PUBLISH_SLOTS.slot():
+        yield
+
+
+async def publish_limit(user: CurrentUserDep) -> AsyncIterator[None]:
+    """One publish or deploy at a time per user, in bursts of at most `PUBLISH_BURST`, then one per
+    `PUBLISH_EVERY_SECONDS`.
+
+    Raises:
+        TooManyRequestsError: The user has one in progress, or published too often.
+    """
+    async with PUBLISHES.hold(user.id):
         yield

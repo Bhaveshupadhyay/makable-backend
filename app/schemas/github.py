@@ -25,6 +25,7 @@ class GithubRepo(BaseModel):
     html_url: str
     default_branch: str
     description: str | None = None
+    archived: bool = False
 
 
 class GithubFile(BaseModel):
@@ -48,7 +49,22 @@ class GithubBranchHead(BaseModel):
 
 
 class GithubTreeChange(BaseModel):
-    """One file in a new commit: its new text, or None to delete it."""
+    """One file in a new commit: its new text, its bytes (a binary file, e.g. an image), or None to delete it."""
 
     path: str
-    content: str | None
+    content: str | bytes | None
+
+
+class GithubActionsKey(BaseModel):
+    """The public key a repo's Actions secrets are encrypted with."""
+
+    key_id: str
+    key: str
+
+
+class GithubWorkflowRun(BaseModel):
+    status: str
+    conclusion: str | None = None
+    head_sha: str
+    html_url: str
+    created_at: str

@@ -16,3 +16,8 @@ MAX_CONCURRENT_WORKSPACE_REQUESTS = 100
 # Workspace saves per user: bursts of up to this many (the batches of a big save), then one per this many seconds.
 WORKSPACE_SAVE_BURST = 20
 WORKSPACE_SAVE_EVERY_SECONDS = 15
+# Publish requests in progress at once, per worker (each makes a dozen or so GitHub requests).
+MAX_CONCURRENT_PUBLISH_REQUESTS = 20
+# Publishes per user: bursts of up to this many, then one per this many seconds (about 30 an hour).
+PUBLISH_BURST = 5
+PUBLISH_EVERY_SECONDS = 120

@@ -49,3 +49,5 @@ NEW_REPO_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
 # is slow. The commit itself isn't cut short: stopping it part-way could move the branch without the browser
 # knowing, and the next save would then look like a conflict. Its requests still have their own timeouts.
 SAVE_DEADLINE_SECONDS = 20.0
+# AI-edited files read at once when a site is published from its saved session.
+SNAPSHOT_READS_AT_ONCE = 8

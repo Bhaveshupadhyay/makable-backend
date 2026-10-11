@@ -108,6 +108,10 @@ class Settings(DatabaseSettings):
     # Adds what the model was given to AI edit responses. Never turn it on in production.
     ai_debug: bool = False
 
+    # The published template catalog: the same one the SPA's preview loads, so a published site is the one the
+    # user saw. Template files are only read from this URL's host.
+    template_catalog_url: str = "https://bhaveshupadhyay.github.io/makable-templates/catalog.json"
+
     @field_validator("app_url", "supabase_url", "ai_base_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:

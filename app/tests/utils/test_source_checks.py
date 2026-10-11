@@ -1,7 +1,9 @@
 import pytest
 
+from app.schemas.portfolio import Portfolio
 from app.tests.ai_edit_fixtures import PORTFOLIO, render_portfolio_source
 from app.utils.portfolio_source import PortfolioSourceError, parse_portfolio_source
+from app.utils.portfolio_source import render_portfolio_source as render
 from app.utils.syntax_check import css_braces_balanced, script_language, script_syntax_error
 
 
@@ -11,6 +13,22 @@ def test_parses_the_content_files_the_spa_renders() -> None:
 
     assert parse_portfolio_source(react).profile.name == "Ada"
     assert parse_portfolio_source(static).template == "minimal"
+
+
+def test_renders_the_content_file_like_the_spa() -> None:
+    portfolio = Portfolio.model_validate({**PORTFOLIO, "skills": ["Café ☕", 'Say "hi"']})
+
+    react = render(portfolio, "react")
+
+    # Byte for byte what `renderPortfolioSource` writes (JSON.stringify keeps non-ASCII as is).
+    assert react == render_portfolio_source({**PORTFOLIO, "skills": ["Café ☕", 'Say "hi"']}).replace(
+        "\\u00e9 \\u2615", "é ☕"
+    )
+    assert "Café ☕" in react
+    assert parse_portfolio_source(react) == portfolio
+    static = render(portfolio, "static")
+    assert static.startswith("// All copy on the site lives here.") and "import type" not in static
+    assert parse_portfolio_source(static) == portfolio
 
 
 @pytest.mark.parametrize(

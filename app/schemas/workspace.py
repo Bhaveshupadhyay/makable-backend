@@ -148,6 +148,14 @@ class WorkspaceStateRead(CamelModel):
         return state.model_dump(mode="json", by_alias=True, exclude_unset=True)
 
 
+class WorkspaceSnapshot(CamelModel):
+    """A saved state and the AI-edited files of its current template, all from one commit."""
+
+    state: WorkspaceState
+    # Repo path inside the template -> contents.
+    files: dict[str, str]
+
+
 class WorkspacePartRead(CamelModel):
     path: str
     content: str

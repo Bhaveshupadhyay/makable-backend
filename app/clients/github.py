@@ -13,12 +13,14 @@ from pydantic import BaseModel
 from app.core.exceptions import ExternalServiceError
 from app.core.limits import ServiceBusyError
 from app.schemas.github import (
+    GithubActionsKey,
     GithubBranchHead,
     GithubDirEntry,
     GithubFile,
     GithubRepo,
     GithubTreeChange,
     GithubUser,
+    GithubWorkflowRun,
 )
 
 API_URL = "https://api.github.com"
@@ -70,12 +72,24 @@ class GithubConflictError(GithubError):
     message = "The file changed on GitHub"
 
 
+class GithubPagesUnavailableError(GithubError):
+    """GitHub refused to turn Pages on for the repo (a private repo on the free plan, or an organisation policy)."""
+
+    status_code = status.HTTP_409_CONFLICT
+    code = "github_pages_unavailable"
+    message = "GitHub Pages can't be turned on for this repository."
+
+
 class GithubClient(Protocol):
     async def get_user(self, access_token: str) -> GithubUser: ...
 
+    async def get_scopes(self, access_token: str) -> set[str] | None: ...
+
     async def get_repo(self, access_token: str, full_name: str) -> GithubRepo | None: ...
 
-    async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo: ...
+    async def create_repo(
+        self, access_token: str, name: str, description: str, *, private: bool, homepage: str | None = None
+    ) -> GithubRepo: ...
 
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None: ...
 
@@ -97,6 +111,26 @@ class GithubClient(Protocol):
         *,
         message: str,
     ) -> str: ...
+
+    async def get_tree(self, access_token: str, full_name: str, tree_sha: str) -> dict[str, str]: ...
+
+    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str: ...
+
+    async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey: ...
+
+    async def put_actions_secret(
+        self, access_token: str, full_name: str, name: str, encrypted_value: str, key_id: str
+    ) -> None: ...
+
+    async def has_actions_secret(self, access_token: str, full_name: str, name: str) -> bool: ...
+
+    async def enable_pages_workflow(self, access_token: str, full_name: str) -> None: ...
+
+    async def dispatch_workflow(self, access_token: str, full_name: str, workflow: str, ref: str) -> None: ...
+
+    async def latest_workflow_run(
+        self, access_token: str, full_name: str, workflow: str, branch: str
+    ) -> GithubWorkflowRun | None: ...
 
 
 class HttpGithubClient:
@@ -125,22 +159,40 @@ class HttpGithubClient:
             return None
         return _parse(GithubRepo, res, "fetching the repository")
 
-    async def create_private_repo(self, access_token: str, name: str, description: str) -> GithubRepo:
-        """Creates a private repository for the user, with a first commit so files can be written right away.
+    async def get_scopes(self, access_token: str) -> set[str] | None:
+        """The OAuth scopes the token was granted, from GitHub's `X-OAuth-Scopes` header. None when GitHub doesn't
+        say (tokens that aren't OAuth App tokens).
+
+        Raises:
+            GithubError: The request failed.
+        """
+        res = await self._request("GET", "/user", access_token)
+        _json(res, "fetching the user")
+        header = res.headers.get("x-oauth-scopes")
+        if header is None:
+            return None
+        return {scope.strip() for scope in header.split(",") if scope.strip()}
+
+    async def create_repo(
+        self, access_token: str, name: str, description: str, *, private: bool, homepage: str | None = None
+    ) -> GithubRepo:
+        """Creates a repository for the user, with a first commit so files can be written right away.
 
         Raises:
             GithubRepoExistsError: The user already has a repository with that name.
             GithubError: The request failed.
         """
-        body = {
+        body: dict[str, Any] = {
             "name": name,
             "description": description,
-            "private": True,
+            "private": private,
             "auto_init": True,
             "has_issues": False,
             "has_projects": False,
             "has_wiki": False,
         }
+        if homepage:
+            body["homepage"] = homepage
         res = await self._request("POST", "/user/repos", access_token, json=body)
         if res.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
             raise GithubRepoExistsError()
@@ -233,17 +285,22 @@ class HttpGithubClient:
     ) -> str:
         """Writes and deletes several files as one commit on top of `head`, then moves the branch to it. Nothing
         is visible until the branch moves, so a failure part-way leaves the repo unchanged. Returns the commit SHA.
+        Binary files are uploaded as blobs first (a tree only takes text inline).
 
         Raises:
             GithubConflictError: The branch moved since `head` was read (another save got in first).
             GithubError: A request failed.
         """
-        tree = [
-            {"path": c.path, "mode": "100644", "type": "blob", "content": c.content}
-            if c.content is not None
-            else {"path": c.path, "mode": "100644", "type": "blob", "sha": None}
-            for c in changes
-        ]
+        tree: list[dict[str, Any]] = []
+        for c in changes:
+            entry: dict[str, Any] = {"path": c.path, "mode": "100644", "type": "blob"}
+            if isinstance(c.content, bytes):
+                entry["sha"] = await self._create_blob(access_token, full_name, c.content)
+            elif c.content is not None:
+                entry["content"] = c.content
+            else:
+                entry["sha"] = None
+            tree.append(entry)
         res = await self._request(
             "POST", f"/repos/{full_name}/git/trees", access_token, json={"base_tree": head.tree_sha, "tree": tree}
         )
@@ -266,6 +323,137 @@ class HttpGithubClient:
             raise GithubConflictError()
         _json(res, "moving the branch")
         return commit_sha
+
+    async def get_tree(self, access_token: str, full_name: str, tree_sha: str) -> dict[str, str]:
+        """Every file in a tree, recursively: path -> blob SHA.
+
+        Raises:
+            GithubError: The request failed, or the tree is too big for GitHub to list in one answer.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/git/trees/{tree_sha}?recursive=1", access_token)
+        data = _json(res, "reading the files")
+        if data.get("truncated"):
+            raise GithubError("reading the files failed: the repository has too many files")
+        return {str(e["path"]): str(e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"}
+
+    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
+        """A text file's contents by its blob SHA (which never changes, unlike a path on a branch).
+
+        Raises:
+            GithubNotFoundError: No such blob.
+            GithubError: The request failed, or the file isn't UTF-8 text.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/git/blobs/{sha}", access_token)
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            raise GithubNotFoundError()
+        try:
+            return base64.b64decode(_json(res, "reading the file")["content"]).decode()
+        except (KeyError, TypeError, ValueError) as err:
+            raise GithubError("reading the file failed: not a text file") from err
+
+    async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey:
+        """The public key the repo's Actions secrets are encrypted with.
+
+        Raises:
+            GithubError: The request failed.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/actions/secrets/public-key", access_token)
+        return _parse(GithubActionsKey, res, "reading the secrets key")
+
+    async def put_actions_secret(
+        self, access_token: str, full_name: str, name: str, encrypted_value: str, key_id: str
+    ) -> None:
+        """Creates or replaces an Actions secret. `encrypted_value` is sealed with the repo's key (base64).
+
+        Raises:
+            GithubError: The request failed.
+        """
+        res = await self._request(
+            "PUT",
+            f"/repos/{full_name}/actions/secrets/{quote(name)}",
+            access_token,
+            json={"encrypted_value": encrypted_value, "key_id": key_id},
+        )
+        if res.is_error:
+            raise GithubError(f"saving the secret failed: HTTP {res.status_code}")
+
+    async def has_actions_secret(self, access_token: str, full_name: str, name: str) -> bool:
+        """Whether the repo has an Actions secret with this name (GitHub never gives its value back).
+
+        Raises:
+            GithubError: The request failed.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/actions/secrets/{quote(name)}", access_token)
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            return False
+        _json(res, "reading the secret")
+        return True
+
+    async def enable_pages_workflow(self, access_token: str, full_name: str) -> None:
+        """Turns GitHub Pages on, deployed by a workflow (or switches it to that if it's on already).
+
+        Raises:
+            GithubPagesUnavailableError: GitHub won't turn Pages on for this repo.
+            GithubError: The request failed.
+        """
+        body = {"build_type": "workflow"}
+        res = await self._request("POST", f"/repos/{full_name}/pages", access_token, json=body)
+        if res.status_code == status.HTTP_409_CONFLICT:  # Already on.
+            res = await self._request("PUT", f"/repos/{full_name}/pages", access_token, json=body)
+        if res.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_422_UNPROCESSABLE_CONTENT):
+            raise GithubPagesUnavailableError()
+        if res.is_error:
+            raise GithubError(f"turning on GitHub Pages failed: HTTP {res.status_code}")
+
+    async def dispatch_workflow(self, access_token: str, full_name: str, workflow: str, ref: str) -> None:
+        """Starts a workflow that has a `workflow_dispatch` trigger.
+
+        Raises:
+            GithubNotFoundError: The workflow isn't on that branch.
+            GithubError: The request failed.
+        """
+        res = await self._request(
+            "POST",
+            f"/repos/{full_name}/actions/workflows/{quote(workflow)}/dispatches",
+            access_token,
+            json={"ref": ref},
+        )
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            raise GithubNotFoundError()
+        if res.is_error:
+            raise GithubError(f"starting the workflow failed: HTTP {res.status_code}")
+
+    async def latest_workflow_run(
+        self, access_token: str, full_name: str, workflow: str, branch: str
+    ) -> GithubWorkflowRun | None:
+        """The newest run of a workflow on a branch, or None if it never ran (or doesn't exist).
+
+        Raises:
+            GithubError: The request failed.
+        """
+        res = await self._request(
+            "GET",
+            f"/repos/{full_name}/actions/workflows/{quote(workflow)}/runs?branch={quote(branch)}&per_page=1",
+            access_token,
+        )
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            return None
+        runs = _json(res, "reading the workflow runs").get("workflow_runs", [])
+        if not runs:
+            return None
+        try:
+            return GithubWorkflowRun.model_validate(runs[0])
+        except ValueError as err:
+            raise GithubError(f"reading the workflow runs failed: {err}") from err
+
+    async def _create_blob(self, access_token: str, full_name: str, data: bytes) -> str:
+        res = await self._request(
+            "POST",
+            f"/repos/{full_name}/git/blobs",
+            access_token,
+            json={"content": base64.b64encode(data).decode(), "encoding": "base64"},
+        )
+        return str(_json(res, "uploading a file")["sha"])
 
     async def _request(
         self, method: str, path: str, access_token: str, *, json: dict[str, Any] | None = None
