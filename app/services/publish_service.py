@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from fastapi import status
@@ -14,6 +14,7 @@ from app.clients.github import GithubClient, GithubConflictError, GithubNotFound
 from app.clients.templates import TemplateCatalogClient
 from app.constants.publish import (
     DEFAULT_REPO,
+    DEPLOY_CLOCK_SKEW_SECONDS,
     DISPATCH_RETRY_DELAYS,
     MANIFEST_FORMAT,
     MANIFEST_PATH,
@@ -389,12 +390,14 @@ class PublishService:
         )
 
     async def _start_deploy(self, token: str, repo: GithubRepo, branch: str) -> str:
-        """Starts the deploy workflow and returns when (UTC, to the second, as GitHub filters runs).
+        """Starts the deploy workflow and returns when (UTC, to the second, less a clock-skew margin).
 
         Raises:
             PublishDeployNotStartedError: GitHub still wouldn't start it after the retries.
         """
-        started_at = self._clock().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # A little early, in case GitHub's clock is behind ours: its run would look older than the deploy otherwise.
+        started = self._clock() - timedelta(seconds=DEPLOY_CLOCK_SKEW_SECONDS)
+        started_at = started.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
         # A workflow file that was just written can take GitHub a few seconds to register.
         for delay in (*self._dispatch_delays, None):
             try:

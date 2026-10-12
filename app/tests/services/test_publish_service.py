@@ -132,7 +132,7 @@ async def test_the_first_github_pages_publish_creates_the_user_site_and_commits_
     assert result.deploy == "started" and result.missing_secrets == [] and result.changed
     # makable starts the deploy itself (the workflow has no push trigger), and says when, to the second.
     assert s.github.dispatches == [(PAGES_REPO, "makable-deploy.yml", "main")]
-    assert result.deploy_started_at == "2026-10-11T13:45:07Z"
+    assert result.deploy_started_at == "2026-10-11T13:44:57Z"
     assert result.site_url == "https://octocat.github.io/"
     assert result.repo_url == f"https://github.com/{PAGES_REPO}"
     assert result.actions_url == f"https://github.com/{PAGES_REPO}/actions/workflows/makable-deploy.yml"
@@ -184,7 +184,7 @@ async def test_without_a_token_the_user_adds_the_secrets_on_github_then_deploys(
 
     assert s.github.dispatches == [(SITE_REPO, "makable-deploy.yml", "main")]
     assert started.actions_url.endswith("/actions/workflows/makable-deploy.yml")
-    assert started.started_at == "2026-10-11T13:45:07Z"
+    assert started.started_at == "2026-10-11T13:44:57Z"
     again = await s.publish(target="cloudflare-pages")
     assert (again.deploy, again.changed) == ("started", False)
     assert len(s.github.dispatches) == 2
