@@ -135,6 +135,16 @@ def test_models_are_picked_and_shown_in_the_menu(client: TestClient, models: dic
     ]
 
 
+def test_a_check_drops_models_the_provider_no_longer_lists(client: TestClient, ai_providers: FakeAiProviders) -> None:
+    sign_in(client)
+    key = add_key(client, models=["gpt-5", "o4-mini"]).json()["data"]["key"]
+    ai_providers.models = ["gpt-5"]
+
+    checked = client.post(f"{AI}/keys/{key['id']}/check").json()["data"]
+
+    assert (checked["key"]["status"], checked["key"]["models"]) == ("valid", ["gpt-5"])
+
+
 def test_a_check_marks_a_refused_key_invalid_and_the_menu_drops_it(
     client: TestClient, ai_providers: FakeAiProviders, models: dict[str, Any]
 ) -> None:

@@ -1,9 +1,12 @@
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants.ai_keys import AiKeyStatus, AiProvider
 from app.core.database import utc_now
+from app.core.exceptions import ConflictError
+from app.models.ai_key import AiKey
 from app.repositories.ai_key import SqlAiKeyRepository
 from app.repositories.user import SqlUserRepository
 from app.schemas.ai_key import AiKeyStatusUpdate, AiKeyUpsert
@@ -69,3 +72,14 @@ async def test_models_and_status_are_written_and_keys_deleted(session: AsyncSess
 
     await keys.delete(stored)
     assert await keys.list_for_user(alice) == []
+
+
+async def test_a_key_added_by_a_concurrent_request_is_a_conflict(session: AsyncSession) -> None:
+    keys = SqlAiKeyRepository(session)
+    alice = await make_user(session, 1)
+    # Another worker's insert, which this request's lookup didn't see.
+    session.add(AiKey(**key_for(alice).model_dump()))
+
+    with pytest.raises(ConflictError) as err:
+        await keys.upsert(key_for(alice))
+    assert err.value.code == "ai_key_conflict"

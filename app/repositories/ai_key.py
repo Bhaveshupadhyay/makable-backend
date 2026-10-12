@@ -2,9 +2,11 @@ from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants.ai_keys import AiProvider
+from app.core.exceptions import ConflictError
 from app.models.ai_key import AiKey
 from app.schemas.ai_key import AiKeyStatusUpdate, AiKeyUpsert
 
@@ -44,7 +46,12 @@ class SqlAiKeyRepository:
         return await self._session.scalar(select(AiKey).where(AiKey.user_id == user_id, AiKey.provider == provider))
 
     async def upsert(self, data: AiKeyUpsert) -> AiKey:
-        """Adds the user's key for the provider, or replaces the one they have (keeping its id)."""
+        """Adds the user's key for the provider, or replaces the one they have (keeping its id).
+
+        Raises:
+            ConflictError: Another request added a key for this provider at the same time. The session must then
+                be rolled back.
+        """
         key = await self.get_by_provider(data.user_id, data.provider)
         if key is None:
             key = AiKey(**data.model_dump())
@@ -52,7 +59,10 @@ class SqlAiKeyRepository:
         else:
             for field, value in data.model_dump(exclude={"user_id", "provider"}).items():
                 setattr(key, field, value)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as err:
+            raise ConflictError("A key for this provider was just saved. Try again.", code="ai_key_conflict") from err
         return key
 
     async def set_models(self, key: AiKey, models: list[str]) -> AiKey:

@@ -15,6 +15,7 @@ ERRORS: dict[int | str, dict[str, Any]] = {
 }
 CHECK_ERRORS: dict[int | str, dict[str, Any]] = {
     **ERRORS,
+    status.HTTP_409_CONFLICT: {"model": ErrorResponse},
     status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
     status.HTTP_429_TOO_MANY_REQUESTS: {"model": ErrorResponse},
     status.HTTP_502_BAD_GATEWAY: {"model": ErrorResponse},

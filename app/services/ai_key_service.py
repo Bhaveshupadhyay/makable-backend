@@ -78,6 +78,7 @@ class AiKeyService:
             AiKeyInvalidError: The provider refused the key. Nothing is stored.
             ModelRateLimitedError: The provider is rate limiting the key. Nothing is stored.
             AiProviderError: The provider failed. Nothing is stored.
+            ConflictError: Another request added a key for this provider at the same time.
         """
         api_key = data.api_key.get_secret_value()
         available = await self._providers.list_models(data.provider, api_key)
@@ -115,7 +116,8 @@ class AiKeyService:
 
     async def check_key(self, user_id: UUID, key_id: UUID) -> AiKeyChecked:
         """Asks the provider again whether the key works, and records the answer. A refused key is marked invalid
-        rather than raised.
+        rather than raised (its models are kept, for when it's replaced); a working key drops models the provider
+        no longer lists.
 
         Raises:
             AiKeyNotFoundError: The user has no such key.
@@ -131,6 +133,8 @@ class AiKeyService:
             key_status = AiKeyStatus.INVALID
         else:
             key_status = AiKeyStatus.VALID
+            usable = set(available)
+            key = await self._keys.set_models(key, [m for m in key.models if m in usable])
         key = await self._keys.set_status(key, AiKeyStatusUpdate(status=key_status, checked_at=utc_now()))
         result = AiKeyChecked(key=AiKeyRead.model_validate(key), available_models=available)
         await self._uow.commit()
