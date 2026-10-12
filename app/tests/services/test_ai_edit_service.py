@@ -1,6 +1,7 @@
 """Mirrors the SPA's old dev endpoint tests (`apps/web/dev-server/ai-edit.test.ts`)."""
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -8,8 +9,10 @@ from app.schemas.ai_edit import AiEditTier1, AiEditTier2, FileEdit
 from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt
 from app.services.ai_edit_service import AiEditRejectedError, AiEditService, check_edits, classify, extract_json
 from app.tests.ai_edit_fixtures import CONTENT_PATH, GOOD_EDITS, GOOD_REPLY, HERO, HERO_PATH, make_request
-from app.tests.fakes import FakeModelClient
+from app.tests.fakes import FakeModelClient, FakeModelSource
 from app.utils.file_edits import FileEditError
+
+USER_ID = uuid4()
 
 
 def test_the_prompt_carries_the_request_as_data_and_the_rules_stay_in_the_system_part() -> None:
@@ -87,7 +90,7 @@ def test_extract_json_handles_fences_and_prose() -> None:
 async def test_returns_checked_tier_1_edits() -> None:
     model = FakeModelClient(f"```json\n{GOOD_REPLY}\n```")
 
-    result = await AiEditService(model).edit(make_request())
+    result = await AiEditService(FakeModelSource(model)).edit(USER_ID, make_request())
 
     assert result == AiEditTier1(summary="Made it green.", edits=[FileEdit.model_validate(e) for e in GOOD_EDITS])
     assert result.debug is None
@@ -100,7 +103,7 @@ async def test_a_rejected_answer_is_retried_once_with_the_error() -> None:
     bad = json.dumps({"summary": "x", "edits": [{"path": HERO_PATH, "search": "nope", "replace": "y"}]})
     model = FakeModelClient(bad, GOOD_REPLY)
 
-    result = await AiEditService(model, debug=True).edit(make_request())
+    result = await AiEditService(FakeModelSource(model), debug=True).edit(USER_ID, make_request())
 
     assert isinstance(result, AiEditTier1)
     assert result.debug is not None
@@ -114,13 +117,17 @@ async def test_a_rejected_answer_is_retried_once_with_the_error() -> None:
 async def test_the_model_can_escalate_to_tier_2() -> None:
     model = FakeModelClient('{"escalate":"Needs the navbar too."}')
 
-    assert await AiEditService(model).edit(make_request()) == AiEditTier2(reason="Needs the navbar too.")
+    assert await AiEditService(FakeModelSource(model)).edit(USER_ID, make_request()) == AiEditTier2(
+        reason="Needs the navbar too."
+    )
 
 
 async def test_rule_based_tier_2_skips_the_model() -> None:
     model = FakeModelClient()
 
-    result = await AiEditService(model).edit(make_request(instruction="Install framer motion"))
+    result = await AiEditService(FakeModelSource(model)).edit(
+        USER_ID, make_request(instruction="Install framer motion")
+    )
 
     assert isinstance(result, AiEditTier2)
     assert model.calls == []
@@ -130,6 +137,6 @@ async def test_two_bad_answers_are_an_error() -> None:
     model = FakeModelClient("not json", '{"summary": "x"}')
 
     with pytest.raises(AiEditRejectedError):
-        await AiEditService(model).edit(make_request())
+        await AiEditService(FakeModelSource(model)).edit(USER_ID, make_request())
     assert len(model.calls) == 2
     assert "did not return JSON" in model.calls[1][-1].content

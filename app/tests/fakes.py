@@ -14,11 +14,14 @@ from app.clients.github import (
     GithubPagesUnavailableError,
     GithubRepoExistsError,
 )
+from app.clients.model import AiKeyInvalidError, ModelClient
 from app.clients.supabase import SupabaseRejectedError
 from app.clients.templates import TemplateNotFoundError
+from app.constants.ai_keys import AiProvider
 from app.constants.publish import PublishTarget
 from app.core.database import utc_now
 from app.core.security import InvalidTokenError, generate_token, pkce_challenge
+from app.schemas.ai_key import ModelChoice
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
 from app.schemas.github import (
@@ -400,3 +403,34 @@ class FakeModelClient:
     async def complete(self, messages: list[ChatMessage]) -> str:
         self.calls.append(list(messages))
         return self.replies.pop(0)
+
+
+class FakeModelSource:
+    """Always picks the given model; records keys reported as refused."""
+
+    def __init__(self, model: ModelClient) -> None:
+        self.model = model
+        self.refused: list[UUID] = []
+
+    async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient:
+        return self.model
+
+    async def key_refused(self, user_id: UUID, key_id: UUID) -> None:
+        self.refused.append(key_id)
+
+
+VALID_AI_KEY = "sk-test-valid-1234"
+
+
+class FakeAiProviders:
+    """Accepts `VALID_AI_KEY` at every provider and lists `models` for it; refuses any other key."""
+
+    def __init__(self) -> None:
+        self.models = ["gpt-4.1-mini", "gpt-5", "o4-mini"]
+        self.calls: list[tuple[AiProvider, str]] = []
+
+    async def list_models(self, provider: AiProvider, api_key: str) -> list[str]:
+        self.calls.append((provider, api_key))
+        if api_key != VALID_AI_KEY:
+            raise AiKeyInvalidError()
+        return list(self.models)

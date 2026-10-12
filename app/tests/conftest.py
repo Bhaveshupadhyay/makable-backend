@@ -11,12 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import models  # noqa: F401  # registers every table
 from app.api import dependencies
 from app.api.dependencies import (
+    get_ai_provider_client,
     get_deploy_platform_client,
     get_github_client,
     get_supabase_client,
     get_template_catalog,
 )
 from app.clients.templates import TEMPLATE_CACHE
+from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
@@ -31,7 +33,13 @@ from app.core.config import Settings, get_settings
 from app.core.database import Base
 from app.core.limits import ConcurrencyLimit, PerKeyLimit
 from app.services.workspace_service import VERIFIED_REPOS
-from app.tests.fakes import FakeDeployPlatforms, FakeGithubClient, FakeSupabaseClient, FakeTemplateCatalog
+from app.tests.fakes import (
+    FakeAiProviders,
+    FakeDeployPlatforms,
+    FakeGithubClient,
+    FakeSupabaseClient,
+    FakeTemplateCatalog,
+)
 from main import create_app
 
 APP_URL = "http://localhost:5173"
@@ -69,6 +77,9 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     TEMPLATE_CACHE.clear()
     monkeypatch.setattr(dependencies, "PUBLISH_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS))
     monkeypatch.setattr(dependencies, "PUBLISHES", PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS))
+    monkeypatch.setattr(
+        dependencies, "AI_KEY_CHECKS", PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
+    )
     monkeypatch.setattr(dependencies, "AI_EDIT_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS))
     monkeypatch.setattr(dependencies, "WORKSPACE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS))
     monkeypatch.setattr(
@@ -115,8 +126,14 @@ def platforms() -> FakeDeployPlatforms:
 
 
 @pytest.fixture
+def ai_providers() -> FakeAiProviders:
+    return FakeAiProviders()
+
+
+@pytest.fixture
 def client(
     settings: Settings,
+    ai_providers: FakeAiProviders,
     github: FakeGithubClient,
     supabase: FakeSupabaseClient,
     templates: FakeTemplateCatalog,
@@ -128,6 +145,7 @@ def client(
     app.dependency_overrides[get_supabase_client] = lambda: supabase
     app.dependency_overrides[get_template_catalog] = lambda: templates
     app.dependency_overrides[get_deploy_platform_client] = lambda: platforms
+    app.dependency_overrides[get_ai_provider_client] = lambda: ai_providers
     # The SPA's origin: in dev the Vite proxy serves the API under it.
     with TestClient(app, base_url=APP_URL, follow_redirects=False) as client:
         yield client

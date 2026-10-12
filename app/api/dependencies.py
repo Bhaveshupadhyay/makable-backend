@@ -14,11 +14,13 @@ from fastapi import Cookie, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.cookies import AuthCookies
+from app.clients.ai_providers import AiProviderClient, HttpAiProviderClient
 from app.clients.deploy_platforms import DeployPlatformClient, HttpDeployPlatformClient
 from app.clients.github import GithubClient, HttpGithubClient
 from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
 from app.clients.templates import HttpTemplateCatalog, TemplateCatalogClient
+from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
@@ -34,12 +36,15 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ForbiddenError
 from app.core.limits import ConcurrencyLimit, PerKeyLimit
 from app.core.security import PayloadSigner, TokenCipher
+from app.repositories.ai_key import AiKeyRepository, SqlAiKeyRepository
 from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
 from app.repositories.health import HealthRepository, SqlHealthRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
 from app.repositories.user import SqlUserRepository, UserRepository
+from app.schemas.ai_key import ModelEndpoint
 from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiEditService
+from app.services.ai_key_service import AiKeyService, ModelClientFactory
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 from app.services.publish_service import PublishService
@@ -74,13 +79,22 @@ def get_github_client(http: HttpClientDep) -> GithubClient:
 
 
 def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient:
-    return HttpModelClient(
-        http,
+    """makable's own model, for users who haven't picked one of theirs."""
+    endpoint = ModelEndpoint(
         base_url=settings.ai_base_url,
         api_key=settings.ai_api_key.get_secret_value() if settings.ai_api_key else None,
         model=settings.ai_model,
-        timeout_seconds=settings.ai_timeout_seconds,
     )
+    return HttpModelClient(http, endpoint, timeout_seconds=settings.ai_timeout_seconds)
+
+
+def get_model_client_factory(http: HttpClientDep, settings: SettingsDep) -> ModelClientFactory:
+    """Builds the client for a model the user picked, with their key."""
+    return lambda endpoint: HttpModelClient(http, endpoint, timeout_seconds=settings.ai_timeout_seconds)
+
+
+def get_ai_provider_client(http: HttpClientDep) -> AiProviderClient:
+    return HttpAiProviderClient(http)
 
 
 def get_template_catalog(http: HttpClientDep, settings: SettingsDep) -> TemplateCatalogClient:
@@ -111,6 +125,10 @@ def get_user_repository(session: DbSessionDep) -> UserRepository:
 
 def get_github_credential_repository(session: DbSessionDep) -> GithubCredentialRepository:
     return SqlGithubCredentialRepository(session)
+
+
+def get_ai_key_repository(session: DbSessionDep) -> AiKeyRepository:
+    return SqlAiKeyRepository(session)
 
 
 def get_health_repository(session: DbSessionDep) -> HealthRepository:
@@ -148,10 +166,21 @@ def get_health_service(health: Annotated[HealthRepository, Depends(get_health_re
     return HealthService(health)
 
 
+def get_ai_key_service(
+    keys: Annotated[AiKeyRepository, Depends(get_ai_key_repository)],
+    providers: Annotated[AiProviderClient, Depends(get_ai_provider_client)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+    uow: UnitOfWorkDep,
+    default_model: Annotated[ModelClient, Depends(get_model_client)],
+    model_client: Annotated[ModelClientFactory, Depends(get_model_client_factory)],
+) -> AiKeyService:
+    return AiKeyService(keys, providers, cipher, uow, default_model=default_model, model_client=model_client)
+
+
 def get_ai_edit_service(
-    model: Annotated[ModelClient, Depends(get_model_client)], settings: SettingsDep
+    models: Annotated[AiKeyService, Depends(get_ai_key_service)], settings: SettingsDep
 ) -> AiEditService:
-    return AiEditService(model, debug=settings.ai_debug)
+    return AiEditService(models, debug=settings.ai_debug)
 
 
 def get_workspace_service(
@@ -177,6 +206,7 @@ AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
+AiKeyServiceDep = Annotated[AiKeyService, Depends(get_ai_key_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
 
 # --- Authentication ---
@@ -216,6 +246,7 @@ WORKSPACE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS)
 WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS)
 PUBLISH_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS)
 PUBLISHES = PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS)
+AI_KEY_CHECKS = PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
 
 
 async def ai_edit_slot() -> AsyncIterator[None]:
@@ -267,4 +298,16 @@ async def publish_limit(user: CurrentUserDep) -> AsyncIterator[None]:
         TooManyRequestsError: The user has one in progress, or published too often.
     """
     async with PUBLISHES.hold(user.id):
+        yield
+
+
+async def ai_key_check_limit(user: CurrentUserDep) -> AsyncIterator[None]:
+    """One key check at a time per user, in bursts of at most `KEY_CHECK_BURST`, then one per
+    `KEY_CHECK_EVERY_SECONDS`. A check calls the provider with the key, so this also keeps the endpoint from being
+    used to test lists of stolen keys.
+
+    Raises:
+        TooManyRequestsError: The user has one in progress, or checked too often.
+    """
+    async with AI_KEY_CHECKS.hold(user.id):
         yield
