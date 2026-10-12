@@ -53,6 +53,7 @@ async def test_sends_no_authorization_without_a_key() -> None:
         httpx.Response(502, json={"error": {"message": "upstream down"}}),
         httpx.Response(200, json={"choices": []}),
         httpx.Response(200, text="not json"),
+        httpx.Response(400, json=[{"error": {"code": 400, "message": "model auto not found"}}]),
     ],
 )
 async def test_errors_and_empty_replies_are_unavailable(response: httpx.Response) -> None:
@@ -87,10 +88,20 @@ async def test_sends_the_endpoints_extra_headers() -> None:
     assert await HttpModelClient(http, endpoint, timeout_seconds=5).complete(MESSAGES) == "ok"
 
 
-@pytest.mark.parametrize("status", [401, 403])
-async def test_a_refused_key_is_its_own_error(status: int) -> None:
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401, json={"error": {"message": "bad key"}}),
+        httpx.Response(403, json={"error": {"message": "bad key"}}),
+        # Gemini's answer to a bad key.
+        httpx.Response(
+            400, json=[{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}]
+        ),
+    ],
+)
+async def test_a_refused_key_is_its_own_error(response: httpx.Response) -> None:
     with pytest.raises(AiKeyInvalidError):
-        await client(lambda _: httpx.Response(status, json={"error": {"message": "bad key"}})).complete(MESSAGES)
+        await client(lambda _: response).complete(MESSAGES)
 
 
 async def test_a_rate_limit_carries_the_providers_wait() -> None:

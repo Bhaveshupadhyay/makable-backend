@@ -78,8 +78,10 @@ def get_github_client(http: HttpClientDep) -> GithubClient:
     return HttpGithubClient(http)
 
 
-def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient:
-    """makable's own model, for users who haven't picked one of theirs."""
+def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient | None:
+    """makable's own model, for users who haven't picked one of theirs. None when `AI_BASE_URL` isn't set."""
+    if settings.ai_base_url is None:
+        return None
     endpoint = ModelEndpoint(
         base_url=settings.ai_base_url,
         api_key=settings.ai_api_key.get_secret_value() if settings.ai_api_key else None,
@@ -171,7 +173,7 @@ def get_ai_key_service(
     providers: Annotated[AiProviderClient, Depends(get_ai_provider_client)],
     cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
     uow: UnitOfWorkDep,
-    default_model: Annotated[ModelClient, Depends(get_model_client)],
+    default_model: Annotated[ModelClient | None, Depends(get_model_client)],
     model_client: Annotated[ModelClientFactory, Depends(get_model_client_factory)],
 ) -> AiKeyService:
     return AiKeyService(keys, providers, cipher, uow, default_model=default_model, model_client=model_client)

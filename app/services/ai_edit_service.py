@@ -118,6 +118,7 @@ class AiEditService:
         search text wrong the first time.
 
         Raises:
+            AiModelRequiredError: Nothing was picked and there's no makable model.
             AiKeyNotFoundError: The picked key isn't the user's (any more).
             AiModelNotEnabledError: The picked model isn't turned on for the key.
             AiKeyInvalidError: The provider refused the user's key. It's marked invalid.

@@ -67,6 +67,7 @@ async def test_openrouter_checks_the_key_first_because_its_list_is_public() -> N
     [
         (httpx.Response(401), AiKeyInvalidError),
         (httpx.Response(403), AiKeyInvalidError),
+        (httpx.Response(400, json=[{"error": {"message": "API key not valid."}}]), AiKeyInvalidError),
         (httpx.Response(429), ModelRateLimitedError),
         (httpx.Response(500), AiProviderError),
         (httpx.Response(200, text="not json"), AiProviderError),

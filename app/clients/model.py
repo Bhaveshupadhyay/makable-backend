@@ -44,10 +44,12 @@ def raise_for_provider_status(res: httpx.Response) -> None:
     """Turns a provider's refusal of the key, or its rate limit, into a domain error.
 
     Raises:
-        AiKeyInvalidError: 401 or 403.
+        AiKeyInvalidError: 401 or 403, or a 400 about the API key (Gemini's answer to a bad key).
         ModelRateLimitedError: 429.
     """
     if res.status_code in (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN):
+        raise AiKeyInvalidError()
+    if res.status_code == status.HTTP_400_BAD_REQUEST and "api key" in res.text.lower():
         raise AiKeyInvalidError()
     if res.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
         raise ModelRateLimitedError(_retry_after(res))
@@ -130,6 +132,7 @@ def _content(data: object) -> str | None:
 
 def _error_message(data: object) -> str | None:
     match data:
-        case {"error": {"message": str(message)}}:
-            return message
+        # Gemini's OpenAI-compatible API wraps the error in a list.
+        case {"error": {"message": str(message)}} | [{"error": {"message": str(message)}}, *_]:
+            return message[:500]
     return None

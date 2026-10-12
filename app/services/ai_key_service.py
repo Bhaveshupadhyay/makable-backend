@@ -42,6 +42,14 @@ class AiModelNotEnabledError(AppError):
     message = "That model isn't turned on for your API key. Pick it in Settings."
 
 
+class AiModelRequiredError(AppError):
+    """There's no makable model (`AI_BASE_URL` unset), and the request didn't pick one of the user's."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "ai_model_required"
+    message = "Add your own API key in Settings to use AI edits."
+
+
 class AiKeyService:
     """Users' own AI provider keys: checked live with the provider before they're kept, stored encrypted, and turned
     into the model client for a request."""
@@ -53,7 +61,7 @@ class AiKeyService:
         cipher: TokenCipher,
         uow: UnitOfWork,
         *,
-        default_model: ModelClient,
+        default_model: ModelClient | None,
         model_client: ModelClientFactory,
     ) -> None:
         self._keys = keys
@@ -150,8 +158,11 @@ class AiKeyService:
         await self._uow.commit()
 
     async def model_options(self, user_id: UUID) -> list[AiModelOption]:
-        """The chat's model menu: makable's own model first, then the enabled models of the user's working keys."""
-        options = [AiModelOption(key_id=None, provider=None, model=self._default_model.name)]
+        """The chat's model menu: makable's own model first (if there is one), then the enabled models of the user's
+        working keys."""
+        options = []
+        if self._default_model is not None:
+            options.append(AiModelOption(key_id=None, provider=None, model=self._default_model.name))
         for key in await self._keys.list_for_user(user_id):
             if key.status == AiKeyStatus.VALID:
                 options += [AiModelOption(key_id=key.id, provider=key.provider, model=m) for m in key.models]
@@ -164,12 +175,15 @@ class AiKeyService:
         mustn't hold a pooled connection all that time.
 
         Raises:
+            AiModelRequiredError: Nothing was picked and there's no makable model.
             AiKeyNotFoundError: The user has no such key.
             AiKeyInvalidError: The key was refused the last time it was used or checked.
             AiModelNotEnabledError: The model isn't one the user turned on for the key.
         """
         try:
             if choice is None:
+                if self._default_model is None:
+                    raise AiModelRequiredError()
                 return self._default_model
             key = await self._get(user_id, choice.key_id)
             if key.status == AiKeyStatus.INVALID:

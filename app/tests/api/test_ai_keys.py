@@ -250,3 +250,17 @@ def test_a_key_refused_during_an_edit_is_marked_invalid(client: TestClient, mode
     again = client.post("/api/v1/ai/edit", json=request_body(model=pick))
     assert again.json()["error"]["code"] == "ai_key_invalid"
     assert len(models["endpoints"]) == 1
+
+
+def test_without_makables_model_the_menu_has_only_the_users_and_an_edit_must_pick_one(
+    client: TestClient, models: dict[str, Any]
+) -> None:
+    client.app.dependency_overrides[get_model_client] = lambda: None  # type: ignore[attr-defined]
+    sign_in(client)
+    assert client.get(f"{AI}/models").json()["data"] == []
+
+    res = client.post("/api/v1/ai/edit", json=request_body())
+
+    assert (res.status_code, res.json()["error"]["code"]) == (422, "ai_model_required")
+    key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
+    assert client.get(f"{AI}/models").json()["data"] == [{"keyId": key["id"], "provider": "openai", "model": "gpt-5"}]
