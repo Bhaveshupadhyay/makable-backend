@@ -65,6 +65,12 @@ MAX_TEMPLATE_BYTES = 10_000_000
 # longer: their URL carries the template's version, so they don't change.
 CATALOG_TTL = 300
 TEMPLATE_FILES_CACHE_SIZE = 32
+# Waits (seconds) for GitHub to accept starting a workflow it just received (a new or changed workflow file can
+# take a few seconds to register).
+DISPATCH_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
+# How far before the dispatch a deploy's start time is put, so a run GitHub dates by a clock slightly behind ours still
+# counts as this deploy's.
+DEPLOY_CLOCK_SKEW_SECONDS = 10
 # Waits (seconds) for a repo GitHub just created to show its first commit.
 NEW_REPO_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
 # Paths listed in a "changed on GitHub" conflict.

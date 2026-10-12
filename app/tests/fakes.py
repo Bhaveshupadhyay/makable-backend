@@ -133,6 +133,9 @@ class FakeGithubClient:
         self.pages_unavailable = False
         self.dispatches: list[tuple[str, str, str]] = []
         self.runs: dict[str, GithubWorkflowRun] = {}
+        # Starting a workflow fails with 404 this many times, like a workflow file GitHub hasn't registered yet.
+        self.dispatch_not_ready = 0
+        self.run_queries: list[str | None] = []
         self.blob_reads = 0
 
     async def get_user(self, access_token: str) -> GithubUser:
@@ -242,12 +245,18 @@ class FakeGithubClient:
     async def dispatch_workflow(self, access_token: str, full_name: str, workflow: str, ref: str) -> None:
         if f".github/workflows/{workflow}" not in self.files.get(full_name, {}):
             raise GithubNotFoundError()
+        if self.dispatch_not_ready:
+            self.dispatch_not_ready -= 1
+            raise GithubNotFoundError()
         self.dispatches.append((full_name, workflow, ref))
 
     async def latest_workflow_run(
-        self, access_token: str, full_name: str, workflow: str, branch: str
+        self, access_token: str, full_name: str, workflow: str, branch: str, *, created_since: str | None = None
     ) -> GithubWorkflowRun | None:
-        return self.runs.get(full_name)
+        self.run_queries.append(created_since)
+        run = self.runs.get(full_name)
+        # ISO 8601 UTC strings of the same shape compare in time order.
+        return run if run and (created_since is None or run.created_at >= created_since) else None
 
     def edit_on_github(self, full_name: str, path: str, content: str | None) -> None:
         """A commit the user made on GitHub (None deletes the file)."""

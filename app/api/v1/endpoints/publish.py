@@ -49,9 +49,11 @@ async def publish_site(
     project_id: UUID, body: PublishRequest, user: CurrentUserDep, publisher: PublishServiceDep
 ) -> ApiResponse[PublishResult]:
     """Commits the site (built from the template catalog, the content and the AI-edited files) and a deploy
-    workflow for `target` to the site repo on the user's GitHub, creating it on first publish. The push starts the
-    deploy. With `credentials` (a platform token pasted in the chat), the token is checked, the platform project is
-    created and the token is saved as an Actions secret; without it, `missingSecrets` lists what to add on GitHub.
+    workflow for `target` to the site repo on the user's GitHub, creating it on first publish, then starts the
+    deploy (also when nothing changed). Pushes never deploy: the workflow only runs when makable starts it. With
+    `credentials` (a platform token pasted in the chat), the token is checked, the platform project is created and
+    the token is saved as an Actions secret; without it, `missingSecrets` lists what to add on GitHub and the deploy
+    isn't started. `deployStartedAt` goes to the status check as `since`.
 
     409 `publish_changed_on_github` when files makable manages were changed on GitHub: send `details.headSha` back
     as `confirmOverwrite` to overwrite them."""
@@ -83,6 +85,8 @@ async def get_status(
     repo_name: Annotated[RepoName, Query(alias="repoName")],
     user: CurrentUserDep,
     publisher: PublishServiceDep,
+    since: Annotated[str | None, Query(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")] = None,
 ) -> ApiResponse[PublishStatus]:
-    """The platform, the site's address and the deploy workflow's latest run (None before the first one)."""
-    return ApiResponse(data=await publisher.status(user, project_id, repo_name))
+    """The platform, the site's address and the deploy workflow's latest run (None before the first one). With
+    `since` (a deploy's `startedAt` / `deployStartedAt`), only a run started then or later."""
+    return ApiResponse(data=await publisher.status(user, project_id, repo_name, since))

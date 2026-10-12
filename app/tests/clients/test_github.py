@@ -292,3 +292,19 @@ async def test_get_blob_reads_text_by_sha() -> None:
     assert await client(handler).get_blob("tok", REPO, "a" * 40) == "body {}\n"
     with pytest.raises(GithubNotFoundError):
         await client(lambda _: httpx.Response(404)).get_blob("tok", REPO, "a" * 40)
+
+
+async def test_runs_since_a_time_and_a_workflow_github_hasnt_registered() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"workflow_runs": []})
+
+    await client(handler).latest_workflow_run(
+        "tok", REPO, "makable-deploy.yml", "main", created_since="2026-10-11T13:45:07Z"
+    )
+    assert seen[0].url.params["created"] == ">=2026-10-11T13:45:07Z"
+    # "Workflow does not have 'workflow_dispatch' trigger": GitHub still has the old file. Retried by the caller.
+    with pytest.raises(GithubNotFoundError):
+        await client(lambda _: httpx.Response(422)).dispatch_workflow("tok", REPO, "x.yml", "main")

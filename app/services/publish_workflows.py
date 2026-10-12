@@ -1,5 +1,8 @@
 """The deploy workflow a publish writes to `.github/workflows/makable-deploy.yml`: build the site (React templates
-with Vite, static ones as they are) and deploy it to the platform the user picked, on every push and on demand.
+with Vite, static ones as they are) and deploy it to the platform the user picked.
+
+It only runs when started (`workflow_dispatch`): by makable when the user clicks Publish, or by hand from the
+Actions tab. A push doesn't deploy, so a change made on GitHub stays unpublished until the user publishes.
 
 Values that come from the user or GitHub (project name, branch, base path) only go into `env:` as JSON strings,
 which YAML reads as quoted scalars, and scripts read them as quoted shell variables: they can't change the
@@ -38,13 +41,12 @@ def render_workflow(
     pages = target == PublishTarget.GITHUB_PAGES
     permissions = ["contents: read", *(["pages: write", "id-token: write"] if pages else [])]
     header = f"""\
-# Deploys this site to {TARGET_NAMES[target]}. makable writes this file on every publish, so changes made here are
-# replaced by the next publish.
+# Deploys this site to {TARGET_NAMES[target]} when makable publishes it (or when you run it from the Actions tab).
+# Pushing doesn't deploy: changes made on GitHub go live with the next publish. makable writes this file on every
+# publish, so changes made here are replaced by the next publish.
 name: Deploy to {TARGET_NAMES[target]}
 
 on:
-  push:
-    branches: [{json.dumps(branch)}]
   workflow_dispatch:
 
 concurrency:

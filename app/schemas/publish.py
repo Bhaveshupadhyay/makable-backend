@@ -65,7 +65,7 @@ class PublishRequest(CamelModel):
         return self
 
 
-DeployState = Literal["started", "waiting_for_secrets", "unchanged"]
+DeployState = Literal["started", "waiting_for_secrets"]
 
 
 class PublishResult(CamelModel):
@@ -75,9 +75,13 @@ class PublishResult(CamelModel):
     branch: str
     # The commit with the site; the branch's current head when nothing changed.
     commit_sha: str
-    # `started`: the push (or a manual run) started the deploy workflow. `waiting_for_secrets`: the workflow skips
-    # the deploy until the secrets in `missing_secrets` are added. `unchanged`: nothing to commit or deploy.
+    # Whether this publish committed anything. Either way the site is deployed from what's on GitHub.
+    changed: bool
+    # `started`: makable started the deploy workflow (a push never does). `waiting_for_secrets`: it wasn't started,
+    # because the secrets in `missing_secrets` aren't on the repo yet.
     deploy: DeployState
+    # When the deploy was started (UTC, to the second): the status check finds this deploy's run with it.
+    deploy_started_at: str | None
     # Where the site will be. For a token added on GitHub, the platform's usual address for the project.
     site_url: str | None
     project_name: str | None
@@ -97,6 +101,8 @@ class DeployRequest(CamelModel):
 class DeployStarted(CamelModel):
     repo_url: str
     actions_url: str
+    # When the deploy was started (UTC, to the second), for the status check.
+    started_at: str
 
 
 class WorkflowRun(CamelModel):
@@ -111,7 +117,7 @@ class WorkflowRun(CamelModel):
 class PublishStatus(CamelModel):
     target: PublishTarget
     site_url: str | None
-    # The deploy workflow's latest run, or None if it hasn't run yet.
+    # The deploy workflow's latest run (since the time asked for), or None if there's none yet.
     run: WorkflowRun | None
 
 
