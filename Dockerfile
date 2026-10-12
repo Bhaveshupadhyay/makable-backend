@@ -29,8 +29,10 @@ ENV PATH=/app/.venv/bin:$PATH \
 USER makable
 EXPOSE 8787
 
+# Healthy means ready: the database answers. Docker doesn't restart an unhealthy container, so a database outage
+# only shows here (and fails a deploy's `compose up --wait`); it never restarts the app.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/v1/health/live', timeout=3)"]
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/v1/health/ready', timeout=4)"]
 
 # One worker: the request limits (core/limits.py) are counted per process.
 # The port is only reachable from the compose network (cloudflared), so trusting forwarded headers from any

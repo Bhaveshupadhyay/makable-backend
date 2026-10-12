@@ -6,6 +6,7 @@ venv/
 .ruff_cache/
 
 .env
+tunnel.env
 *.db
 
 .DS_Store

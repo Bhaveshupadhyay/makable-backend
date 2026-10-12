@@ -1,4 +1,4 @@
-# Checks every push and pull request. Deploys only when asked, from main: a push whose last commit message has
+# Checks every pull request and push to main. Deploys only when asked, from main: a push whose last commit message has
 # [deploy] (e.g. `git commit --allow-empty -m "Deploy [deploy]"`), or "Run workflow" in the Actions tab
 # (`gh workflow run ci-cd.yml --ref main`). A deploy pushes the image to GHCR and rolls it out to the VPS over SSH
 # (README.md, "Deploying"). The server only needs Docker, compose.yaml and .env.
@@ -31,7 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv publishes no moving major tag, only exact versions.
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
       - run: uv sync --locked
@@ -51,16 +52,19 @@ jobs:
       contents: read
       packages: write
     outputs:
-      deploy: ${{ env.DEPLOY }}
-    env:
-      DEPLOY: >-
-        ${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch'
-        || (github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy]'))) }}
+      deploy: ${{ steps.plan.outputs.deploy }}
     steps:
+      - name: Deploy this run?
+        id: plan
+        env:
+          DEPLOY: >-
+            ${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy]'))) }}
+        run: echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
-        if: env.DEPLOY == 'true'
+        if: steps.plan.outputs.deploy == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -70,7 +74,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ env.DEPLOY == 'true' }}
+          push: ${{ steps.plan.outputs.deploy == 'true' }}
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
@@ -86,7 +90,8 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # One deploy at a time, and never cancelled half-way.
+    # One deploy at a time, and never cancelled half-way. A deploy waiting for the running one is replaced by a newer
+    # one (GitHub keeps one waiting run per group), which is fine: the newer commit is what should end up live.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -94,7 +99,10 @@ jobs:
       TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
       SSH_PORT: ${{ secrets.VPS_PORT || '22' }}
     steps:
+      # The full history, to tell whether the deployed commit is newer than this one.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up SSH
         env:
@@ -108,16 +116,32 @@ jobs:
           printf 'Host vps\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/deploy_key\n  StrictHostKeyChecking yes\n' \
             "${TARGET#*@}" "${TARGET%@*}" "$SSH_PORT" > ~/.ssh/config
 
+      # A slower run for an older commit can reach this point after a newer deploy; it mustn't roll the server back.
+      # The server keeps the deployed commit in deployed-sha. Redeploying the same commit is allowed.
+      - name: Skip if a newer commit is live
+        id: fresh
+        run: |
+          # shellcheck disable=SC2029
+          deployed=$(ssh vps "cat '$DEPLOY_PATH/deployed-sha' 2>/dev/null || true")
+          if [ -n "$deployed" ] && [ "$deployed" != "$GITHUB_SHA" ] \
+            && git merge-base --is-ancestor "$GITHUB_SHA" "$deployed" 2>/dev/null; then
+            echo "::notice::$deployed is live and newer than $GITHUB_SHA, so this run doesn't deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Copy compose.yaml
+        if: steps.fresh.outputs.skip != 'true'
         run: scp compose.yaml "vps:$DEPLOY_PATH/compose.yaml"
 
       # This job's token can pull the image and expires when the job ends, so the server keeps no registry password.
       - name: Log the server in to GHCR
+        if: steps.fresh.outputs.skip != 'true'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$TOKEN" | ssh vps docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Pull, migrate, restart
+        if: steps.fresh.outputs.skip != 'true'
         run: |
           # The variables in the ssh command are meant to expand here, on the runner.
           # shellcheck disable=SC2029
@@ -127,9 +151,10 @@ jobs:
           docker compose pull api
           docker compose run --rm api alembic upgrade head
           if ! docker compose up -d --wait --wait-timeout 120; then
-            docker compose logs --tail 100 api
+            docker compose logs --tail 100 api cloudflared
             exit 1
           fi
+          printf '%s\n' "${API_IMAGE##*:}" > deployed-sha
           # Keeps two weeks of this app's images for rollbacks; other images on the server aren't touched.
           docker image prune -af --filter "label=$SOURCE_LABEL" --filter until=336h
           SCRIPT
