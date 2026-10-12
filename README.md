@@ -133,6 +133,73 @@ anything is parsed. Each worker allows 50 AI edits and 100 workspace requests at
 `Retry-After`), one save at a time per user (bursts of 20, then one per 15 s; more get 429), and 200 outgoing
 connections with a 5 s wait for a free one.
 
+## Deploying (Docker + Cloudflare Tunnel)
+
+`compose.yaml` runs the API in a container and connects it to Cloudflare with a tunnel, so it can share a VPS with
+other sites (e.g. CloudPanel's Nginx keeps ports 80/443). The API isn't published on any host port.
+
+`.github/workflows/ci-cd.yml` checks every push and pull request (ruff, mypy, pytest, `alembic check`, and an image
+build). Merging to `main` doesn't deploy. To deploy `main`, either push a commit whose message has `[deploy]`:
+
+```sh
+git switch main && git pull
+git commit --allow-empty -m "Deploy [deploy]" && git push
+```
+
+or run the workflow by hand (Actions → CI/CD → Run workflow on `main`, or `gh workflow run ci-cd.yml --ref main`).
+A deploy runs the checks, pushes the image to `ghcr.io/bhaveshupadhyay/makable-backend` (tagged with the commit and
+`latest`), then over SSH copies `compose.yaml` to the server, pulls the image, runs `alembic upgrade head` against
+the production database and restarts, waiting for the health check.
+
+### Once, on the server
+
+1. Cloudflare → Zero Trust → Networks → **Tunnels** → create a `cloudflared` tunnel and copy its token. Add a public
+   hostname, e.g. `api.example.com`, with service `http://api:8787`.
+2. Install Docker (`curl -fsSL https://get.docker.com | sh`) and add a deploy user that may use it (the `docker`
+   group is as powerful as root, so use this user for nothing else):
+
+   ```sh
+   adduser --disabled-password --gecos "" deploy
+   usermod -aG docker deploy
+   install -d -o deploy -g deploy -m 750 /opt/makable-backend
+   ```
+
+3. Write `/opt/makable-backend/.env` (owner `deploy`, `chmod 600`) with the production values:
+   `APP_URL=https://<the SPA's domain>`, the same `TOKEN_ENCRYPTION_KEY` as before (stored tokens can't be read
+   with another), and `TUNNEL_TOKEN`. `ENVIRONMENT=production` is set by compose. Write a literal `$` as `$$`.
+4. Make an SSH key for GitHub (`ssh-keygen -t ed25519 -f makable-deploy -N ""` on your machine) and append
+   `makable-deploy.pub` to `/home/deploy/.ssh/authorized_keys`.
+5. Supabase → Redirect URLs: add `https://<the SPA's domain>/api/v1/auth/github/callback`.
+
+### Once, on GitHub
+
+Repo → Settings → Environments → new environment **`production`** (add required reviewers to approve each deploy),
+with these secrets:
+
+| Secret | Value |
+| --- | --- |
+| `VPS_HOST` | the server's IP or hostname |
+| `VPS_PORT` | SSH port, if not 22 |
+| `VPS_USER` | `deploy` |
+| `VPS_SSH_KEY` | the private key `makable-deploy` |
+| `VPS_KNOWN_HOSTS` | output of `ssh-keyscan -p <port> <host>` (check it against the server's real host key) |
+
+The server pulls with the job's own token and logs out at the end, so it keeps no registry password.
+
+### By hand
+
+```sh
+cd /opt/makable-backend
+docker compose logs -f api
+API_IMAGE=ghcr.io/bhaveshupadhyay/makable-backend:<commit sha> docker compose up -d   # roll back
+```
+
+Images of the last two weeks stay on the server for rollbacks. A rollback doesn't undo migrations. The container runs
+one uvicorn worker, because the request limits are per process.
+
+The SPA must reach the API on its own origin (the auth cookies are SameSite=Lax with path `/api/v1`), so its host
+forwards `/api/*` to `https://api.example.com`, as the Vite proxy does in dev.
+
 ## Checks
 
 ```sh
