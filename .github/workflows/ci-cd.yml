@@ -1,0 +1,164 @@
+# Checks every pull request and push to main. Deploys only when asked, from main: a push whose last commit message has
+# [deploy] (e.g. `git commit --allow-empty -m "Deploy [deploy]"`), or "Run workflow" in the Actions tab
+# (`gh workflow run ci-cd.yml --ref main`). A deploy pushes the image to GHCR and rolls it out to the VPS over SSH
+# (README.md, "Deploying"). The server only needs Docker, compose.yaml and .env.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run. Other runs never replace each other, so a waiting deploy
+# isn't dropped for a later push that doesn't deploy.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # GHCR names must be lowercase.
+  IMAGE: ghcr.io/bhaveshupadhyay/makable-backend
+  DEPLOY_PATH: /opt/makable-backend
+  # Set in the Dockerfile too: it links the GHCR package to this repo (so the job's token can pull it).
+  SOURCE_LABEL: org.opencontainers.image.source=https://github.com/Bhaveshupadhyay/makable-backend
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes no moving major tag, only exact versions.
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy .
+      - run: uv run pytest
+      - name: Migrations match the models
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///${{ runner.temp }}/ci.db
+        run: uv run alembic upgrade head && uv run alembic check
+
+  image:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      deploy: ${{ steps.plan.outputs.deploy }}
+    steps:
+      - name: Deploy this run?
+        id: plan
+        env:
+          DEPLOY: >-
+            ${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy]'))) }}
+        run: echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: steps.plan.outputs.deploy == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Without a deploy it only builds, to check the Dockerfile.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ steps.plan.outputs.deploy == 'true' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    if: needs.image.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    # Holds the VPS_* secrets. Add required reviewers to it on GitHub to approve each deploy by hand.
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    # One deploy at a time, and never cancelled half-way. A deploy waiting for the running one is replaced by a newer
+    # one (GitHub keeps one waiting run per group), which is fine: the newer commit is what should end up live.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+      SSH_PORT: ${{ secrets.VPS_PORT || '22' }}
+    steps:
+      # The full history, to tell whether the deployed commit is newer than this one.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host vps\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/deploy_key\n  StrictHostKeyChecking yes\n' \
+            "${TARGET#*@}" "${TARGET%@*}" "$SSH_PORT" > ~/.ssh/config
+
+      # A slower run for an older commit can reach this point after a newer deploy; it mustn't roll the server back.
+      # The server keeps the deployed commit in deployed-sha. Redeploying the same commit is allowed.
+      - name: Skip if a newer commit is live
+        id: fresh
+        run: |
+          # shellcheck disable=SC2029
+          deployed=$(ssh vps "cat '$DEPLOY_PATH/deployed-sha' 2>/dev/null || true")
+          if [ -n "$deployed" ] && [ "$deployed" != "$GITHUB_SHA" ] \
+            && git merge-base --is-ancestor "$GITHUB_SHA" "$deployed" 2>/dev/null; then
+            echo "::notice::$deployed is live and newer than $GITHUB_SHA, so this run doesn't deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy compose.yaml
+        if: steps.fresh.outputs.skip != 'true'
+        run: scp compose.yaml "vps:$DEPLOY_PATH/compose.yaml"
+
+      # This job's token can pull the image and expires when the job ends, so the server keeps no registry password.
+      - name: Log the server in to GHCR
+        if: steps.fresh.outputs.skip != 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | ssh vps docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull, migrate, restart
+        if: steps.fresh.outputs.skip != 'true'
+        run: |
+          # The variables in the ssh command are meant to expand here, on the runner.
+          # shellcheck disable=SC2029
+          ssh vps "API_IMAGE='$IMAGE:${{ github.sha }}' DEPLOY_PATH='$DEPLOY_PATH' SOURCE_LABEL='$SOURCE_LABEL' bash -s" <<'SCRIPT'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          docker compose pull api
+          docker compose run --rm api alembic upgrade head
+          if ! docker compose up -d --wait --wait-timeout 120; then
+            docker compose logs --tail 100 api cloudflared
+            exit 1
+          fi
+          printf '%s\n' "${API_IMAGE##*:}" > deployed-sha
+          # Keeps two weeks of this app's images for rollbacks; other images on the server aren't touched.
+          docker image prune -af --filter "label=$SOURCE_LABEL" --filter until=336h
+          SCRIPT
+
+      - name: Log the server out of GHCR
+        if: always()
+        run: ssh vps docker logout ghcr.io || true

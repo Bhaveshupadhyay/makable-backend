@@ -1,0 +1,53 @@
+# Production on a VPS, next to whatever else runs there (e.g. CloudPanel): the API isn't published on any host
+# port, and Cloudflare Tunnel brings traffic in over an outgoing connection, so nothing needs ports 80/443.
+#
+# CI/CD (.github/workflows/ci-cd.yml) deploys main when asked ([deploy] in a commit message, or a manual run): it
+# copies this file to the server, pulls the image it built (API_IMAGE, tagged with the commit), runs the migrations
+# and restarts. By hand on the server:
+#
+#   docker compose pull && docker compose up -d       # the latest image from main
+#   API_IMAGE=ghcr.io/bhaveshupadhyay/makable-backend:<commit sha> docker compose up -d   # roll back to a commit
+#   docker compose logs -f api
+#
+# `docker compose up --build` builds from source instead (needs a clone of the repo).
+#
+# The app's settings are in .env and the tunnel's token in tunnel.env (TUNNEL_TOKEN=...), so neither container
+# gets the other's secrets. Compose expands `$` in .env values, so write a literal `$` (e.g. in DB_PASSWORD) as `$$`.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  api:
+    build: .
+    image: ${API_IMAGE:-ghcr.io/bhaveshupadhyay/makable-backend:latest}
+    env_file: .env
+    environment:
+      ENVIRONMENT: production
+    restart: unless-stopped
+    logging: *logging
+    # Option B (CloudPanel's Nginx in front instead of a tunnel): uncomment, remove the cloudflared service, and
+    # add a Reverse Proxy site in CloudPanel for http://127.0.0.1:8787. Keep the 127.0.0.1: Docker's published
+    # ports skip the host firewall.
+    # ports:
+    #   - "127.0.0.1:8787:8787"
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.3
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
+    env_file: tunnel.env
+    # Healthy once the tunnel has a live connection to Cloudflare (a bad token never gets there).
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
