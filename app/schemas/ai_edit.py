@@ -20,6 +20,7 @@ from app.constants.ai_edit import (
     MAX_TARGET_LABEL,
     SAFE_REPO_PATH,
 )
+from app.schemas.ai_key import ModelChoice
 from app.schemas.common import CamelModel
 from app.schemas.portfolio import TemplateId
 
@@ -97,6 +98,8 @@ class AiEditRequest(CamelModel):
     files: Annotated[list[AiEditFile], Field(max_length=MAX_FILES)]
     # Earlier requests, oldest first.
     history: Annotated[list[AiEditTurn], Field(max_length=MAX_HISTORY, default_factory=list)]
+    # The model the user picked in the chat's menu; left out for makable's own.
+    model: ModelChoice | None = None
 
 
 class FileEdit(CamelModel):

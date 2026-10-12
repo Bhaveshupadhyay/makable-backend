@@ -1,9 +1,11 @@
 import json
 import logging
+from typing import Protocol
+from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
-from app.clients.model import ModelClient
+from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_edit import FORBIDDEN_PATH, MAX_ATTEMPTS, SITE_WIDE
 from app.core.exceptions import ExternalServiceError
 from app.schemas.ai_edit import (
@@ -16,6 +18,7 @@ from app.schemas.ai_edit import (
     ModelEdits,
     ModelEscalation,
 )
+from app.schemas.ai_key import ModelChoice
 from app.schemas.chat import ChatMessage
 from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt, rejection_prompt
 from app.utils.file_edits import AppliedEdits, FileEditError, apply_file_edits
@@ -91,38 +94,61 @@ def extract_json(text: str) -> object:
     return json.loads(text[start : end + 1])
 
 
+class ModelSource(Protocol):
+    """Picks the model for a request (`AiKeyService`)."""
+
+    async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient: ...
+
+    async def key_refused(self, user_id: UUID, key_id: UUID) -> None: ...
+
+
 class AiEditService:
     """Tier 1 AI edits: asks the model for search/replace edits on the files the browser sent, and checks
     them before answering. Prompts and the model call stay on the server."""
 
-    def __init__(self, model: ModelClient, *, debug: bool = False) -> None:
-        self._model = model
+    def __init__(self, models: ModelSource, *, debug: bool = False) -> None:
+        self._models = models
         self._debug = debug
 
-    async def edit(self, request: AiEditRequest) -> AiEditTier1 | AiEditTier2:
+    async def edit(self, user_id: UUID, request: AiEditRequest) -> AiEditTier1 | AiEditTier2:
         """Answers Tier 1 edits, or hands the request to Tier 2 (by rule, or because the model escalated).
+        The model is the one the user picked (`request.model`), or makable's own.
 
         A rejected answer is sent back once with the error, because free models often get the shape or the
         search text wrong the first time.
 
         Raises:
+            AiModelRequiredError: Nothing was picked and there's no makable model.
+            AiKeyNotFoundError: The picked key isn't the user's (any more).
+            AiModelNotEnabledError: The picked model isn't turned on for the key.
+            AiKeyInvalidError: The provider refused the user's key. It's marked invalid.
+            ModelRateLimitedError: The provider is rate limiting the user's key.
             ModelUnavailableError: The model couldn't be reached or answered with an error.
             AiEditRejectedError: The model's answer was rejected on every attempt.
         """
         rule = classify(request)
         if rule:
-            return AiEditTier2(reason=rule, debug=self._debug_info("", 0))
+            return AiEditTier2(reason=rule, debug=self._debug_info("", 0, None))
+        model = await self._models.model_for(user_id, request.model)
+        try:
+            return await self._edit(request, model)
+        except AiKeyInvalidError:
+            if request.model is not None:
+                await self._models.key_refused(user_id, request.model.key_id)
+            raise
+
+    async def _edit(self, request: AiEditRequest, model: ModelClient) -> AiEditTier1 | AiEditTier2:
         user_prompt = build_user_prompt(request)
         # One user turn, no system role: the free models behind OmniRoute ignore a system message and answer
         # in their own agent format, but follow the same text in the user turn.
         messages = [ChatMessage(role="user", content=f"{SYSTEM_PROMPT}\n\n{user_prompt}")]
         problem = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            reply = await self._model.complete(messages)
+            reply = await model.complete(messages)
             try:
                 answer = _ANSWER.validate_python(extract_json(reply))
                 if isinstance(answer, ModelEscalation):
-                    return AiEditTier2(reason=answer.escalate, debug=self._debug_info(user_prompt, attempt))
+                    return AiEditTier2(reason=answer.escalate, debug=self._debug_info(user_prompt, attempt, model))
                 check_edits(request, answer.edits)
             except (ValueError, FileEditError) as err:  # ValidationError and JSONDecodeError are ValueErrors.
                 problem = _describe(err)
@@ -132,13 +158,14 @@ class AiEditService:
                     ChatMessage(role="user", content=rejection_prompt(problem)),
                 ]
                 continue
-            return AiEditTier1(summary=answer.summary, edits=answer.edits, debug=self._debug_info(user_prompt, attempt))
+            debug = self._debug_info(user_prompt, attempt, model)
+            return AiEditTier1(summary=answer.summary, edits=answer.edits, debug=debug)
         raise AiEditRejectedError(details={"problem": problem[:300]} if self._debug else None)
 
-    def _debug_info(self, model_input: str, attempts: int) -> AiEditDebug | None:
+    def _debug_info(self, model_input: str, attempts: int, model: ModelClient | None) -> AiEditDebug | None:
         if not self._debug:
             return None
-        return AiEditDebug(model_input=model_input, attempts=attempts, model=self._model.name)
+        return AiEditDebug(model_input=model_input, attempts=attempts, model=model.name if model else "")
 
 
 def _describe(err: Exception) -> str:

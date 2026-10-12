@@ -14,6 +14,9 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 
 ERRORS: dict[int | str, dict[str, Any]] = {
     status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+    status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+    status.HTTP_429_TOO_MANY_REQUESTS: {"model": ErrorResponse},
     status.HTTP_502_BAD_GATEWAY: {"model": ErrorResponse},
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
 }
@@ -32,6 +35,6 @@ async def edit(
     """Tier 1: search/replace edits on the files sent, checked on the server, or `{tier: 2, reason}` when the
     change needs a deeper edit. The SPA applies the edits itself. Closing the request (Stop) cancels the
     model call."""
-    result = await cancel_on_disconnect(request, ai_edit.edit(body))
+    result = await cancel_on_disconnect(request, ai_edit.edit(user.id, body))
     logger.info("AI edit", extra={"user_id": str(user.id), "tier": result.tier})
     return ApiResponse(data=result)

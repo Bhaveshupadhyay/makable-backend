@@ -99,9 +99,11 @@ class Settings(DatabaseSettings):
     # How long the browser keeps the refresh token cookie. Supabase decides when the token itself expires.
     refresh_token_ttl_days: int = 30
 
-    # The model behind "Edit with AI": any OpenAI-compatible chat completions API. The default is a local
-    # OmniRoute (`OMNIROUTE_SERVER_HOST=127.0.0.1 omniroute serve`), which needs no key.
-    ai_base_url: str = "http://localhost:20128/v1"
+    # makable's own model for "Edit with AI", offered as "makable default" to users who haven't picked one of their
+    # own keys: any OpenAI-compatible chat completions API, e.g. a local OmniRoute in dev
+    # (`OMNIROUTE_SERVER_HOST=127.0.0.1 omniroute serve`, `http://localhost:20128/v1`, no key). Unset or empty means
+    # there's no makable model: users add their own API key to use AI edits.
+    ai_base_url: str | None = None
     ai_api_key: SecretStr | None = None
     ai_model: str = "auto"
     ai_timeout_seconds: float = Field(default=90, gt=0)
@@ -112,10 +114,16 @@ class Settings(DatabaseSettings):
     # user saw. Template files are only read from this URL's host.
     template_catalog_url: str = "https://bhaveshupadhyay.github.io/makable-templates/catalog.json"
 
-    @field_validator("app_url", "supabase_url", "ai_base_url")
+    @field_validator("app_url", "supabase_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("ai_base_url")
+    @classmethod
+    def _optional_url(cls, value: str | None) -> str | None:
+        # An empty `AI_BASE_URL=` in `.env` means no makable model, the same as leaving it out.
+        return (value or "").rstrip("/") or None
 
     @field_validator("token_encryption_key")
     @classmethod
