@@ -1,7 +1,10 @@
 from app.utils.edit_diagnosis import (
     MAX_EXCERPT,
+    count_occurrences,
     excerpt,
+    interior_match,
     line_col,
+    line_matches,
     near_match,
     occurrences,
     unique_anchor,
@@ -60,3 +63,21 @@ def test_places_lines_and_excerpts() -> None:
     assert excerpt("x" * 1000, 500, 510) == "…" + "x" * 170 + "…"
     assert len(excerpt("y" * 5000, 0, 5000)) == MAX_EXCERPT + 1
     assert excerpt("short", 1) == "short"
+
+
+def test_a_piece_from_the_middle_is_found_and_grown_both_ways() -> None:
+    search = "XXXXXXXXXXXXXXXXXXXX" + BUNDLE[40:100] + "YYYYYYYYYYYYYYYYYYYY"
+
+    middle = interior_match(BUNDLE, search)
+
+    assert middle is not None
+    assert (middle.start, middle.offset, middle.length) == (20, 40, 60)
+    assert interior_match(BUNDLE, "nothing like the bundle at all, really") is None
+
+
+def test_counts_and_line_matches() -> None:
+    assert count_occurrences("aaaa", "aa") == 3  # Overlapping, like the edit check's search.
+    assert count_occurrences("abc", "") == 0
+    text = "  if (a) {\n    go()\n  }\n  if (a) {\n    go()\n"
+    assert line_matches(text, "\n\tif (a) {\n\t\tgo()\n  \n") == [0, text.index("  if (a) {", 5)]
+    assert line_matches(text, "  \n") == []

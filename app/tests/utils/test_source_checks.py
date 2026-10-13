@@ -99,7 +99,8 @@ def test_script_syntax_errors_say_where() -> None:
     code = 'const a = 1,b = () => e.jsx("p", {children: "x"}));'
     found = locate_syntax_error(code, script_language("a.js"))  # type: ignore[arg-type]
 
-    assert found is not None
-    message, offset = found
-    assert message.startswith("syntax error (line 1)")
-    assert 0 < offset <= len(code)
+    assert found == ("syntax error (line 1): unexpected code", code.index("));") + 1)  # The stray ")".
+    # Offsets count characters, not UTF-8 bytes.
+    accented = 'const ok = 1;\nconst é = "ü";\nfoo(;\n'
+    found = locate_syntax_error(accented, script_language("a.js"))  # type: ignore[arg-type]
+    assert found == ("syntax error (line 3): missing )", accented.index("foo(;") + 4)

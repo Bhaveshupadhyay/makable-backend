@@ -12,6 +12,8 @@ MAX_EXCERPT = 400
 MIN_MATCH = 12
 # Longest anchor suggested; past this the text isn't a useful anchor.
 MAX_ANCHOR = 200
+# Characters of a search scanned for a match in its middle (each probe is a find over the whole file).
+MAX_SCAN = 2000
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,33 @@ def unique_anchor(text: str, offset: int) -> str | None:
     return text[offset : offset + lo]
 
 
+@dataclass(frozen=True)
+class InteriorMatch:
+    """A stretch from the middle of the search that is in the file: `search[start:start + length]` is the file's
+    text at `offset`."""
+
+    start: int
+    offset: int
+    length: int
+
+
+def interior_match(text: str, search: str) -> InteriorMatch | None:
+    """The first piece of `search` (at least 2 * MIN_MATCH characters, looked for every MIN_MATCH characters
+    within its first MAX_SCAN) that is in `text`, grown as far as both still agree. None if there's none."""
+    size = 2 * MIN_MATCH
+    for start in range(0, min(len(search), MAX_SCAN) - size + 1, MIN_MATCH):
+        offset = text.find(search[start : start + size])
+        if offset == -1:
+            continue
+        begin, at, end = start, offset, start + size
+        while begin > 0 and at > 0 and search[begin - 1] == text[at - 1]:
+            begin, at = begin - 1, at - 1
+        while end < len(search) and at + end - begin < len(text) and search[end] == text[at + end - begin]:
+            end += 1
+        return InteriorMatch(begin, at, end - begin)
+    return None
+
+
 def occurrences(text: str, needle: str, limit: int = 5) -> list[int]:
     """Offsets of the first `limit` places `needle` appears in `text`."""
     found: list[int] = []
@@ -76,6 +105,33 @@ def occurrences(text: str, needle: str, limit: int = 5) -> list[int]:
         found.append(at)
         at = text.find(needle, at + 1)
     return found
+
+
+def count_occurrences(text: str, needle: str) -> int:
+    """How many places `needle` appears in `text`, overlapping ones included (as the edit check counts them)."""
+    count, at = 0, text.find(needle) if needle else -1
+    while at != -1:
+        count, at = count + 1, text.find(needle, at + 1)
+    return count
+
+
+def line_matches(text: str, search: str) -> list[int]:
+    """Offsets of the lines where `search` matches line by line with leading and trailing whitespace ignored,
+    the fallback `apply_file_edits` uses when there's no exact match."""
+    want = [line.strip() for line in search.split("\n")]
+    while want and not want[0]:
+        want.pop(0)
+    while want and not want[-1]:
+        want.pop()
+    if not want:
+        return []
+    lines = text.split("\n")
+    starts, offset = [], 0
+    for i in range(len(lines)):
+        if i + len(want) <= len(lines) and all(lines[i + k].strip() == w for k, w in enumerate(want)):
+            starts.append(offset)
+        offset += len(lines[i]) + 1
+    return starts
 
 
 def excerpt(text: str, start: int, end: int | None = None) -> str:
