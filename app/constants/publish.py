@@ -59,8 +59,9 @@ PROJECT_NAME_MAX = 58
 # AI-edited files a published site may have (read from the saved session).
 MAX_FILE_EDITS = 100
 MAX_TOKEN_CHARS = 500
-# A template's files.json is read up to this size.
-MAX_TEMPLATE_BYTES = 10_000_000
+# A template's files.json is read up to this size. Images, video and 3D models are in it as base64, so a template
+# with a lot of media is well past 10 MB.
+MAX_TEMPLATE_BYTES = 50_000_000
 # How long (seconds) the template catalog is trusted before it's read again. A template's files are cached
 # longer: their URL carries the template's version, so they don't change.
 CATALOG_TTL = 300
