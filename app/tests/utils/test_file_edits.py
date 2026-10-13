@@ -51,6 +51,22 @@ def test_rejects_missing_ambiguous_and_unknown_file_edits(edits: list[FileEdit],
         apply_file_edits(FILES, edits)
 
 
+@pytest.mark.parametrize(
+    ("edits", "kind", "index", "path"),
+    [
+        ([edit("src/Hero.tsx", "nope", "x")], "not_found", 1, "src/Hero.tsx"),
+        ([edit("src/Hero.tsx", "Contact", "Hi"), edit("src/index.css", "a {", "b {")], "ambiguous", 2, "src/index.css"),
+        ([edit("src/App.tsx", "a", "b")], "file_not_sent", 1, "src/App.tsx"),
+        ([edit("src/Hero.tsx", "\n\n", "x")], "empty_search", 1, "src/Hero.tsx"),
+    ],
+)
+def test_errors_say_which_edit_failed_and_how(edits: list[FileEdit], kind: str, index: int, path: str) -> None:
+    with pytest.raises(FileEditError) as caught:
+        apply_file_edits(FILES, edits)
+
+    assert (caught.value.kind, caught.value.edit, caught.value.path) == (kind, index, path)
+
+
 def test_later_edits_see_earlier_ones_and_no_op_edits_are_not_changes() -> None:
     result = apply_file_edits(
         FILES, [edit("src/Hero.tsx", "Contact", "Hire me"), edit("src/Hero.tsx", "Hire me", "Say hi")]

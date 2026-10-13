@@ -4,7 +4,13 @@ from app.schemas.portfolio import Portfolio
 from app.tests.ai_edit_fixtures import PORTFOLIO, render_portfolio_source
 from app.utils.portfolio_source import PortfolioSourceError, parse_portfolio_source
 from app.utils.portfolio_source import render_portfolio_source as render
-from app.utils.syntax_check import css_braces_balanced, script_language, script_syntax_error
+from app.utils.syntax_check import (
+    css_braces_balanced,
+    locate_syntax_error,
+    locate_unbalanced_brace,
+    script_language,
+    script_syntax_error,
+)
 
 
 def test_parses_the_content_files_the_spa_renders() -> None:
@@ -78,3 +84,22 @@ def test_css_braces_ignore_comments_and_strings() -> None:
     assert css_braces_balanced('a { content: "}"; } /* { */')
     assert not css_braces_balanced("a { color: red; ")
     assert not css_braces_balanced("} a {")
+
+
+def test_css_brace_errors_say_where() -> None:
+    assert locate_unbalanced_brace('a { content: "}"; }') is None
+    assert locate_unbalanced_brace("a { color: red; }\n} b { }") == ("unbalanced braces: a } that closes nothing", 18)
+    unclosed = "@media (x) { a { color: red; }\nb { color: blue;\n"
+    never_closed = unclosed.index("b {") + 2
+    assert locate_unbalanced_brace(unclosed) == ("unbalanced braces: a { that is never closed", never_closed)
+    assert locate_unbalanced_brace("/* } */ a { }") is None
+
+
+def test_script_syntax_errors_say_where() -> None:
+    code = 'const a = 1,b = () => e.jsx("p", {children: "x"}));'
+    found = locate_syntax_error(code, script_language("a.js"))  # type: ignore[arg-type]
+
+    assert found is not None
+    message, offset = found
+    assert message.startswith("syntax error (line 1)")
+    assert 0 < offset <= len(code)
