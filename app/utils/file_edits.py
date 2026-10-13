@@ -6,13 +6,37 @@ original, so the two must agree. Keep them in sync (the tests mirror `ai-edit-fi
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from app.constants.ai_edit import MAX_FILE_CHARS
 from app.schemas.ai_edit import FileEdit
 
+EditProblem = Literal[
+    "file_not_sent", "not_found", "ambiguous", "empty_search", "too_large", "forbidden", "no_change", "broken_file"
+]
+
 
 class FileEditError(ValueError):
-    """An edit can't be applied. The message is written for the model, which gets it back on a retry."""
+    """An edit can't be applied. The message is written for the model, which gets it back on a retry.
+
+    The other fields say what went wrong where, so the retry can explain it in detail: `edit` is the 1-based
+    index of the failing edit, `path` its file, and `offset` the place in the file it concerns, if known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: EditProblem | None = None,
+        edit: int | None = None,
+        path: str | None = None,
+        offset: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.edit = edit
+        self.path = path
+        self.offset = offset
 
 
 @dataclass(frozen=True)
@@ -38,13 +62,15 @@ def apply_file_edits(files: Mapping[str, str], edits: Sequence[FileEdit]) -> App
     for i, edit in enumerate(edits, start=1):
         where = f"edit {i} ({edit.path})"
         if edit.path not in result:
-            raise FileEditError(f"{where}: that file wasn't sent, so it can't be edited")
+            raise FileEditError(
+                f"{where}: that file wasn't sent, so it can't be edited", kind="file_not_sent", edit=i, path=edit.path
+            )
         try:
             text = _replace_once(result[edit.path], edit.search, edit.replace)
         except FileEditError as err:
-            raise FileEditError(f"{where}: {err}") from None
+            raise FileEditError(f"{where}: {err}", kind=err.kind, edit=i, path=edit.path) from None
         if _js_length(text) > MAX_FILE_CHARS:
-            raise FileEditError(f"{where}: the file would be too large")
+            raise FileEditError(f"{where}: the file would be too large", kind="too_large", edit=i, path=edit.path)
         if text != files[edit.path]:
             changed[edit.path] = None
         result[edit.path] = text
@@ -52,23 +78,24 @@ def apply_file_edits(files: Mapping[str, str], edits: Sequence[FileEdit]) -> App
 
 
 def _replace_once(text: str, search: str, replace: str) -> str:
+    ambiguous = "the search text appears more than once; include more surrounding lines"
     first = text.find(search)
     if first != -1:
         if text.find(search, first + 1) != -1:
-            raise FileEditError("the search text appears more than once; include more surrounding lines")
+            raise FileEditError(ambiguous, kind="ambiguous")
         return text[:first] + replace + text[first + len(search) :]
     # Line-based fallback: whole lines, compared trimmed. Blank edge lines in the search are ignored.
     want = [line.strip() for line in _trim_blank_edges(search.split("\n"))]
     if not want:
-        raise FileEditError("the search text is empty")
+        raise FileEditError("the search text is empty", kind="empty_search")
     lines = text.split("\n")
     starts = [
         s for s in range(len(lines) - len(want) + 1) if all(lines[s + k].strip() == w for k, w in enumerate(want))
     ]
     if not starts:
-        raise FileEditError("the search text was not found; copy it exactly from the file")
+        raise FileEditError("the search text was not found; copy it exactly from the file", kind="not_found")
     if len(starts) > 1:
-        raise FileEditError("the search text appears more than once; include more surrounding lines")
+        raise FileEditError(ambiguous, kind="ambiguous")
     s = starts[0]
     return "\n".join([*lines[:s], *_trim_blank_edges(replace.split("\n")), *lines[s + len(want) :]])
 

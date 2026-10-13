@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 from app.schemas.ai_edit import AiEditTier1, AiEditTier2, FileEdit
-from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt
+from app.services.ai_edit_prompt import REPAIR_PROMPT, SYSTEM_PROMPT, build_user_prompt
 from app.services.ai_edit_service import AiEditRejectedError, AiEditService, check_edits, classify, extract_json
 from app.tests.ai_edit_fixtures import CONTENT_PATH, GOOD_EDITS, GOOD_REPLY, HERO, HERO_PATH, make_request
 from app.tests.fakes import FakeModelClient, FakeModelSource
@@ -111,7 +111,10 @@ async def test_a_rejected_answer_is_retried_once_with_the_error() -> None:
     retry = model.calls[1]
     assert [m.role for m in retry] == ["user", "assistant", "user"]
     assert retry[1].content == bad
-    assert "not found" in retry[2].content
+    assert retry[2].content.startswith(REPAIR_PROMPT)
+    assert f"<rejection_report>\nEdit 1 of 1 ({HERO_PATH}) was rejected: the search text was not found" in (
+        retry[2].content
+    )
 
 
 async def test_the_model_can_escalate_to_tier_2() -> None:

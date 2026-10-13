@@ -20,10 +20,11 @@ from app.schemas.ai_edit import (
 )
 from app.schemas.ai_key import ModelChoice
 from app.schemas.chat import ChatMessage
-from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt, rejection_prompt
+from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt, repair_prompt
+from app.services.ai_edit_repair import rejection_report
 from app.utils.file_edits import AppliedEdits, FileEditError, apply_file_edits
 from app.utils.portfolio_source import PortfolioSourceError, parse_portfolio_source
-from app.utils.syntax_check import css_braces_balanced, script_language, script_syntax_error
+from app.utils.syntax_check import locate_syntax_error, locate_unbalanced_brace, script_language
 
 logger = logging.getLogger(__name__)
 
@@ -54,31 +55,45 @@ def check_edits(request: AiEditRequest, edits: list[FileEdit]) -> AppliedEdits:
     Raises:
         FileEditError: An edit can't be applied, or it breaks a file. The message is written for the model.
     """
-    forbidden = next((e for e in edits if FORBIDDEN_PATH.search(e.path)), None)
+    forbidden = next((i for i, e in enumerate(edits, start=1) if FORBIDDEN_PATH.search(e.path)), None)
     if forbidden:
-        raise FileEditError(f"{forbidden.path} can't be edited")
+        path = edits[forbidden - 1].path
+        raise FileEditError(f"{path} can't be edited", kind="forbidden", edit=forbidden, path=path)
     applied = apply_file_edits({f.path: f.content for f in request.files}, edits)
     if not applied.changed:
-        raise FileEditError("the edits don't change any file; make the requested change, or escalate if you can't")
+        raise FileEditError(
+            "the edits don't change any file; make the requested change, or escalate if you can't", kind="no_change"
+        )
+    same = next((i for i, e in enumerate(edits, start=1) if e.search == e.replace), None)
+    if same:
+        path = edits[same - 1].path
+        raise FileEditError(
+            f"edit {same} ({path}): its search and replace are the same, so it changes nothing",
+            kind="no_change",
+            edit=same,
+            path=path,
+        )
     for path in applied.changed:
-        problem = _problem_in(path, applied.files[path], request.template.content_path)
-        if problem:
-            raise FileEditError(f"{path}: {problem}")
+        found = _problem_in(path, applied.files[path], request.template.content_path)
+        if found:
+            problem, offset = found
+            raise FileEditError(f"{path}: {problem}", kind="broken_file", path=path, offset=offset)
     return applied
 
 
-def _problem_in(path: str, code: str, content_path: str) -> str | None:
+def _problem_in(path: str, code: str, content_path: str) -> tuple[str, int | None] | None:
+    """What's wrong with an edited file, and where (a character offset) when that's known."""
     if path == content_path:
         try:
             parse_portfolio_source(code)
         except PortfolioSourceError as err:
-            return str(err)
+            return str(err), None
         return None
     language = script_language(path)
     if language is not None:
-        return script_syntax_error(code, language)
-    if path.endswith(".css") and not css_braces_balanced(code):
-        return "unbalanced braces"
+        return locate_syntax_error(code, language)
+    if path.endswith(".css"):
+        return locate_unbalanced_brace(code)
     return None
 
 
@@ -114,8 +129,9 @@ class AiEditService:
         """Answers Tier 1 edits, or hands the request to Tier 2 (by rule, or because the model escalated).
         The model is the one the user picked (`request.model`), or makable's own.
 
-        A rejected answer is sent back once with the error, because free models often get the shape or the
-        search text wrong the first time.
+        A rejected answer is sent back once with a repair prompt and a report of what failed and where (the
+        file's real text at that place), because free models often get the shape or the search text wrong the
+        first time.
 
         Raises:
             AiModelRequiredError: Nothing was picked and there's no makable model.
@@ -144,6 +160,7 @@ class AiEditService:
         messages = [ChatMessage(role="user", content=f"{SYSTEM_PROMPT}\n\n{user_prompt}")]
         problem = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            answer: ModelEdits | ModelEscalation | None = None
             reply = await model.complete(messages)
             try:
                 answer = _ANSWER.validate_python(extract_json(reply))
@@ -153,9 +170,11 @@ class AiEditService:
             except (ValueError, FileEditError) as err:  # ValidationError and JSONDecodeError are ValueErrors.
                 problem = _describe(err)
                 logger.info("AI edit answer rejected", extra={"attempt": attempt, "problem": problem[:300]})
+                # A separate prompt for the retry: how to repair an answer, and exactly what failed and where.
+                edits = answer.edits if isinstance(answer, ModelEdits) else None
                 messages += [
                     ChatMessage(role="assistant", content=reply),
-                    ChatMessage(role="user", content=rejection_prompt(problem)),
+                    ChatMessage(role="user", content=repair_prompt(rejection_report(request, edits, err))),
                 ]
                 continue
             debug = self._debug_info(user_prompt, attempt, model)

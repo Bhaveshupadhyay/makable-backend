@@ -27,12 +27,19 @@ def script_language(path: str) -> Language | None:
 
 def script_syntax_error(code: str, language: Language) -> str | None:
     """The first syntax error in a script, as `syntax error (line N)`, or None if it parses."""
-    tree = Parser(language).parse(code.encode())
-    node = _first_error(tree.root_node)
+    found = locate_syntax_error(code, language)
+    return found[0] if found else None
+
+
+def locate_syntax_error(code: str, language: Language) -> tuple[str, int] | None:
+    """The first syntax error in a script and its character offset, or None if it parses."""
+    encoded = code.encode()
+    node = _first_error(Parser(language).parse(encoded).root_node)
     if node is None:
         return None
     what = f"missing {node.type}" if node.is_missing else "unexpected code"
-    return f"syntax error (line {node.start_point.row + 1}): {what}"
+    offset = len(encoded[: node.start_byte].decode(errors="ignore"))
+    return f"syntax error (line {node.start_point.row + 1}): {what}", offset
 
 
 def _first_error(node: Node) -> Node | None:
@@ -48,12 +55,24 @@ def _first_error(node: Node) -> Node | None:
 
 def css_braces_balanced(code: str) -> bool:
     """Braces in a stylesheet, ignoring comments and strings, open and close in order."""
-    depth = 0
-    for ch in _CSS_NOISE.sub("", code):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
+    return locate_unbalanced_brace(code) is None
+
+
+def locate_unbalanced_brace(code: str) -> tuple[str, int] | None:
+    """The first `}` with no `{` before it, or else the last `{` that is never closed, with its offset; None
+    when the braces balance. Comments and strings are skipped."""
+    noise = [m.span() for m in _CSS_NOISE.finditer(code)]
+    opened: list[int] = []
+    i = skip = 0
+    while i < len(code):
+        if skip < len(noise) and i >= noise[skip][0]:
+            i, skip = max(i, noise[skip][1]), skip + 1
+            continue
+        if code[i] == "{":
+            opened.append(i)
+        elif code[i] == "}":
+            if not opened:
+                return "unbalanced braces: a } that closes nothing", i
+            opened.pop()
+        i += 1
+    return ("unbalanced braces: a { that is never closed", opened[-1]) if opened else None
