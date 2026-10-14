@@ -133,10 +133,11 @@ anything is parsed. Each worker allows 50 AI edits and 100 workspace requests at
 `Retry-After`), one save at a time per user (bursts of 20, then one per 15 s; more get 429), and 200 outgoing
 connections with a 5 s wait for a free one.
 
-## Deploying (Docker + Cloudflare Tunnel)
+## Deploying (Docker + Reverse Proxy on Hostinger VPS)
 
-`compose.yaml` runs the API in a container and connects it to Cloudflare with a tunnel, so it can share a VPS with
-other sites (e.g. CloudPanel's Nginx keeps ports 80/443). The API isn't published on any host port.
+`compose.yaml` runs the API in a container published on `127.0.0.1:8787` with 16–24 GB RAM allocated, behind CloudPanel's
+Nginx reverse proxy with Let's Encrypt SSL. The API is only reachable locally on the server (never exposed directly on
+host ports), so CloudPanel keeps full control over ports 80/443 and other sites on the VPS.
 
 `.github/workflows/ci-cd.yml` checks every pull request and push to `main` (ruff, mypy, pytest, `alembic check`, and
 an image build). Merging to `main` doesn't deploy. To deploy `main`, either push a commit whose message has `[deploy]`:
@@ -149,14 +150,26 @@ git commit --allow-empty -m "Deploy [deploy]" && git push
 or run the workflow by hand (Actions → CI/CD → Run workflow on `main`, or `gh workflow run ci-cd.yml --ref main`).
 A deploy runs the checks, pushes the image to `ghcr.io/bhaveshupadhyay/makable-backend` (tagged with the commit and
 `latest`), then over SSH copies `compose.yaml` to the server, pulls the image, runs `alembic upgrade head` against
-the production database and restarts, waiting until the API reaches the database and the tunnel is connected. A run
+the production database and restarts, waiting until the API reaches the database and passes its health check. A run
 for an older commit than the one live (`deployed-sha` on the server) skips the rollout instead of rolling back.
 
 ### Once, on the server
 
-1. Cloudflare → Zero Trust → Networks → **Tunnels** → create a `cloudflared` tunnel and copy its token. Add a public
-   hostname, e.g. `api.example.com`, with service `http://api:8787`.
-2. Install Docker (`curl -fsSL https://get.docker.com | sh`) and add a deploy user that may use it (the `docker`
+1. Point your API domain's DNS `A` record (e.g. `api.example.com`) to the VPS IP, and wait until it resolves:
+   Let's Encrypt checks the domain from outside, so the certificate fails before then.
+2. In CloudPanel (or Nginx), create a **Reverse Proxy site** for that domain forwarding to `http://127.0.0.1:8787`,
+   then enable Let's Encrypt SSL under the site's SSL/TLS tab.
+3. In the site's Vhost, raise the proxy timeouts inside `location /`. Nginx's default of 60 s cuts off AI edits, which
+   can make two model calls of up to `AI_TIMEOUT_SECONDS` (90 s) each:
+
+   ```nginx
+   proxy_read_timeout 300s;
+   proxy_send_timeout 300s;
+   ```
+
+   The API trusts `X-Forwarded-For` only from its Docker network's gateway (`FORWARDED_ALLOW_IPS` in `compose.yaml`).
+   If the logs show `172.31.87.1` instead of visitors' IPs, check that the Vhost sends that header.
+4. Install Docker (`curl -fsSL https://get.docker.com | sh`) and add a deploy user that may use it (the `docker`
    group is as powerful as root, so use this user for nothing else):
 
    ```sh
@@ -165,14 +178,12 @@ for an older commit than the one live (`deployed-sha` on the server) skips the r
    install -d -o deploy -g deploy -m 750 /opt/makable-backend
    ```
 
-3. Write `/opt/makable-backend/.env` (owner `deploy`, `chmod 600`) with the production values:
+5. Write `/opt/makable-backend/.env` (owner `deploy`, `chmod 600`) with the production values:
    `APP_URL=https://<the SPA's domain>` and the same `TOKEN_ENCRYPTION_KEY` as before (stored tokens can't be read
-   with another). `ENVIRONMENT=production` is set by compose. Write a literal `$` as `$$`. Put the tunnel's token in
-   `/opt/makable-backend/tunnel.env` (`TUNNEL_TOKEN=...`, see `tunnel.env.example`, also `chmod 600`): only the
-   `cloudflared` container gets it.
-4. Make an SSH key for GitHub (`ssh-keygen -t ed25519 -f makable-deploy -N ""` on your machine) and append
+   with another). `ENVIRONMENT=production` is set by compose. Write a literal `$` as `$$`.
+6. Make an SSH key for GitHub (`ssh-keygen -t ed25519 -f makable-deploy -N ""` on your machine) and append
    `makable-deploy.pub` to `/home/deploy/.ssh/authorized_keys`.
-5. Supabase → Redirect URLs: add `https://<the SPA's domain>/api/v1/auth/github/callback`.
+7. Supabase → Redirect URLs: add `https://<the SPA's domain>/api/v1/auth/github/callback`.
 
 ### Once, on GitHub
 
@@ -186,6 +197,10 @@ with these secrets:
 | `VPS_USER` | `deploy` |
 | `VPS_SSH_KEY` | the private key `makable-deploy` |
 | `VPS_KNOWN_HOSTS` | output of `ssh-keyscan -p <port> <host>` (check it against the server's real host key) |
+
+Add the **variable** `API_URL` (e.g. `https://api.example.com`) in the same environment: after the rollout the
+deploy checks `/api/v1/health/ready` through it, so a broken DNS, Nginx or certificate fails the run. Without it the
+check is skipped with a warning.
 
 The server pulls with the job's own token and logs out at the end, so it keeps no registry password.
 

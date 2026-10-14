@@ -35,7 +35,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/v1/health/ready', timeout=4)"]
 
 # One worker: the request limits (core/limits.py) are counted per process.
-# The port is only reachable from the compose network (cloudflared), so trusting forwarded headers from any
-# address is safe; it puts the visitor's IP in the logs instead of cloudflared's.
+# Forwarded headers are trusted only from FORWARDED_ALLOW_IPS (uvicorn's default 127.0.0.1 when unset); compose.yaml
+# sets it to the reverse proxy's address, so the logs show the visitor's IP and a caller can't fake it.
 CMD ["uvicorn", "main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8787", "--workers", "1", \
-     "--proxy-headers", "--forwarded-allow-ips", "*"]
+     "--proxy-headers"]
