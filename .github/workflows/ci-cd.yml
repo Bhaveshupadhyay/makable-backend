@@ -149,7 +149,9 @@ jobs:
           set -euo pipefail
           cd "$DEPLOY_PATH"
           docker compose pull api
-          docker compose run --rm api alembic upgrade head
+          # bash reads this script from stdin, and `compose run` attaches stdin to the container, which would swallow
+          # the rest of the script and end the step "successfully" right after the migration.
+          docker compose run --rm -T api alembic upgrade head < /dev/null
           # --remove-orphans stops services this compose.yaml no longer has (e.g. the old cloudflared tunnel).
           if ! docker compose up -d --remove-orphans --wait --wait-timeout 120; then
             docker compose logs --tail 100 api
