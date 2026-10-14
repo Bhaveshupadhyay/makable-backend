@@ -151,7 +151,7 @@ jobs:
           docker compose pull api
           docker compose run --rm api alembic upgrade head
           if ! docker compose up -d --wait --wait-timeout 120; then
-            docker compose logs --tail 100 api cloudflared
+            docker compose logs --tail 100 api
             exit 1
           fi
           printf '%s\n' "${API_IMAGE##*:}" > deployed-sha
