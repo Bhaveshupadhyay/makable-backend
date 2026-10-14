@@ -25,6 +25,9 @@ from app.schemas.github import (
 
 API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
+# Text sent inline in one tree request, in total (characters). Files past it are uploaded as blobs first, one
+# request each, so the tree request stays small however large the commit is.
+MAX_INLINE_TREE_CHARS = 3_000_000
 
 
 class GithubError(ExternalServiceError):
@@ -285,18 +288,23 @@ class HttpGithubClient:
     ) -> str:
         """Writes and deletes several files as one commit on top of `head`, then moves the branch to it. Nothing
         is visible until the branch moves, so a failure part-way leaves the repo unchanged. Returns the commit SHA.
-        Binary files are uploaded as blobs first (a tree only takes text inline).
+        Binary files are uploaded as blobs first (a tree only takes text inline), and so is text past
+        `MAX_INLINE_TREE_CHARS`.
 
         Raises:
             GithubConflictError: The branch moved since `head` was read (another save got in first).
             GithubError: A request failed.
         """
         tree: list[dict[str, Any]] = []
+        inline = 0
         for c in changes:
             entry: dict[str, Any] = {"path": c.path, "mode": "100644", "type": "blob"}
             if isinstance(c.content, bytes):
                 entry["sha"] = await self._create_blob(access_token, full_name, c.content)
+            elif c.content is not None and inline + len(c.content) > MAX_INLINE_TREE_CHARS:
+                entry["sha"] = await self._create_blob(access_token, full_name, c.content.encode())
             elif c.content is not None:
+                inline += len(c.content)
                 entry["content"] = c.content
             else:
                 entry["sha"] = None

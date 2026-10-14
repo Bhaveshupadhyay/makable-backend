@@ -59,12 +59,20 @@ PROJECT_NAME_MAX = 58
 # AI-edited files a published site may have (read from the saved session).
 MAX_FILE_EDITS = 100
 MAX_TOKEN_CHARS = 500
-# A template's files.json is read up to this size.
-MAX_TEMPLATE_BYTES = 10_000_000
+# The catalog itself is a short list of templates, read up to this size.
+MAX_CATALOG_BYTES = 1_000_000
+# A template's files.json is read up to this size. Images, video and 3D models are in it as base64, so a template
+# with a lot of media is well past 10 MB.
+MAX_TEMPLATE_BYTES = 50_000_000
+# One binary file of a template, decoded. Each is sent to GitHub as base64 in a request of its own, which has to
+# stay well inside what GitHub's API takes.
+MAX_TEMPLATE_FILE_BYTES = 15_000_000
 # How long (seconds) the template catalog is trusted before it's read again. A template's files are cached
 # longer: their URL carries the template's version, so they don't change.
 CATALOG_TTL = 300
-TEMPLATE_FILES_CACHE_SIZE = 32
+# The templates' files kept in memory, in total (text characters plus decoded binary bytes). The least recently
+# used go first. Only one template is downloaded and parsed at a time, so a worker holds this plus one load.
+TEMPLATE_FILES_CACHE_BYTES = 100_000_000
 # Waits (seconds) for GitHub to accept starting a workflow it just received (a new or changed workflow file can
 # take a few seconds to register).
 DISPATCH_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)

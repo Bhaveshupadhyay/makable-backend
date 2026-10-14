@@ -4,6 +4,7 @@ import base64
 import json
 import time
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -209,6 +210,43 @@ async def test_commit_changes_uploads_binary_files_as_blobs() -> None:
             {"path": "index.html", "mode": "100644", "type": "blob", "content": "<main></main>"},
         ],
     }
+
+
+async def test_commit_changes_uploads_text_past_the_inline_budget_as_blobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.clients.github.MAX_INLINE_TREE_CHARS", 10)
+    blobs: list[object] = []
+    trees: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/git/blobs"):
+            blobs.append(body)
+            return httpx.Response(201, json={"sha": f"blob{len(blobs)}"})
+        if request.url.path.endswith("/git/trees"):
+            trees.append(body["tree"])
+        return httpx.Response(201, json={"sha": "c" * 40})
+
+    head = GithubBranchHead(commit_sha="a" * 40, tree_sha="b" * 40)
+    changes = [
+        GithubTreeChange(path="a.js", content="123456"),
+        GithubTreeChange(path="big.js", content="é" * 11),
+        GithubTreeChange(path="b.js", content="1234"),
+        GithubTreeChange(path="c.js", content="1"),
+        GithubTreeChange(path="gone.js", content=None),
+    ]
+    await client(handler).commit_changes("tok", REPO, "main", head, changes, message="Publish")
+
+    def blob(text: str) -> dict[str, str]:
+        return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
+
+    assert blobs == [blob("é" * 11), blob("1")]
+    assert [{k: v for k, v in e.items() if k in ("path", "content", "sha")} for e in trees[0]] == [
+        {"path": "a.js", "content": "123456"},
+        {"path": "big.js", "sha": "blob1"},
+        {"path": "b.js", "content": "1234"},
+        {"path": "c.js", "sha": "blob2"},
+        {"path": "gone.js", "sha": None},
+    ]
 
 
 async def test_get_tree_lists_files_and_refuses_a_truncated_tree() -> None:
