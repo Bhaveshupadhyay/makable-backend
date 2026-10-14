@@ -150,7 +150,8 @@ jobs:
           cd "$DEPLOY_PATH"
           docker compose pull api
           docker compose run --rm api alembic upgrade head
-          if ! docker compose up -d --wait --wait-timeout 120; then
+          # --remove-orphans stops services this compose.yaml no longer has (e.g. the old cloudflared tunnel).
+          if ! docker compose up -d --remove-orphans --wait --wait-timeout 120; then
             docker compose logs --tail 100 api
             exit 1
           fi
@@ -158,6 +159,19 @@ jobs:
           # Keeps two weeks of this app's images for rollbacks; other images on the server aren't touched.
           docker image prune -af --filter "label=$SOURCE_LABEL" --filter until=336h
           SCRIPT
+
+      # `up --wait` only checks the container. This checks the way users come in (DNS, Nginx, SSL), and fails the run
+      # if it's broken. deployed-sha stays as written: that commit is what the server runs.
+      - name: Check the API through its public URL
+        if: steps.fresh.outputs.skip != 'true'
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "::warning::The production environment has no API_URL variable, so the public URL isn't checked."
+            exit 0
+          fi
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors --max-time 10 "${API_URL%/}/api/v1/health/ready"
 
       - name: Log the server out of GHCR
         if: always()

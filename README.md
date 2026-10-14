@@ -155,10 +155,21 @@ for an older commit than the one live (`deployed-sha` on the server) skips the r
 
 ### Once, on the server
 
-1. In CloudPanel (or Nginx), create a **Reverse Proxy site** for your API domain (e.g. `api.example.com`) forwarding to
-   `http://127.0.0.1:8787`. Enable Let's Encrypt SSL under the site's SSL/TLS tab. Point your domain's DNS `A` record
-   to the VPS IP.
-2. Install Docker (`curl -fsSL https://get.docker.com | sh`) and add a deploy user that may use it (the `docker`
+1. Point your API domain's DNS `A` record (e.g. `api.example.com`) to the VPS IP, and wait until it resolves:
+   Let's Encrypt checks the domain from outside, so the certificate fails before then.
+2. In CloudPanel (or Nginx), create a **Reverse Proxy site** for that domain forwarding to `http://127.0.0.1:8787`,
+   then enable Let's Encrypt SSL under the site's SSL/TLS tab.
+3. In the site's Vhost, raise the proxy timeouts inside `location /`. Nginx's default of 60 s cuts off AI edits, which
+   can make two model calls of up to `AI_TIMEOUT_SECONDS` (90 s) each:
+
+   ```nginx
+   proxy_read_timeout 300s;
+   proxy_send_timeout 300s;
+   ```
+
+   The API trusts `X-Forwarded-For` only from its Docker network's gateway (`FORWARDED_ALLOW_IPS` in `compose.yaml`).
+   If the logs show `172.31.87.1` instead of visitors' IPs, check that the Vhost sends that header.
+4. Install Docker (`curl -fsSL https://get.docker.com | sh`) and add a deploy user that may use it (the `docker`
    group is as powerful as root, so use this user for nothing else):
 
    ```sh
@@ -167,12 +178,12 @@ for an older commit than the one live (`deployed-sha` on the server) skips the r
    install -d -o deploy -g deploy -m 750 /opt/makable-backend
    ```
 
-3. Write `/opt/makable-backend/.env` (owner `deploy`, `chmod 600`) with the production values:
+5. Write `/opt/makable-backend/.env` (owner `deploy`, `chmod 600`) with the production values:
    `APP_URL=https://<the SPA's domain>` and the same `TOKEN_ENCRYPTION_KEY` as before (stored tokens can't be read
    with another). `ENVIRONMENT=production` is set by compose. Write a literal `$` as `$$`.
-4. Make an SSH key for GitHub (`ssh-keygen -t ed25519 -f makable-deploy -N ""` on your machine) and append
+6. Make an SSH key for GitHub (`ssh-keygen -t ed25519 -f makable-deploy -N ""` on your machine) and append
    `makable-deploy.pub` to `/home/deploy/.ssh/authorized_keys`.
-5. Supabase → Redirect URLs: add `https://<the SPA's domain>/api/v1/auth/github/callback`.
+7. Supabase → Redirect URLs: add `https://<the SPA's domain>/api/v1/auth/github/callback`.
 
 ### Once, on GitHub
 
@@ -186,6 +197,10 @@ with these secrets:
 | `VPS_USER` | `deploy` |
 | `VPS_SSH_KEY` | the private key `makable-deploy` |
 | `VPS_KNOWN_HOSTS` | output of `ssh-keyscan -p <port> <host>` (check it against the server's real host key) |
+
+Add the **variable** `API_URL` (e.g. `https://api.example.com`) in the same environment: after the rollout the
+deploy checks `/api/v1/health/ready` through it, so a broken DNS, Nginx or certificate fails the run. Without it the
+check is skipped with a warning.
 
 The server pulls with the job's own token and logs out at the end, so it keeps no registry password.
 

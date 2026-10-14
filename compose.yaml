@@ -6,8 +6,8 @@
 # copies this file to the server, pulls the image it built (API_IMAGE, tagged with the commit), runs the migrations
 # and restarts. By hand on the server:
 #
-#   docker compose pull && docker compose up -d       # the latest image from main
-#   API_IMAGE=ghcr.io/bhaveshupadhyay/makable-backend:<commit sha> docker compose up -d   # roll back to a commit
+#   docker compose pull && docker compose up -d --remove-orphans   # the latest image from main
+#   API_IMAGE=ghcr.io/bhaveshupadhyay/makable-backend:<commit sha> docker compose up -d --remove-orphans   # roll back
 #   docker compose logs -f api
 #
 # `docker compose up --build` builds from source instead (needs a clone of the repo).
@@ -27,6 +27,12 @@ services:
     env_file: .env
     environment:
       ENVIRONMENT: production
+      # Nginx's requests arrive from this network's gateway (Docker forwards the published port), so only it may set
+      # X-Forwarded-For. Uvicorn then takes the client from the right, past trusted hops, and a header sent by the
+      # caller is ignored even when Nginx appends to it.
+      FORWARDED_ALLOW_IPS: 172.31.87.0/24
+    networks:
+      - api
     ports:
       - "127.0.0.1:8787:8787"
     deploy:
@@ -37,3 +43,10 @@ services:
           memory: 24G
     restart: unless-stopped
     logging: *logging
+
+networks:
+  # A fixed subnet, so FORWARDED_ALLOW_IPS above can name it.
+  api:
+    ipam:
+      config:
+        - subnet: 172.31.87.0/24
