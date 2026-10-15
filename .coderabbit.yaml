@@ -1,7 +1,11 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# CodeRabbit's reviews of this repo. Tests, the lockfile and generated data aren't reviewed.
+# CodeRabbit's reviews of this repo. It reviews at most 100 files per PR, so what isn't worth a review is left out:
+# tests, the lockfile, generated data, this file, and `__init__.py` files (they only import and re-export: keep code
+# out of them).
 reviews:
   path_filters:
     - "!app/tests/**"
     - "!uv.lock"
     - "!app/agents/create_site/tools/lucide_icons.txt"
+    - "!.coderabbit.yaml"
+    - "!**/__init__.py"
