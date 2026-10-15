@@ -13,6 +13,8 @@ ROUTE_BODY_LIMITS: tuple[tuple[str, str, int], ...] = (
 
 # Requests of a kind in progress at once, per worker. Past these, a quick 503 instead of piling up in memory.
 MAX_CONCURRENT_AI_EDITS = 50
+# Creations take minutes (a model call per file) and hold their slot all that time.
+MAX_CONCURRENT_CREATIONS = 10
 MAX_CONCURRENT_SITE_REQUESTS = 100
 # Saves of manual edits per user: bursts of up to this many, then one per this many seconds (the SPA saves after a
 # 30 s pause, so a user editing nonstop saves about every 2 min).

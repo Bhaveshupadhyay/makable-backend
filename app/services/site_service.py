@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import status
 
+from app.agents.create_site.state import NameTakenError
 from app.clients.github import GithubClient, GithubConflictError, GithubNotFoundError, GithubRepoExistsError
 from app.constants.site import (
     MANIFEST_FORMAT,
@@ -165,6 +166,36 @@ class SiteAccess:
         return await self._service.commit(self._token, self.repo, base_commit, changes, message)
 
 
+class SiteCreatorAccess:
+    """A site's repo for the create agent (`SiteCreator`): `create` makes it with the starter files; then it reads and
+    commits like `SiteAccess`. A taken name is the agent's `NameTakenError`, so it can ask for another."""
+
+    def __init__(self, service: SiteService, user: UserRead, project_id: UUID) -> None:
+        self._service = service
+        self._user = user
+        self._project_id = project_id
+        self._access: SiteAccess | None = None
+
+    async def create(self, name: str) -> str:
+        try:
+            created = await self._service.create(self._user, self._project_id, SiteNew(name=name))
+        except SiteRepoTakenError as err:
+            raise NameTakenError(str((err.details or {}).get("repoName", name))) from None
+        self._access = None
+        return created.commit_sha
+
+    async def snapshot(self, commit_sha: str) -> SiteSnapshot:
+        return await (await self._site()).snapshot(commit_sha)
+
+    async def commit(self, base_commit: str, changes: dict[str, str | None], message: str) -> str:
+        return await (await self._site()).commit(base_commit, changes, message)
+
+    async def _site(self) -> SiteAccess:
+        if self._access is None:
+            self._access = await self._service.access(self._user, self._project_id)
+        return self._access
+
+
 class SiteService:
     """Sites: a row for whose site it is, and the code in a private repo on the user's GitHub (one per site, marked
     with `.makable/manifest.json`). makable reads a site as an archive at a commit and writes every change as a
@@ -200,6 +231,17 @@ class SiteService:
     async def list_sites(self, user: UserRead) -> list[SiteRead]:
         """The user's sites, the most recently used first."""
         return [self._read(user, site) for site in await self._sites.list_for_user(user.id)]
+
+    async def read(self, user: UserRead, project_id: UUID) -> SiteRead:
+        """The site's row as the SPA sees it.
+
+        Raises:
+            SiteNotFoundError: No such site, or it's another user's.
+        """
+        site = await self._sites.get(project_id)
+        if site is None or site.user_id != user.id:
+            raise SiteNotFoundError()
+        return self._read(user, site)
 
     async def create(self, user: UserRead, project_id: UUID, data: SiteNew) -> SiteFiles:
         """Creates the site's private repo, named after the site, with makable's starter files. A site that already
@@ -251,7 +293,8 @@ class SiteService:
                 SiteCreate(id=project_id, user_id=user.id, name=data.name, repo_name=repo.name)
             )
         else:
-            await self._sites.set_repo(project_id, repo.name)
+            await self._sites.set_repo(project_id, repo.name, data.name)
+            site.name, site.repo_name = data.name, repo.name
         await self._uow.commit()
         self._verified.add(project_id, repo)
         snapshot = await self.snapshot(token, repo, commit_sha)
@@ -290,6 +333,24 @@ class SiteService:
         _, token, repo = await self._site_repo(user, project_id)
         await self._uow.rollback()
         return SiteAccess(self, token, repo, project_id)
+
+    async def ensure(self, user: UserRead, project_id: UUID, name: str) -> Site:
+        """The user's site, made (without a repo yet) if there's none: what its AI threads belong to.
+
+        Raises:
+            SiteNotFoundError: The site is another user's.
+        """
+        site = await self._sites.get(project_id)
+        if site is not None and site.user_id != user.id:
+            raise SiteNotFoundError()
+        if site is None:
+            site = await self._sites.create(SiteCreate(id=project_id, user_id=user.id, name=name))
+            await self._uow.commit()
+        return site
+
+    def creator(self, user: UserRead, project_id: UUID) -> SiteCreatorAccess:
+        """The site's repo for the create agent: it makes the repo, then reads and commits like `access`."""
+        return SiteCreatorAccess(self, user, project_id)
 
     async def save(self, user: UserRead, project_id: UUID, data: SiteSave) -> SiteSaved:
         """Commits the user's manual edits on top of `base_commit`: only files that differ from it (none: no commit).

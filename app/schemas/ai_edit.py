@@ -148,6 +148,8 @@ class Question(CamelModel):
         Field(max_length=MAX_OPTIONS),
     ] = Field(default_factory=list)
     allow_free_text: bool = True
+    # What's asked, when it's one of makable's own questions (the create agent's name for the site).
+    kind: Literal["project_name"] | None = None
 
 
 class ModelQuestion(CamelModel):

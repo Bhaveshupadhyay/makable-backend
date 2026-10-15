@@ -1,4 +1,5 @@
-from app.agents.ai_edit.state import EditState, Turn, result_of
+from app.agents.ai_edit.state import EditState, result_of
+from app.agents.thread import Turn
 from app.constants.ai_edit import AiEditOutcome
 from app.core.database import utc_now
 

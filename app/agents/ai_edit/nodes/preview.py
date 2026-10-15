@@ -2,7 +2,8 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from app.agents.ai_edit.prompts.repair import preview_prompt
-from app.agents.ai_edit.state import EditRun, EditState, RunResult, result_of
+from app.agents.ai_edit.state import EditRun, EditState, result_of
+from app.agents.thread import RunResult
 from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.schemas.ai_edit import AiEditPreviewReport, FileEdit
 from app.utils.file_edits import apply_file_edits

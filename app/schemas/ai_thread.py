@@ -43,6 +43,9 @@ class AiPausedRun(CamelModel):
     preview (the edits to try: report with `/ai/edit/{projectId}/result`)."""
 
     run_id: UUID
+    # Which agent's run: an edit's, or the site's creation (its name question; answer it with
+    # `/ai/create/{projectId}/answer`).
+    mode: Literal["edit", "create"] = "edit"
     instruction: str
     target: str | None
     question: Question | None = None

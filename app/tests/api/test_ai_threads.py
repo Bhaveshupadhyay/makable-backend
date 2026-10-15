@@ -102,9 +102,10 @@ def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClien
     assert thread["status"] == "needs_input"
     assert thread["run"] == {
         "runId": paused["runId"],
+        "mode": "edit",
         "instruction": "Make the contact button green",
         "target": 'Ada > <a> "Contact"',
-        "question": paused["question"],
+        "question": {**paused["question"], "kind": None},
         "preview": None,
     }
 

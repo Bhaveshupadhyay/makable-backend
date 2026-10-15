@@ -18,7 +18,7 @@ class SiteRepository(Protocol):
 
     async def create(self, data: SiteCreate) -> Site: ...
 
-    async def set_repo(self, site_id: UUID, repo_name: str) -> None: ...
+    async def set_repo(self, site_id: UUID, repo_name: str, name: str) -> None: ...
 
     async def touch(self, site_id: UUID) -> None: ...
 
@@ -60,9 +60,10 @@ class SqlSiteRepository:
             raise ConflictError("This site was just created. Try again.", code="site_conflict") from err
         return site
 
-    async def set_repo(self, site_id: UUID, repo_name: str) -> None:
+    async def set_repo(self, site_id: UUID, repo_name: str, name: str) -> None:
+        """Records the repo a site got (and the name it was given then)."""
         await self._session.execute(
-            update(Site).where(Site.id == site_id).values(repo_name=repo_name, updated_at=utc_now())
+            update(Site).where(Site.id == site_id).values(repo_name=repo_name, name=name, updated_at=utc_now())
         )
 
     async def touch(self, site_id: UUID) -> None:

@@ -2,8 +2,9 @@
 code it's shown, all as tagged data. The code is read from the snapshot each time (the state only says which lines),
 and shown as numbered lines."""
 
-from app.agents.ai_edit.state import ContextRef, Selection, Turn
+from app.agents.ai_edit.state import ContextRef, Selection
 from app.agents.ai_edit.tools.context import line_count, outline
+from app.agents.thread import Turn
 from app.constants.ai_edit import MAX_HISTORY, MAX_HISTORY_REPLY, MAX_LISTED_FILES
 from app.constants.site import RESERVED_PATH
 from app.schemas.ai_edit import AiEditRequest, AiEditTarget, AiEditTurn

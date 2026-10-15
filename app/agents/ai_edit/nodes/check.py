@@ -3,9 +3,10 @@ import logging
 from langgraph.runtime import Runtime
 
 from app.agents.ai_edit.prompts.repair import rejection_report, repair_prompt
-from app.agents.ai_edit.state import EditRun, EditState, RunResult
+from app.agents.ai_edit.state import EditRun, EditState
 from app.agents.ai_edit.tools.answer import describe_problem, parse_answer, without_line_numbers
 from app.agents.ai_edit.tools.edits import check_edits
+from app.agents.thread import RunResult
 from app.constants.ai_edit import MAX_ATTEMPTS, MAX_CONTEXT_ROUNDS, MAX_QUESTIONS, AiEditOutcome
 from app.schemas.ai_edit import ModelEdits, ModelEscalation, ModelNeedsContext, ModelQuestion
 from app.utils.file_edits import FileEditError

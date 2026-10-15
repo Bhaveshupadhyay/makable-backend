@@ -4,9 +4,10 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.types import Command, Durability, StateSnapshot
+from langgraph.types import Command, StateSnapshot
 
 from app.agents.ai_edit import EditRun, EditState, RunResult, compile_edit_graph, result_of, run_input, turn_for
+from app.agents.create_site import compile_create_graph
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
@@ -29,16 +30,13 @@ from app.schemas.ai_key import ModelChoice
 from app.schemas.ai_thread import AiPausedRun, AiPreview, AiThreadRead, AiTurnRead
 from app.schemas.site import AiEditRecordCreate, SiteSnapshot
 from app.schemas.user import UserRead
+from app.services.ai_runs import DURABILITY, create_config, edit_config, end_paused, pause_kind, pause_value, prune
 from app.services.site_service import SiteAccess, SiteConflictError, SiteNotFoundError, SiteService
 from app.utils.file_edits import apply_file_edits
 
 logger = logging.getLogger(__name__)
 
 type AiEditResult = AiEditApplied | AiEditEscalated | AiEditNeedsInput | AiEditAwaitingResult
-
-# The checkpoint is written when a run ends (or pauses), not after every step: a run is short, and a cancelled or
-# failed one then leaves nothing half-done behind (only its input), which the next run's input replaces.
-DURABILITY: Durability = "exit"
 
 
 class AiEditRejectedError(ExternalServiceError):
@@ -72,10 +70,11 @@ class ModelSource(Protocol):
 
 
 class AiEditService:
-    """AI edits on the LangGraph agent (`app/agents/ai_edit`), one thread per site: the agent reads the site's code
-    from its repo at the commit the browser is at, asks the model for search/replace edits, checks them, and commits
-    them. Prompts and the model call stay on the server. The thread keeps the chat; `ai_edit_requests` keeps each
-    request as a row."""
+    """AI edits on the LangGraph agent (`app/agents/ai_edit`): the agent reads the site's code from its repo at the
+    commit the browser is at, asks the model for search/replace edits, checks them, has the preview try them, and
+    commits them. Prompts and the model call stay on the server. It also shows the site's chat (the edit thread's and
+    the create thread's turns, and a run that's waiting), and Dismiss and Start over for both agents;
+    `SiteCreateService` runs the creations. `ai_edit_requests` keeps each request as a row."""
 
     def __init__(
         self,
@@ -96,6 +95,7 @@ class AiEditService:
         self._uow = uow
         self._checkpointer = checkpointer
         self._graph = compile_edit_graph(checkpointer)
+        self._create_graph = compile_create_graph(checkpointer)
         self._runs = runs
         self._debug = debug
 
@@ -138,7 +138,7 @@ class AiEditService:
         async with self._runs.hold((user.id, project_id)):
             site = await self._site_at(user, project_id, body.base_commit)
             paused = await self._paused(project_id)
-            if paused is None or _pause_kind(paused) != "question" or paused.values.get("run_id") != str(body.run_id):
+            if paused is None or pause_kind(paused) != "question" or paused.values.get("run_id") != str(body.run_id):
                 raise AiRunSupersededError()
             request = AiEditRequest.model_validate(
                 {**paused.values["request"], "base_commit": body.base_commit, "screenshot": body.screenshot}
@@ -157,7 +157,7 @@ class AiEditService:
         """
         async with self._runs.hold((user.id, project_id)):
             paused = await self._paused(project_id)
-            if paused is None or _pause_kind(paused) != "preview" or paused.values.get("run_id") != str(body.run_id):
+            if paused is None or pause_kind(paused) != "preview" or paused.values.get("run_id") != str(body.run_id):
                 raise AiRunSupersededError()
             base = paused.values["base_commit"]
             site = await self._site_at(user, project_id, base)
@@ -166,7 +166,8 @@ class AiEditService:
             return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
 
     async def dismiss(self, user: UserRead, project_id: UUID) -> None:
-        """Ends the run that's waiting for the user (Dismiss): it's recorded as skipped. Nothing waiting is fine.
+        """Ends the run that's waiting (for the user's answer or the preview), the edit's or the creation's (Dismiss):
+        it's recorded as skipped. Nothing waiting is fine.
 
         Raises:
             SiteNotFoundError: The site is another user's.
@@ -178,6 +179,17 @@ class AiEditService:
                 raise SiteNotFoundError()
             if site is not None:
                 await self._skip_paused(user, project_id)
+                config = create_config(project_id)
+                snapshot = await self._create_graph.aget_state(config)
+                await end_paused(
+                    self._create_graph,
+                    config,
+                    snapshot,
+                    records=self._records,
+                    uow=self._uow,
+                    user_id=user.id,
+                    project_id=project_id,
+                )
 
     async def thread(self, user: UserRead, project_id: UUID) -> AiThreadRead:
         """The site's chat, oldest first, and the run waiting for the user's answer, if one is (it survives a closed
@@ -192,14 +204,26 @@ class AiEditService:
         if site is None:
             return AiThreadRead(project_id=project_id, status="idle", turns=[])
         snapshot = await self._graph.aget_state(self._config(project_id))
-        turns = [AiTurnRead.model_validate(t) for t in snapshot.values.get("turns", [])]
-        kind = _pause_kind(snapshot)
+        creation = await self._create_graph.aget_state(create_config(project_id))
+        both = [*creation.values.get("turns", []), *snapshot.values.get("turns", [])]
+        turns = sorted((AiTurnRead.model_validate(t) for t in both), key=lambda t: t.created_at)
+        asked = pause_value(creation)
+        if asked is not None:
+            run = AiPausedRun(
+                run_id=creation.values["run_id"],
+                mode="create",
+                instruction=creation.values["prompt"],
+                target=None,
+                question=Question.model_validate(asked),
+            )
+            return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
+        kind = pause_kind(snapshot)
         if kind is None:
             return AiThreadRead(project_id=project_id, status="idle", turns=turns)
         values = snapshot.values
         run = AiPausedRun(run_id=values["run_id"], instruction=values["instruction"], target=values.get("target"))
         if kind == "question":
-            run.question = Question.model_validate(_pause_value(snapshot))
+            run.question = Question.model_validate(pause_value(snapshot))
             return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
         # The edits are in the state; the files they make are worked out again from the base commit.
         access = await self._site_service.access(user, project_id)
@@ -222,7 +246,8 @@ class AiEditService:
             if site.user_id != user.id:
                 raise SiteNotFoundError()
             # Checkpoints first: if that fails, the site row is still there to try again with.
-            await self._checkpointer.adelete_thread(str(project_id))
+            await self._checkpointer.adelete_thread(edit_config(project_id)["configurable"]["thread_id"])
+            await self._checkpointer.adelete_thread(create_config(project_id)["configurable"]["thread_id"])
             await self._records.delete_for_site(project_id)
             await self._sites.delete(site)
             await self._uow.commit()
@@ -291,34 +316,21 @@ class AiEditService:
     async def _paused(self, project_id: UUID) -> StateSnapshot | None:
         """The thread's state, if a run is waiting (for the user's answer, or for the preview)."""
         snapshot = await self._graph.aget_state(self._config(project_id))
-        return snapshot if _pause_kind(snapshot) is not None else None
+        return snapshot if pause_kind(snapshot) is not None else None
 
     async def _skip_paused(self, user: UserRead, project_id: UUID) -> None:
-        """Ends a run that's waiting (for an answer or the preview; a new instruction or Dismiss replaces it), recorded
-        as skipped."""
-        paused = await self._paused(project_id)
-        if paused is None:
-            return
-        values = paused.values
-        result = RunResult(outcome=AiEditOutcome.SKIPPED.value)
-        await self._graph.aupdate_state(
-            self._config(project_id), {"result": result, "messages": [], "reply": ""}, as_node="finish"
+        """Ends an edit run that's waiting (for an answer or the preview; a new instruction or Dismiss replaces it),
+        recorded as skipped."""
+        snapshot = await self._graph.aget_state(self._config(project_id))
+        await end_paused(
+            self._graph,
+            self._config(project_id),
+            snapshot,
+            records=self._records,
+            uow=self._uow,
+            user_id=user.id,
+            project_id=project_id,
         )
-        request = AiEditRequest.model_validate(values["request"])
-        await self._records.add(
-            AiEditRecordCreate(
-                site_id=project_id,
-                user_id=user.id,
-                instruction=values["instruction"],
-                selection=request.target.model_dump(mode="json") if request.target else None,
-                model=None,
-                tier=None,
-                outcome=AiEditOutcome.SKIPPED,
-                summary="replaced or dismissed while waiting for an answer",
-                attempts=values.get("attempt", 0),
-            )
-        )
-        await self._uow.commit()
 
     async def _finish(
         self, user: UserRead, request: AiEditRequest, run: EditRun, run_id: UUID, state: dict[str, Any]
@@ -327,7 +339,7 @@ class AiEditService:
         outcome = AiEditOutcome(result["outcome"])
         attempts = state.get("attempt", 0)
         await self._record(user, request, run, outcome, result=result, attempts=attempts, model=state.get("model"))
-        await self._prune(request.project_id)
+        await prune(self._checkpointer, self._config(request.project_id))
         if outcome == AiEditOutcome.REJECTED:
             problem = result.get("problem", "")
             details = {"problem": problem[:300]} if self._debug else None
@@ -425,36 +437,12 @@ class AiEditService:
         except Exception:
             logger.exception("Couldn't record an AI edit request", extra={"outcome": outcome.value})
 
-    async def _prune(self, project_id: UUID) -> None:
-        """Keeps only the thread's latest checkpoint: it has the whole chat, and nothing reads older ones."""
-        try:
-            await self._checkpointer.aprune([str(project_id)], strategy="keep_latest")
-        except NotImplementedError:
-            pass  # The in-memory checkpointer (tests, SQLite dev) can't prune; it's gone at exit anyway.
-        except Exception:
-            # Best effort: the next run prunes again.
-            logger.warning("Couldn't prune an AI thread's checkpoints", exc_info=True)
-
     @staticmethod
     def _config(project_id: UUID) -> Any:
-        return {"configurable": {"thread_id": str(project_id)}}
+        return edit_config(project_id)
 
     def _debug_info(self, run: EditRun, attempts: int, model: str | None = None) -> AiEditDebug | None:
         if not self._debug:
             return None
         name = model or (run.model.name if run.model else "")
         return AiEditDebug(model_input=run.model_input, attempts=attempts, model=name)
-
-
-def _pause_value(snapshot: StateSnapshot) -> dict[str, Any] | None:
-    """What a paused run is waiting on (the `interrupt` value), if the thread has one."""
-    for interrupt in snapshot.interrupts:
-        if isinstance(interrupt.value, dict) and interrupt.value.get("type") in ("question", "preview"):
-            return interrupt.value
-    return None
-
-
-def _pause_kind(snapshot: StateSnapshot) -> str | None:
-    """ "question" or "preview" when a run is waiting for one, else None."""
-    value = _pause_value(snapshot)
-    return value["type"] if value else None

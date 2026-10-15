@@ -11,39 +11,13 @@ which isn't saved either.
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Annotated, Any, NotRequired, Protocol, TypedDict
+from typing import Any, NotRequired, TypedDict
 from uuid import UUID
 
+from app.agents.thread import QuestionAnswer, RunResult, SiteFiles, Turns
 from app.clients.model import ModelClient
-from app.constants.ai_edit import MAX_TARGET_LABEL, MAX_TURNS
+from app.constants.ai_edit import MAX_TARGET_LABEL
 from app.schemas.ai_edit import AiEditRequest, AiEditTarget
-from app.schemas.site import SiteSnapshot
-
-
-class SiteFiles(Protocol):
-    """The site's repo, as the agent may use it: read a commit, and commit a change on top of one."""
-
-    async def snapshot(self, commit_sha: str) -> SiteSnapshot: ...
-
-    async def commit(self, base_commit: str, changes: dict[str, str | None], message: str) -> str: ...
-
-
-class QuestionAnswer(TypedDict):
-    question: str
-    answer: str
-
-
-class Turn(TypedDict):
-    """A finished request in the thread: the chat, and the `<earlier_requests>` of the next prompts."""
-
-    run_id: str
-    instruction: str
-    target: str | None
-    outcome: str
-    reply: str
-    questions: NotRequired[list[QuestionAnswer]]
-    commit_sha: str | None
-    created_at: str
 
 
 class Selection(TypedDict):
@@ -65,25 +39,9 @@ class ContextRef(TypedDict):
     outline: NotRequired[bool]
 
 
-class RunResult(TypedDict):
-    """How a run ended. `outcome` is an `AiEditOutcome` value."""
-
-    outcome: str
-    tier: NotRequired[int]
-    summary: NotRequired[str]
-    edits: NotRequired[list[dict[str, str]]]
-    reason: NotRequired[str]
-    problem: NotRequired[str]
-    commit_sha: NotRequired[str]
-
-
-def _keep_recent(old: list[Turn], new: list[Turn]) -> list[Turn]:
-    return [*old, *new][-MAX_TURNS:]
-
-
 class EditState(TypedDict, total=False):
     # The thread's finished requests, oldest first. Kept across runs.
-    turns: Annotated[list[Turn], _keep_recent]
+    turns: Turns
     # The current run's fields, all set by its input (`run_input`), so a run never sees an earlier, cancelled or
     # failed one's.
     run_id: str

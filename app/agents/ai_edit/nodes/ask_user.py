@@ -1,8 +1,9 @@
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
-from app.agents.ai_edit.state import EditRun, EditState, QuestionAnswer
+from app.agents.ai_edit.state import EditRun, EditState
 from app.agents.ai_edit.tools.answer import parse_answer
+from app.agents.thread import QuestionAnswer
 from app.constants.ai_edit import MAX_ANSWER
 from app.schemas.ai_edit import ModelQuestion
 

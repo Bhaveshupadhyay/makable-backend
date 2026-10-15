@@ -7,7 +7,8 @@ it the site's repo through the run's context (`SiteFiles`).
 
 from app.agents.ai_edit.graph import EditGraph, compile_edit_graph
 from app.agents.ai_edit.nodes.finish import turn_for
-from app.agents.ai_edit.state import EditRun, EditState, RunResult, SiteFiles, Turn, result_of, run_input
+from app.agents.ai_edit.state import EditRun, EditState, result_of, run_input
+from app.agents.thread import RunResult, SiteFiles, Turn
 
 __all__ = [
     "EditGraph",

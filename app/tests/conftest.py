@@ -1,4 +1,5 @@
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from app.clients.templates import TEMPLATE_CACHE
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
+    MAX_CONCURRENT_CREATIONS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
     MAX_CONCURRENT_SITE_REQUESTS,
     MAX_CONCURRENT_WORKSPACE_REQUESTS,
@@ -40,6 +42,7 @@ from app.models.site import Site
 from app.repositories.site import SqlAiEditRecordRepository, SqlSiteRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.services.ai_edit_service import AiEditService, AiRunInProgressError, ModelSource
+from app.services.site_create_service import SiteCreateService
 from app.services.site_service import VERIFIED_SITES, SiteService
 from app.services.site_snapshots import SITE_SNAPSHOTS
 from app.services.workspace_service import VERIFIED_REPOS
@@ -96,6 +99,7 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         dependencies, "AI_KEY_CHECKS", PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
     )
     monkeypatch.setattr(dependencies, "AI_EDIT_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS))
+    monkeypatch.setattr(dependencies, "AI_CREATE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_CREATIONS))
     monkeypatch.setattr(dependencies, "AI_RUNS", KeyLock(AiRunInProgressError))
     monkeypatch.setattr(dependencies, "SITE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_SITE_REQUESTS))
     monkeypatch.setattr(dependencies, "SITE_SAVES", PerKeyLimit(burst=SITE_SAVE_BURST, every=SITE_SAVE_EVERY_SECONDS))
@@ -166,6 +170,45 @@ def ai_edit_service(
         )
 
     return make
+
+
+@dataclass
+class AiServices:
+    """The AI services on the test database, the fake GitHub and one checkpointer, sharing the site lock: for tests
+    where the site doesn't exist yet (creations)."""
+
+    edit: Callable[[ModelSource], AiEditService]
+    create: Callable[[ModelSource], SiteCreateService]
+
+
+@pytest.fixture
+def ai_services(session: AsyncSession, checkpointer: InMemorySaver, github: FakeGithubClient) -> AiServices:
+    runs = KeyLock(AiRunInProgressError)
+
+    def edit(model_source: ModelSource) -> AiEditService:
+        return AiEditService(
+            model_source,
+            make_site_service(session, github),
+            SqlSiteRepository(session),
+            SqlAiEditRecordRepository(session),
+            SqlAlchemyUnitOfWork(session),
+            checkpointer,
+            runs,
+        )
+
+    def create(model_source: ModelSource) -> SiteCreateService:
+        return SiteCreateService(
+            model_source,
+            make_site_service(session, github),
+            SqlSiteRepository(session),
+            SqlAiEditRecordRepository(session),
+            SqlAlchemyUnitOfWork(session),
+            checkpointer,
+            runs,
+            heartbeat=0.05,
+        )
+
+    return AiServices(edit=edit, create=create)
 
 
 @pytest.fixture

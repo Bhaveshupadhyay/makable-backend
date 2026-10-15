@@ -24,6 +24,7 @@ from app.clients.templates import HttpTemplateCatalog, TemplateCatalogClient
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
+    MAX_CONCURRENT_CREATIONS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
     MAX_CONCURRENT_SITE_REQUESTS,
     MAX_CONCURRENT_WORKSPACE_REQUESTS,
@@ -58,6 +59,7 @@ from app.services.ai_key_service import AiKeyService, ModelClientFactory
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 from app.services.publish_service import PublishService
+from app.services.site_create_service import SiteCreateService
 from app.services.site_service import SiteService
 from app.services.workspace_service import WorkspaceService
 
@@ -251,7 +253,21 @@ def get_publish_service(
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
+
+
+def get_site_create_service(
+    models: Annotated[AiKeyService, Depends(get_ai_key_service)],
+    site_service: Annotated[SiteService, Depends(get_site_service)],
+    sites: Annotated[SiteRepository, Depends(get_site_repository)],
+    records: Annotated[AiEditRecordRepository, Depends(get_ai_edit_record_repository)],
+    uow: UnitOfWorkDep,
+    checkpointer: CheckpointerDep,
+) -> SiteCreateService:
+    return SiteCreateService(models, site_service, sites, records, uow, checkpointer, AI_RUNS)
+
+
 AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
+SiteCreateServiceDep = Annotated[SiteCreateService, Depends(get_site_create_service)]
 SiteServiceDep = Annotated[SiteService, Depends(get_site_service)]
 AiKeyServiceDep = Annotated[AiKeyService, Depends(get_ai_key_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
@@ -289,6 +305,7 @@ def require_roles(*roles: Role) -> Callable[[UserRead], Awaitable[UserRead]]:
 # --- Limits (per worker; see `core/limits.py`) ---
 
 AI_EDIT_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS)
+AI_CREATE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_CREATIONS)
 WORKSPACE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS)
 WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS)
 PUBLISH_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS)
@@ -307,6 +324,16 @@ async def ai_edit_slot() -> AsyncIterator[None]:
         ServiceBusyError: This worker has as many AI edits in progress as it allows.
     """
     async with AI_EDIT_SLOTS.slot():
+        yield
+
+
+async def ai_create_slot() -> AsyncIterator[None]:
+    """A slot for a creation, held while it streams (minutes).
+
+    Raises:
+        ServiceBusyError: This worker has as many creations in progress as it allows.
+    """
+    async with AI_CREATE_SLOTS.slot():
         yield
 
 
