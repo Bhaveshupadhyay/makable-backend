@@ -173,12 +173,8 @@ class PublishService:
             raise SiteConflictError(details={"commitSha": head.commit_sha})
         snapshot = await self._sites.snapshot(token, repo, request.base_commit)
         kind = _site_kind(snapshot)
-        if pages and repo.private:
-            if not request.make_public:
-                raise PublishPagesPrivateError()
-            repo = await self._github.set_private(token, repo.full_name, False)
-            self._sites.forget_repo(project_id, repo.full_name)
-            logger.info("site repo made public for GitHub Pages", extra={"repo": repo.full_name})
+        if pages and repo.private and not request.make_public:
+            raise PublishPagesPrivateError()
 
         manifest = _manifest(snapshot)
         published = _settings(manifest)
@@ -211,16 +207,29 @@ class PublishService:
             if snapshot.files.get(path) != content
         }
 
-        # Before the deploy starts, so its run can use them.
-        if pages:
-            await self._github.enable_pages_workflow(token, repo.full_name)
-        if prepared is not None:
-            await self._set_secrets(token, repo.full_name, prepared.secrets)
+        # Pages and the secrets come before the deploy starts, so its run can use them. A private repo is made public
+        # for Pages only now, once everything that could refuse the publish has passed, and private again if Pages or
+        # the commit fails. The commit is the last step that can fail, so a publish that fails has moved nothing.
+        made_public = False
+        try:
+            if pages:
+                if repo.private:
+                    repo = await self._set_private(token, project_id, repo, private=False)
+                    made_public = True
+                await self._github.enable_pages_workflow(token, repo.full_name)
+            if prepared is not None:
+                await self._set_secrets(token, repo.full_name, prepared.secrets)
 
-        commit_sha = request.base_commit
-        if changes:
-            message = f"Publish to {TARGET_NAMES[target]}"
-            commit_sha = await self._sites.commit(token, repo, request.base_commit, changes, message, own_files=True)
+            commit_sha = request.base_commit
+            if changes:
+                message = f"Publish to {TARGET_NAMES[target]}"
+                commit_sha = await self._sites.commit(
+                    token, repo, request.base_commit, changes, message, own_files=True
+                )
+        except Exception:
+            if made_public:
+                await self._make_private_again(token, project_id, repo)
+            raise
 
         missing = [] if prepared else await self._missing_secrets(token, repo.full_name, target)
         deploy: DeployState = "waiting_for_secrets" if missing else "started"
@@ -328,6 +337,21 @@ class PublishService:
                 await self._sleep(delay)
         details = {"repoName": repo.name, "actionsUrl": f"{repo.html_url}/actions/workflows/{WORKFLOW_FILE}"}
         raise PublishDeployNotStartedError(details=details)
+
+    async def _set_private(self, token: str, project_id: UUID, repo: GithubRepo, *, private: bool) -> GithubRepo:
+        repo = await self._github.set_private(token, repo.full_name, private)
+        self._sites.forget_repo(project_id, repo.full_name)
+        logger.info("site repo visibility changed", extra={"repo": repo.full_name, "private": private})
+        return repo
+
+    async def _make_private_again(self, token: str, project_id: UUID, repo: GithubRepo) -> None:
+        """Makes a repo made public for a publish that then failed private again, without hiding why it failed."""
+        try:
+            await self._set_private(token, project_id, repo, private=True)
+        except Exception:
+            logger.exception(
+                "Couldn't make a site repo private again after a failed publish", extra={"repo": repo.full_name}
+            )
 
     async def _prepare(
         self, target: PublishTarget, credentials: PublishCredentials | None, project_name: str | None, branch: str

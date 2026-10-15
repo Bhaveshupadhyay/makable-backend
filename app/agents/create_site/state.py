@@ -85,7 +85,10 @@ class CreateRun:
     model_input: str = ""
     # The files the model wrote, by path (committed together at the end).
     files: dict[str, str] = field(default_factory=dict)
+    # The commit, once it started, and the run's state then, with the summary the chat gets: it's finished even if
+    # the run is cancelled (see the `commit` node), and the service records it then.
     commit_task: asyncio.Future[str] | None = None
+    committing: CreateState | None = None
     _base: dict[str, str] | None = None
 
     async def model_client(self) -> ModelClient:

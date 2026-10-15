@@ -139,18 +139,26 @@ async def _use_langgraph_schema(conn: AsyncConnection[DictRow]) -> None:
 def get_checkpointer(settings: DatabaseSettings | None = None) -> BaseCheckpointSaver[str]:
     """LangGraph's checkpointer, created on first call: Postgres (its own psycopg pool, opened by
     `open_checkpointer`), or in memory when the database is SQLite (tests, offline dev), where threads don't
-    outlive the process."""
+    outlive the process.
+
+    Raises:
+        RuntimeError: The database is reached through a transaction-mode pooler (`DB_TRANSACTION_POOLER`).
+    """
     global _checkpoint_pool, _checkpointer
     if _checkpointer is None:
         settings = settings or DatabaseSettings()
         if settings.is_sqlite:
             _checkpointer = InMemorySaver()
         else:
-            # Autocommit and dict rows are what the saver expects. A transaction-mode pooler can't keep prepared
-            # statements (or a session's search_path, which this pool sets per connection: use session mode).
-            kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
+            # The pool sets each connection's search_path once (the saver's SQL names no schema), and a transaction-mode
+            # pooler can run the next transaction on another server connection, without it.
             if settings.db_transaction_pooler:
-                kwargs["prepare_threshold"] = None
+                raise RuntimeError(
+                    "LangGraph's checkpointer needs a session-mode connection: DB_TRANSACTION_POOLER can't be on "
+                    "(on Supabase, use the session pooler, port 5432)"
+                )
+            # Autocommit and dict rows are what the saver expects.
+            kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
             _checkpoint_pool = AsyncConnectionPool(
                 checkpoint_conninfo(settings),
                 min_size=1,

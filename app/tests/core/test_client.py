@@ -12,6 +12,7 @@ from app.core.client import (
     close_connection,
     close_postgres_client,
     engine_options,
+    get_checkpointer,
     get_http_client,
     get_postgres_client,
     get_postgres_engine,
@@ -118,3 +119,9 @@ async def test_the_pooled_checkpointer_lets_queries_run_side_by_side() -> None:
     # LangGraph's own saver holds an asyncio.Lock here: the inner query would wait for the outer one forever.
     async with saver.lock, saver.lock:
         pass
+
+
+def test_the_checkpointer_refuses_a_transaction_mode_pooler() -> None:
+    # Its search_path is set per connection, which a transaction-mode pooler doesn't keep.
+    with pytest.raises(RuntimeError, match="session-mode"):
+        get_checkpointer(supabase(db_port=6543, db_transaction_pooler=True))

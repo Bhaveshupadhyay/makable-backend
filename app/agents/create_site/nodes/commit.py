@@ -17,8 +17,9 @@ async def commit(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState
     progress("commit", "Saving the site to your GitHub")
     message = f"Create {state['name']} from your prompt"
     changes: dict[str, str | None] = dict(run.files)
+    summary = state["summary"] + (LEFT_PROBLEMS if state["problems"] else "")
+    run.committing = {**state, "summary": summary}
     run.commit_task = asyncio.ensure_future(run.site.commit(state["base_commit"], changes, message))
     commit_sha = await asyncio.shield(run.commit_task)
-    summary = state["summary"] + (LEFT_PROBLEMS if state["problems"] else "")
     result = RunResult(outcome=AiEditOutcome.APPLIED.value, summary=summary, commit_sha=commit_sha)
     return {"result": result, "step": "finish"}

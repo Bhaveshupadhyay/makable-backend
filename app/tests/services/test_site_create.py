@@ -312,6 +312,37 @@ async def test_closing_the_stream_stops_the_creation(
     assert result_of(created)["status"] == "created"
 
 
+async def test_stop_during_the_commit_still_commits_and_the_chat_shows_it(
+    ai_services: AiServices, github: FakeGithubClient, session: AsyncSession, site: str
+) -> None:
+    github.commit_delay = 0.2
+    # Problems are left after the fixes, so the commit's summary says so.
+    model = FakeModelClient(*replies(app=BROKEN_APP), fenced(BROKEN_APP), fenced(BROKEN_APP))
+    events = await ai_services.create(FakeModelSource(model)).create(
+        USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
+    )
+
+    async def read() -> None:
+        async for _ in events:
+            pass
+
+    reader = asyncio.create_task(read())
+    await github.commit_started.wait()
+    await asyncio.sleep(0.05)  # Into the commit.
+    reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+
+    head = github.heads[REPO].commit_sha
+    [record] = await records(session)
+    assert (record.outcome, record.commit_sha, record.attempts) == (AiEditOutcome.APPLIED, head, 6)
+    assert record.model == model.name
+    [turn] = (await ai_services.edit(FakeModelSource(model)).thread(USER, PROJECT_ID)).turns
+    assert (turn.outcome, turn.commit_sha) == (AiEditOutcome.APPLIED, head)
+    assert turn.reply.startswith(json.loads(PLAN)["summary"])
+    assert "may still need fixing" in turn.reply
+
+
 async def test_another_users_site_and_a_busy_site_are_refused_before_streaming(
     ai_services: AiServices, site: str
 ) -> None:

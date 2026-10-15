@@ -257,8 +257,9 @@ class SiteCreateService:
             await self._record_quietly(user, request, AiEditOutcome.CANCELLED, summary="stopped", run=run)
             return
         try:
-            snapshot = await self._graph.aget_state(create_config(request.project_id))
-            summary = snapshot.values.get("summary", "")
+            # The run's own state at the commit: the saved one is older (a run is saved when it pauses or ends).
+            values: dict[str, Any] = dict(run.committing or {})
+            summary = values.get("summary", "")
             result = RunResult(outcome=AiEditOutcome.APPLIED.value, summary=summary, commit_sha=committed)
             turn = Turn(
                 run_id=str(run_id),
@@ -266,14 +267,14 @@ class SiteCreateService:
                 target=None,
                 outcome=result["outcome"],
                 reply=summary,
-                questions=snapshot.values.get("questions", []),
+                questions=values.get("questions", []),
                 commit_sha=committed,
                 created_at=utc_now().isoformat(),
             )
             update = {"turns": [turn], "result": result}
             await self._graph.aupdate_state(create_config(request.project_id), update, as_node="finish")
             await self._uow.rollback()
-            await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=snapshot.values, run=run)
+            await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=values, run=run)
         except Exception:
             logger.exception("Couldn't record a creation committed after Stop")
 

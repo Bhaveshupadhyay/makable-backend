@@ -10,6 +10,7 @@ import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.deploy_platforms import PlatformTokenInvalidError
+from app.clients.github import GithubPagesUnavailableError
 from app.constants.publish import WORKFLOW_PATH, PublishTarget
 from app.constants.site import MANIFEST_PATH
 from app.models.site import Site
@@ -149,6 +150,18 @@ async def test_github_pages_needs_the_repo_made_public_first(
     assert result.site_url == "https://octocat.github.io/my-site/"
     assert workflow(github)["env"]["BASE_PATH"] == "/my-site/"
     assert "PROJECT_NAME" not in workflow(github)["env"]
+
+
+async def test_a_repo_made_public_for_pages_is_private_again_if_pages_cant_be_turned_on(
+    publisher: PublishService, github: FakeGithubClient
+) -> None:
+    github.pages_unavailable = True
+
+    with pytest.raises(GithubPagesUnavailableError):
+        await publish(publisher, github, target="github-pages", makePublic=True)
+
+    assert github.repos[REPO].private
+    assert github.commits == []
 
 
 async def test_a_plain_html_site_is_deployed_as_it_is(
