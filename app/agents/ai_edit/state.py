@@ -84,10 +84,10 @@ class EditRun:
     model_input: str = ""
     # The files the change made, as they are now (None: deleted), for the response.
     changed_files: dict[str, str | None] = field(default_factory=dict)
-    # The commit, once it started, and the result it's for: it's finished even if the run is cancelled (see the
-    # `commit` node), and the service records it then.
+    # The commit, once it started, and the run's state then (its result has the edits): it's finished even if the run
+    # is cancelled (see the `commit` node), and the service records it then, with the chat entry the run would add.
     commit_task: asyncio.Future[str] | None = None
-    committing: RunResult | None = None
+    committing: EditState | None = None
     _files: dict[str, str] | None = None
 
     async def model_client(self) -> ModelClient:

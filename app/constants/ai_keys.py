@@ -70,16 +70,22 @@ NOT_CHAT_MODEL = re.compile(
     r"embed|whisper|tts|transcri|dall-e|image|audio|realtime|moderation|rerank|guard|sora|veo|imagen|aqa|babbage|davinci",
     re.IGNORECASE,
 )
-# Most models a provider's list is cut to (OpenRouter lists hundreds).
 # Model ids of models that read images (the selected element's picture goes with AI edits to them). A model not
-# matched just gets no picture.
+# matched just gets no picture, but one wrongly matched fails every edit with a selection (the provider refuses the
+# picture), so when in doubt a model is left out.
 IMAGE_MODEL = re.compile(
-    r"^(gpt-4o|chatgpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|o1(?!-mini)|o3|o4|claude-(3|sonnet|opus|haiku-4|.*-4)|gemini"
-    r"|gemma-3|grok-4|grok-.*vision|pixtral|llama-4|mistral-(medium|small)-(3|2505|2506|latest))"
+    r"^(gpt-4o|chatgpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|o1|o3|o4|claude-(3|sonnet|opus|haiku-4|.*-4)|gemini"
+    r"|gemma-3|grok-4|grok-.*vision|pixtral|llama-4|mistral-(medium|small)-(3|2503|2505|2506|latest))"
     r"|vision|-vl\b|-vl-",
     re.IGNORECASE,
 )
+# The ids `IMAGE_MODEL` matches whose models read text only.
+TEXT_ONLY_MODEL = re.compile(
+    r"^(o1-(mini|preview)|o3-mini|gpt-4-turbo-preview|claude-3-5-haiku|gemma-3-1b)|search",
+    re.IGNORECASE,
+)
 
+# Most models a provider's list is cut to (OpenRouter lists hundreds).
 MAX_LISTED_MODELS = 500
 # Models a key can show in the chat's model menu.
 MAX_ENABLED_MODELS = 20

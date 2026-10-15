@@ -6,6 +6,7 @@ settings (`get_settings`). Everything else is built per request. Tests replace a
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import Annotated
 
@@ -66,6 +67,17 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 DbSessionDep = Annotated[AsyncSession, Depends(get_db_session)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
+
+
+async def request_cleanup(_session: DbSessionDep) -> AsyncIterator[AsyncExitStack]:
+    """Callbacks for when the request is done, after its response: also a streamed response that was cut short or
+    never started (Starlette doesn't close a stream it didn't finish). They run before the request's DB session is
+    closed (it's a dependency of this one, so it's closed after), so they can still record what happened."""
+    async with AsyncExitStack() as stack:
+        yield stack
+
+
+RequestCleanupDep = Annotated[AsyncExitStack, Depends(request_cleanup)]
 
 
 def get_checkpoint_saver() -> BaseCheckpointSaver[str]:

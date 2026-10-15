@@ -203,6 +203,8 @@ class PublishService:
         settings = PublishSettings(target=target, project_name=project_name, site_url=site_url)
         manifest["publish"] = settings.model_dump(mode="json", by_alias=True)
         manifest_content = json.dumps(manifest, indent=2) + "\n"
+        # makable owns these two files: they're written as makable makes them, also over edits made on GitHub. Only
+        # Publish runs the workflow; a user's own steps go in a workflow of their own.
         changes: dict[str, str | None] = {
             path: content
             for path, content in ((WORKFLOW_PATH, workflow), (MANIFEST_PATH, manifest_content))

@@ -141,6 +141,13 @@ async def test_a_branch_that_moved_is_a_conflict_and_the_head_is_read_in_one_req
         await github.commit_changes("tok", REPO, "main", head, [], message="m")
 
 
+async def test_a_renamed_repo_is_not_there_by_its_old_name() -> None:
+    moved = {"message": "Moved Permanently", "url": "https://api.github.com/repositories/1"}
+    github = client(lambda _: httpx.Response(301, json=moved, headers={"location": moved["url"]}))
+
+    assert await github.get_repo("tok", REPO) is None
+
+
 async def test_no_free_connection_is_a_quick_busy_answer() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.PoolTimeout("no free connection")

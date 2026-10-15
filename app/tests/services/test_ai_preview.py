@@ -11,6 +11,7 @@ from app.constants.ai_edit import AiEditOutcome
 from app.models.site import AiEditRecord
 from app.schemas.ai_edit import AiEditApplied, AiEditAwaitingResult, AiEditPreviewReport, PreviewError
 from app.services.ai_edit_service import AiEditBrokePreviewError, AiRunSupersededError
+from app.services.site_service import VERIFIED_SITES
 from app.tests.ai_edit_fixtures import (
     GOOD_REPLY,
     GREEN_HERO,
@@ -68,6 +69,22 @@ async def test_edits_wait_for_the_preview_before_anything_is_committed(
     assert isinstance(result, AiEditApplied)
     assert github.files[REPO][HERO_PATH].content == GREEN_HERO
     assert (await ai_edit_service(FakeModelSource(model)).thread(USER, PROJECT_ID)).status == "idle"
+
+
+async def test_the_chat_loads_without_the_edits_to_try_when_the_repo_cant_be_read(
+    ai_edit_service: MakeAiEditService, github: FakeGithubClient
+) -> None:
+    service = ai_edit_service(FakeModelSource(FakeModelClient(GOOD_REPLY)))
+    waiting = await service.edit(USER, make_request())
+    assert isinstance(waiting, AiEditAwaitingResult)
+    VERIFIED_SITES.clear()
+    del github.repos[REPO]  # Deleted or renamed on GitHub.
+
+    thread = await service.thread(USER, PROJECT_ID)
+
+    assert thread.status == "awaiting_result"
+    assert thread.run is not None
+    assert (thread.run.run_id, thread.run.preview) == (waiting.run_id, None)
 
 
 async def test_a_preview_error_goes_back_to_the_model(

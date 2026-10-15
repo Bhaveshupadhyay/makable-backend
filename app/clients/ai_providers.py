@@ -14,6 +14,7 @@ from app.constants.ai_keys import (
     MODEL_ID,
     NOT_CHAT_MODEL,
     PROVIDERS,
+    TEXT_ONLY_MODEL,
     AiProvider,
 )
 from app.core.client import HTTP_POOL_TIMEOUT_SECONDS
@@ -32,7 +33,8 @@ class AiProviderError(ExternalServiceError):
 def model_accepts_images(model: str) -> bool:
     """Whether a model reads images, from its id (providers' model lists don't say). OpenRouter's ids carry the
     provider (`openai/gpt-4o`): the part after the slash is what counts."""
-    return bool(IMAGE_MODEL.search(model.rsplit("/", 1)[-1]))
+    name = model.rsplit("/", 1)[-1]
+    return bool(IMAGE_MODEL.search(name)) and not TEXT_ONLY_MODEL.search(name)
 
 
 def provider_endpoint(provider: AiProvider, api_key: str, model: str) -> ModelEndpoint:

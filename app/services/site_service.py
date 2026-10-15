@@ -250,7 +250,8 @@ class SiteService:
 
         Raises:
             SiteNotFoundError: The site is another user's.
-            SiteRepoTakenError: The user has a repo with that name that isn't this site's.
+            SiteRepoTakenError: The user has a repo with that name that isn't this site's, or another of their sites
+                has it (even if it's gone from GitHub).
             SiteGithubNotConnectedError: No usable GitHub token.
             GithubError: GitHub failed.
         """
@@ -259,8 +260,10 @@ class SiteService:
             raise SiteNotFoundError()
         if site is not None and site.repo_name:
             return await self.load(user, project_id)
-        token = await self._token(user)
         repo_name = repo_name_for(data.name)
+        if await self._sites.get_by_repo(user.id, repo_name) is not None:
+            raise SiteRepoTakenError(details={"repoName": repo_name})
+        token = await self._token(user)
         full_name = f"{user.login}/{repo_name}"
         existing = await self._github.get_repo(token, full_name)
         fresh = existing is None
@@ -349,7 +352,7 @@ class SiteService:
         await self._uow.rollback()
         return SiteAccess(self, token, repo, project_id)
 
-    async def ensure(self, user: UserRead, project_id: UUID, name: str) -> Site:
+    async def ensure(self, user: UserRead, project_id: UUID, name: str) -> SiteRead:
         """The user's site, made (without a repo yet) if there's none: what its AI threads belong to.
 
         Raises:
@@ -361,7 +364,7 @@ class SiteService:
         if site is None:
             site = await self._sites.create(SiteCreate(id=project_id, user_id=user.id, name=name))
             await self._uow.commit()
-        return site
+        return self._read(user, site)
 
     def creator(self, user: UserRead, project_id: UUID) -> SiteCreatorAccess:
         """The site's repo for the create agent: it makes the repo, then reads and commits like `access`."""

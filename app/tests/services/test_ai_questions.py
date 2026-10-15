@@ -11,7 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.model import ModelUnavailableError
 from app.constants.ai_edit import AiEditOutcome
 from app.models.site import AiEditRecord
-from app.schemas.ai_edit import AiEditAnswer, AiEditApplied, AiEditNeedsInput
+from app.schemas.ai_edit import (
+    AiEditAnswer,
+    AiEditApplied,
+    AiEditAwaitingResult,
+    AiEditNeedsInput,
+    AiEditPreviewReport,
+)
 from app.schemas.chat import ChatMessage
 from app.services.ai_edit_service import AiRunSupersededError
 from app.services.site_service import SiteNotFoundError
@@ -87,6 +93,27 @@ async def test_a_question_pauses_the_run_and_survives_a_closed_tab(
     assert turn.commit_sha == result.commit_sha
     [record] = await records(session)
     assert (record.outcome, record.attempts) == (AiEditOutcome.APPLIED, 2)
+
+
+async def test_a_commit_finished_after_stop_keeps_the_answer_in_the_chat(
+    ai_edit_service: MakeAiEditService, github: FakeGithubClient
+) -> None:
+    paused, model = await ask_first(ai_edit_service, GOOD_REPLY)
+    service = ai_edit_service(FakeModelSource(model))
+    waiting = await service.answer(USER, PROJECT_ID, answer(paused))
+    assert isinstance(waiting, AiEditAwaitingResult)
+    github.commit_delay = 0.2
+    run = asyncio.create_task(service.report(USER, PROJECT_ID, AiEditPreviewReport(run_id=waiting.run_id, ok=True)))
+    await github.commit_started.wait()
+    await asyncio.sleep(0.05)  # Into the commit.
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    [turn] = (await service.thread(USER, PROJECT_ID)).turns
+    assert turn.outcome == AiEditOutcome.APPLIED
+    assert [(q.question, q.answer) for q in turn.questions] == [("Which colour?", "#16a34a")]
 
 
 async def test_the_answer_works_on_the_site_as_it_is_then(

@@ -20,6 +20,10 @@ CONTEXT_WINDOW_LINES = 40
 # The model can ask for more of the code (`needContext`) this many times per request, up to this many lines in all.
 MAX_CONTEXT_ROUNDS = 2
 MAX_EXTRA_CONTEXT_LINES = 800
+# Lines are counted, so characters are capped too (minified code has few, very long lines): a shown line is cut
+# after this many characters, and one block of code (some lines of a file, or its outline) stops at this many.
+MAX_SHOWN_LINE_CHARS = 1_000
+MAX_SHOWN_CHARS = 40_000
 # Questions the model can ask the user per request (the run pauses until they answer), and their caps.
 MAX_QUESTIONS = 2
 MAX_QUESTION = 300

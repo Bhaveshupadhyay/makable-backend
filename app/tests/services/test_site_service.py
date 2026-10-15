@@ -75,6 +75,20 @@ async def test_a_repo_name_thats_taken_is_refused(sites: SiteService, github: Fa
     assert github.files["octocat/bakery"]["index.html"].content == "<p>mine</p>"
 
 
+async def test_a_repo_name_another_site_has_is_refused_before_github_is_touched(
+    sites: SiteService, github: FakeGithubClient, site: str
+) -> None:
+    del github.repos[REPO]  # The other site's repo is gone from GitHub, but its row still has the name.
+    commits = len(github.commits)
+
+    with pytest.raises(SiteRepoTakenError) as caught:
+        await sites.create(USER, NEW_PROJECT, SiteNew(name="My Site"))
+
+    assert caught.value.details == {"repoName": "my-site"}
+    assert REPO not in github.repos
+    assert len(github.commits) == commits
+
+
 async def test_a_repo_with_this_sites_manifest_is_taken_over_without_overwriting_it(
     sites: SiteService, github: FakeGithubClient
 ) -> None:

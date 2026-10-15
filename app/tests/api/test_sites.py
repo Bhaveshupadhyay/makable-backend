@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from app.constants.site import MAX_SAVE_CHARS
 from app.tests.ai_edit_fixtures import HERO, HERO_PATH, PROJECT_ID, REPO
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import FakeGithubClient
@@ -59,6 +60,8 @@ def test_bad_saves_are_refused(client: TestClient) -> None:
         {"baseCommit": base, "files": {".github/workflows/x.yml": "x"}},
         {"baseCommit": base, "files": {"../x": "x"}},
         {"baseCommit": base, "files": {}, "deletes": [".makable/manifest.json"]},
+        # Each file is small enough, and the body too, but not all the files together.
+        {"baseCommit": base, "files": {f"src/{i}.ts": "x" * (MAX_SAVE_CHARS // 4 + 100) for i in range(4)}},
     ):
         assert client.put(f"{SITE}/files", json=body).status_code == 422
 

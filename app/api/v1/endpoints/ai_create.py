@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import CurrentUserDep, SiteCreateServiceDep, ai_create_slot
+from app.api.dependencies import CurrentUserDep, RequestCleanupDep, SiteCreateServiceDep, ai_create_slot
 from app.schemas.ai_create import AiCreateAnswer, AiCreateRequest
 from app.schemas.common import ErrorResponse
 
@@ -40,7 +40,9 @@ def _lines(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str]:
 
 
 @router.post("", summary="Create a site from a prompt", responses=ERRORS)
-async def create(body: AiCreateRequest, user: CurrentUserDep, creator: SiteCreateServiceDep) -> StreamingResponse:
+async def create(
+    body: AiCreateRequest, user: CurrentUserDep, creator: SiteCreateServiceDep, cleanup: RequestCleanupDep
+) -> StreamingResponse:
     """Builds the site from the prompt: a stream of JSON lines (`application/x-ndjson`). `{type: "progress", stage,
     message, path?, done?, total?}` as it goes, `{type: "ping"}` while the model writes, and at the end `{type:
     "result", data}` (`{status: "needs_input", runId, question}` for the site's name: answer with `/answer`; or
@@ -48,15 +50,22 @@ async def create(body: AiCreateRequest, user: CurrentUserDep, creator: SiteCreat
     Errors before the stream starts (another user's site, a request in progress) are the usual envelopes. Closing the
     request stops the creation."""
     events = await creator.create(user, body)
+    # The events hold the site's lock: they're closed when the request ends, even if the stream never started.
+    cleanup.push_async_callback(events.aclose)
     logger.info("site creation started", extra={"user_id": str(user.id), "project_id": str(body.project_id)})
     return StreamingResponse(_lines(events), media_type=NDJSON, headers=STREAM_HEADERS)
 
 
 @router.post("/{project_id}/answer", summary="Answer the creation's question", responses=ERRORS)
 async def answer(
-    project_id: UUID, body: AiCreateAnswer, user: CurrentUserDep, creator: SiteCreateServiceDep
+    project_id: UUID,
+    body: AiCreateAnswer,
+    user: CurrentUserDep,
+    creator: SiteCreateServiceDep,
+    cleanup: RequestCleanupDep,
 ) -> StreamingResponse:
     """Continues the creation that asked for the site's name, streamed like `/ai/create`. 409 `ai_run_superseded` when
     no creation is waiting for it."""
     events = await creator.answer(user, project_id, body)
+    cleanup.push_async_callback(events.aclose)
     return StreamingResponse(_lines(events), media_type=NDJSON, headers=STREAM_HEADERS)

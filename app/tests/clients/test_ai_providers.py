@@ -5,7 +5,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from app.clients.ai_providers import AiProviderError, HttpAiProviderClient
+from app.clients.ai_providers import AiProviderError, HttpAiProviderClient, model_accepts_images
 from app.clients.model import AiKeyInvalidError, ModelRateLimitedError
 from app.constants.ai_keys import AiProvider
 
@@ -16,6 +16,45 @@ def client(handler: Callable[[httpx.Request], httpx.Response]) -> HttpAiProvider
 
 def models(*ids: str) -> httpx.Response:
     return httpx.Response(200, json={"object": "list", "data": [{"id": i} for i in ids]})
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-4o",
+        "gpt-5-mini",
+        "o1",
+        "o3",
+        "o4-mini",
+        "claude-sonnet-4-5",
+        "claude-3-haiku-20240307",
+        "models/gemini-2.5-flash",
+        "gemma-3-27b-it",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen2.5-vl-72b",
+    ],
+)
+def test_models_that_read_images_get_the_picture(model: str) -> None:
+    assert model_accepts_images(model)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "o1-mini",
+        "o1-preview",
+        "o3-mini",
+        "openai/o3-mini",
+        "gpt-4-turbo-preview",
+        "gpt-4o-search-preview",
+        "claude-3-5-haiku-20241022",
+        "gemma-3-1b-it",
+        "deepseek-chat",
+        "llama-3.3-70b-versatile",
+    ],
+)
+def test_text_only_models_get_no_picture(model: str) -> None:
+    assert not model_accepts_images(model)
 
 
 async def test_lists_chat_models_with_the_key() -> None:

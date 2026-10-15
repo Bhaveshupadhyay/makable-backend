@@ -322,7 +322,17 @@ async def test_another_users_site_and_a_busy_site_are_refused_before_streaming(
     events = await service.create(USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT))
     with pytest.raises(AiRunInProgressError):
         await service.create(USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT))
-    await events.aclose()  # type: ignore[attr-defined]
+    await events.aclose()
+
+
+async def test_events_closed_without_being_read_free_the_site(ai_services: AiServices, site: str) -> None:
+    service = ai_services.create(FakeModelSource(FakeModelClient(*replies())))
+    events = await service.create(USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT))
+
+    await events.aclose()
+
+    created = await collect(await service.create(USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)))
+    assert result_of(created)["status"] == "created"
 
 
 async def test_an_old_answer_is_superseded_and_start_over_forgets_the_creation(

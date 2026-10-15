@@ -10,9 +10,6 @@ from fastapi import Request
 from app.core.exceptions import AppError
 
 POLL_SECONDS = 0.5
-# How long a cancelled piece of work gets to clean up (e.g. record that it was stopped) before the request ends and
-# its database session closes.
-CLEANUP_SECONDS = 5
 
 
 class ClientDisconnectedError(AppError):
@@ -39,4 +36,6 @@ async def cancel_on_disconnect[T](request: Request, work: Coroutine[Any, Any, T]
     finally:
         if not task.done():
             task.cancel()
-            await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+            # The request ends (and its DB session closes) only once the work has cleaned up: it records that it was
+            # stopped, and finishes and records a commit that had started. That's bounded by GitHub's timeouts.
+            await asyncio.wait({task})

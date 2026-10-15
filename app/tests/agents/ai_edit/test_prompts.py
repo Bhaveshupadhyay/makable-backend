@@ -1,6 +1,7 @@
 from app.agents.ai_edit.prompts.system import SYSTEM_PROMPT
 from app.agents.ai_edit.prompts.user import build_user_prompt, render_ref
 from app.agents.ai_edit.state import ContextRef, Selection
+from app.constants.ai_edit import MAX_SHOWN_CHARS, MAX_SHOWN_LINE_CHARS
 from app.schemas.ai_edit import AiEditTurn
 from app.tests.ai_edit_fixtures import HERO_PATH, SITE_FILES, make_request
 
@@ -56,3 +57,16 @@ def test_an_outline_shows_declarations_with_their_line_numbers() -> None:
         "   3| export function App() {\n"
         "</file_outline>"
     )
+
+
+def test_long_lines_are_cut_and_a_block_stops_at_its_size() -> None:
+    minified = "const a=1;" * 500
+    files = {"dist/app.js": "\n".join([minified] * 100)}
+
+    rendered = render_ref(files, ContextRef(path="dist/app.js", start=1, end=100))
+
+    first = rendered.split("\n")[1]
+    assert first == f"   1| {minified[:MAX_SHOWN_LINE_CHARS]}⟪cut: {5000 - MAX_SHOWN_LINE_CHARS} more characters⟫"
+    assert len(rendered) <= MAX_SHOWN_CHARS + 200
+    shown = rendered.count("\n") - 1
+    assert rendered.startswith(f'<file path="dist/app.js" lines="1-{shown}" total_lines="100">')

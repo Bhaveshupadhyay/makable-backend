@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -49,6 +49,28 @@ class SiteNamesTakenError(ConflictError):
     message = "Those names are taken by repositories on your GitHub. Start again with another name."
 
 
+class CreationEvents:
+    """A creation's events. They hold the site's lock: closing them (or reading them to the end) stops the creation if
+    it's still going and frees the site. Closing them works also when they were never read (an async generator that
+    never started doesn't run its `finally`), so whoever gets them must close them."""
+
+    def __init__(self, events: AsyncGenerator[Event], stack: AsyncExitStack) -> None:
+        self._events = events
+        self._stack = stack
+
+    def __aiter__(self) -> CreationEvents:
+        return self
+
+    async def __anext__(self) -> Event:
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        try:
+            await self._events.aclose()
+        finally:
+            await self._stack.aclose()
+
+
 class SiteCreateService:
     """Creating a site from a prompt with the create agent (`app/agents/create_site`), on the site's create thread
     (`<projectId>:create`): it asks for the site's name (a pause: answered with `answer`), creates the repo with the
@@ -57,7 +79,7 @@ class SiteCreateService:
     A creation takes minutes, so it's streamed: `create` and `answer` check the request and take the site's lock (one
     AI request per site at a time, shared with edits) before they return, so those errors are answered as usual; then
     the events come (`progress`, a `ping` while nothing else happens, and a `result` or an `error` at the end). Closing
-    the request stops the creation, unless its commit had started (then it's finished and recorded)."""
+    the events stops the creation, unless its commit had started (then it's finished and recorded)."""
 
     def __init__(
         self,
@@ -81,7 +103,7 @@ class SiteCreateService:
         self._runs = runs
         self._heartbeat = heartbeat
 
-    async def create(self, user: UserRead, request: AiCreateRequest) -> AsyncIterator[Event]:
+    async def create(self, user: UserRead, request: AiCreateRequest) -> CreationEvents:
         """Starts creating the site from the prompt. A site that has its repo already is made again over its files (no
         name question). A creation waiting for its name is replaced.
 
@@ -114,9 +136,9 @@ class SiteCreateService:
         except BaseException:
             await stack.aclose()
             raise
-        return self._events(user, request, run_id, graph_input, stack)
+        return CreationEvents(self._events(user, request, run_id, graph_input, stack), stack)
 
-    async def answer(self, user: UserRead, project_id: UUID, body: AiCreateAnswer) -> AsyncIterator[Event]:
+    async def answer(self, user: UserRead, project_id: UUID, body: AiCreateAnswer) -> CreationEvents:
         """Continues the creation that asked (the site's name) with the user's answer.
 
         Raises:
@@ -138,11 +160,11 @@ class SiteCreateService:
         except BaseException:
             await stack.aclose()
             raise
-        return self._events(user, request, body.run_id, Command(resume=body.answer), stack)
+        return CreationEvents(self._events(user, request, body.run_id, Command(resume=body.answer), stack), stack)
 
     async def _events(
         self, user: UserRead, request: AiCreateRequest, run_id: UUID, graph_input: Any, stack: AsyncExitStack
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event]:
         """Runs the graph and streams what it says. The run is a task of its own, so pings can go out while the model
         writes; it's cancelled when the stream is (the request closed)."""
         run = CreateRun(
@@ -209,9 +231,8 @@ class SiteCreateService:
         result: RunResult = state["result"]
         await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=state, run=run)
         await prune(self._checkpointer, create_config(request.project_id))
-        site = await self._site_service.list_sites(user)
-        read = next(s for s in site if s.project_id == request.project_id)
-        return AiCreated(run_id=run_id, summary=result.get("summary", ""), commit_sha=result["commit_sha"], site=read)
+        site = await self._site_service.read(user, request.project_id)
+        return AiCreated(run_id=run_id, summary=result.get("summary", ""), commit_sha=result["commit_sha"], site=site)
 
     async def _failed(self, user: UserRead, request: AiCreateRequest, run: CreateRun, err: Exception) -> None:
         if isinstance(err, AiKeyInvalidError) and request.model is not None:

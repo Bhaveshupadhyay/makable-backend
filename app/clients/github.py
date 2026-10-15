@@ -167,13 +167,14 @@ class HttpGithubClient:
         return _parse(GithubUser, res, "fetching the user")
 
     async def get_repo(self, access_token: str, full_name: str) -> GithubRepo | None:
-        """A repository, or None if it doesn't exist (or the token can't see it).
+        """A repository, or None if it isn't there by that name: it doesn't exist, the token can't see it, or it was
+        renamed or moved (GitHub then redirects the old name, which isn't followed).
 
         Raises:
             GithubError: The request failed.
         """
         res = await self._request("GET", f"/repos/{full_name}", access_token)
-        if res.status_code == status.HTTP_404_NOT_FOUND:
+        if res.status_code == status.HTTP_404_NOT_FOUND or res.is_redirect:
             return None
         return _parse(GithubRepo, res, "fetching the repository")
 

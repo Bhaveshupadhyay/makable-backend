@@ -25,7 +25,7 @@ async def commit(state: EditState, runtime: Runtime[EditRun]) -> EditState:
     changes: dict[str, str | None] = {path: applied.files[path] for path in applied.changed}
     message = state["instruction"].splitlines()[0][:200]
     run.changed_files = changes
-    run.committing = result
+    run.committing = state
     run.commit_task = asyncio.ensure_future(run.site.commit(state["base_commit"], changes, message))
     commit_sha = await asyncio.shield(run.commit_task)
     return {"result": {**result, "commit_sha": commit_sha}}

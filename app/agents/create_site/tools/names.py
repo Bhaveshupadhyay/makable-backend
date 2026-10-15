@@ -56,13 +56,22 @@ _FILLER = frozenset(
     ]
 )
 MAX_SUGGESTION_WORDS = 4
+# Well under what a question's option (`MAX_OPTION`) and a site's name (`SITE_NAME_MAX`) can be.
+MAX_SUGGESTION_CHARS = 40
 
 
 def suggest_name(prompt: str) -> str:
-    """A quoted name in the prompt if there is one, else its first few meaningful words, in title case."""
+    """A quoted name in the prompt if there is one, else its first few meaningful words, in title case; at most
+    `MAX_SUGGESTION_CHARS` long."""
     quoted = re.search(r"\"([^\"]{2,40})\"|“([^”]{2,40})”|(?<!\w)'([^']{2,40})'(?!\w)", prompt)
     if quoted:
         return next(g for g in quoted.groups() if g).strip()
     words = [w for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9&'-]*", prompt) if w.lower() not in _FILLER]
-    name = " ".join(words[:MAX_SUGGESTION_WORDS]).strip()
+    name = ""
+    for word in words[:MAX_SUGGESTION_WORDS]:
+        if len(name) + len(word) + 1 > MAX_SUGGESTION_CHARS:
+            break
+        name = f"{name} {word}".strip()
+    if not name and words:
+        name = words[0][:MAX_SUGGESTION_CHARS]
     return name.title() if name else "My site"

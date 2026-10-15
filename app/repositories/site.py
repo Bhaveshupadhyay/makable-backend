@@ -16,6 +16,8 @@ class SiteRepository(Protocol):
 
     async def list_for_user(self, user_id: UUID) -> list[Site]: ...
 
+    async def get_by_repo(self, user_id: UUID, repo_name: str) -> Site | None: ...
+
     async def create(self, data: SiteCreate) -> Site: ...
 
     async def set_repo(self, site_id: UUID, repo_name: str, name: str) -> None: ...
@@ -45,6 +47,10 @@ class SqlSiteRepository:
             select(Site).where(Site.user_id == user_id).order_by(Site.updated_at.desc(), Site.id)
         )
         return list(rows)
+
+    async def get_by_repo(self, user_id: UUID, repo_name: str) -> Site | None:
+        """The user's site whose repo has this name."""
+        return await self._session.scalar(select(Site).where(Site.user_id == user_id, Site.repo_name == repo_name))
 
     async def create(self, data: SiteCreate) -> Site:
         """Adds a site.

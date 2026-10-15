@@ -4,10 +4,17 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
 
 from app.constants.ai_edit import SAFE_REPO_PATH, AiEditOutcome
-from app.constants.site import MAX_COMMIT_MESSAGE, MAX_FILE_CHARS, MAX_SAVE_FILES, RESERVED_PATH, SITE_NAME_MAX
+from app.constants.site import (
+    MAX_COMMIT_MESSAGE,
+    MAX_FILE_CHARS,
+    MAX_SAVE_CHARS,
+    MAX_SAVE_FILES,
+    RESERVED_PATH,
+    SITE_NAME_MAX,
+)
 from app.schemas.common import CamelModel
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -84,6 +91,12 @@ class SiteSave(CamelModel):
     ]
     deletes: Annotated[list[WritablePath], Field(max_length=MAX_SAVE_FILES)] = Field(default_factory=list)
     message: Annotated[str, StringConstraints(strip_whitespace=True, max_length=MAX_COMMIT_MESSAGE)] | None = None
+
+    @model_validator(mode="after")
+    def _within_total_size(self) -> SiteSave:
+        if sum(len(content) for content in self.files.values()) > MAX_SAVE_CHARS:
+            raise ValueError(f"The files can be at most {MAX_SAVE_CHARS} characters together")
+        return self
 
 
 class SiteSaved(CamelModel):

@@ -6,8 +6,10 @@ sessions through `get_db_session` (or the factory from `get_postgres_client`), c
 `get_checkpointer` and HTTP through `get_http_client`.
 """
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx
@@ -118,6 +120,17 @@ def checkpoint_conninfo(settings: DatabaseSettings) -> str:
     )
 
 
+class PooledPostgresSaver(AsyncPostgresSaver):
+    """`AsyncPostgresSaver` holds one lock around every query, which a single shared connection needs; on a pool it
+    makes every user's checkpoint reads and writes wait for each other, on one connection at a time. Here each query
+    has its own connection from the pool, so they run side by side (up to `DB_CHECKPOINT_POOL_SIZE`). A thread's own
+    writes (a run, its prune) don't overlap anyway: the site's lock (`AI_RUNS`) allows one AI request at a time."""
+
+    def __init__(self, pool: AsyncConnectionPool[AsyncConnection[DictRow]]) -> None:
+        super().__init__(pool)
+        self.lock = cast(asyncio.Lock, contextlib.nullcontext())
+
+
 async def _use_langgraph_schema(conn: AsyncConnection[DictRow]) -> None:
     # The saver's SQL names its tables without a schema, so the search_path puts them in LangGraph's own.
     await conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(LANGGRAPH_SCHEMA)))
@@ -149,7 +162,7 @@ def get_checkpointer(settings: DatabaseSettings | None = None) -> BaseCheckpoint
                 timeout=settings.db_pool_timeout,
                 open=False,
             )
-            _checkpointer = AsyncPostgresSaver(_checkpoint_pool)
+            _checkpointer = PooledPostgresSaver(_checkpoint_pool)
     return _checkpointer
 
 

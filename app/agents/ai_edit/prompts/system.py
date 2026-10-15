@@ -29,7 +29,8 @@ Rules for edits:
 - "search" is copied exactly from the file, including indentation, and must appear only once in the whole file, \
 not just in the lines you were shown. Include the lines that change plus one or two lines of context. Keep it short.
 - Code is shown as numbered lines: "  12| <text>". The number and the "| " after it are not part of the file: \
-never put them in "search" or "replace".
+never put them in "search" or "replace". A very long line is cut, ending in "⟪cut: N more characters⟫": that mark \
+isn't in the file either, so search for text before it.
 - "replace" is the full new text for those lines. Later edits see the result of earlier ones.
 - To create a new file, use an empty "search" and the whole file as "replace", for a path that isn't in file_list. \
 Then import or link it where it's used, in the same reply.

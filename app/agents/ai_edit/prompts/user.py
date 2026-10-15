@@ -2,10 +2,18 @@
 code it's shown, all as tagged data. The code is read from the snapshot each time (the state only says which lines),
 and shown as numbered lines."""
 
+from collections.abc import Iterable
+
 from app.agents.ai_edit.state import ContextRef, Selection
 from app.agents.ai_edit.tools.context import line_count, outline
 from app.agents.thread import Turn
-from app.constants.ai_edit import MAX_HISTORY, MAX_HISTORY_REPLY, MAX_LISTED_FILES
+from app.constants.ai_edit import (
+    MAX_HISTORY,
+    MAX_HISTORY_REPLY,
+    MAX_LISTED_FILES,
+    MAX_SHOWN_CHARS,
+    MAX_SHOWN_LINE_CHARS,
+)
 from app.constants.site import RESERVED_PATH
 from app.schemas.ai_edit import AiEditRequest, AiEditTarget, AiEditTurn
 
@@ -31,16 +39,33 @@ def build_user_prompt(
 
 
 def render_ref(files: dict[str, str], ref: ContextRef) -> str:
-    """Some lines of a file, numbered, or its outline."""
+    """Some lines of a file, numbered, or its outline, within `MAX_SHOWN_CHARS`."""
     text = files.get(ref["path"], "")
     total = line_count(text)
     path = _attr(ref["path"])
     if ref.get("outline"):
-        lines = "\n".join(_numbered(n, line) for n, line in outline(text, ref["path"]))
+        lines, _ = _shown(outline(text, ref["path"]))
         return f'<file_outline path="{path}" total_lines="{total}">\n{lines}\n</file_outline>'
     start, end = ref["start"], min(ref["end"], total)
-    body = "\n".join(_numbered(n, line) for n, line in enumerate(text.split("\n")[start - 1 : end], start=start))
-    return f'<file path="{path}" lines="{start}-{end}" total_lines="{total}">\n{body}\n</file>'
+    body, last = _shown(enumerate(text.split("\n")[start - 1 : end], start=start))
+    return f'<file path="{path}" lines="{start}-{last or end}" total_lines="{total}">\n{body}\n</file>'
+
+
+def _shown(lines: Iterable[tuple[int, str]]) -> tuple[str, int]:
+    """Numbered lines, each cut after `MAX_SHOWN_LINE_CHARS` (marked as cut, since a search must stop before the
+    mark), until they'd pass `MAX_SHOWN_CHARS`; and the last line shown."""
+    shown: list[str] = []
+    size = last = 0
+    for number, line in lines:
+        if len(line) > MAX_SHOWN_LINE_CHARS:
+            line = f"{line[:MAX_SHOWN_LINE_CHARS]}⟪cut: {len(line) - MAX_SHOWN_LINE_CHARS} more characters⟫"
+        numbered = _numbered(number, line)
+        if shown and size + len(numbered) > MAX_SHOWN_CHARS:
+            break
+        shown.append(numbered)
+        size += len(numbered) + 1
+        last = number
+    return "\n".join(shown), last
 
 
 def earlier_requests(turns: list[Turn]) -> list[AiEditTurn]:

@@ -14,8 +14,6 @@ MANIFEST_VERSION: Final = 2
 RESERVED_PATH = re.compile(r"^(\.github|\.makable|\.git)(/|$)")
 
 SITE_NAME_MAX = 100
-# GitHub's rule for repo names, minus the names git treats specially.
-REPO_NAME = re.compile(r"(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}")
 
 # A save of manual edits: files at most, characters per file, and in total (the request body is capped at 2 MB).
 MAX_SAVE_FILES = 200

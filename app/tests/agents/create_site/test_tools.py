@@ -12,6 +12,12 @@ def test_a_name_is_suggested_from_the_prompt() -> None:
     assert suggest_name("make a website") == "My site"
 
 
+def test_a_suggested_name_is_kept_short() -> None:
+    long_words = "Build a landing page for Northwestern-Pacific-Environmental Consulting Group Sustainability"
+    assert suggest_name(long_words) == "Northwestern-Pacific-Environmental"
+    assert len(suggest_name("A site for " + "Supercalifragilistic" * 5)) == 40
+
+
 def test_the_file_is_the_first_fenced_block() -> None:
     assert extract_code("Here you go:\n```tsx\nexport const a = 1\n```\nDone.") == "export const a = 1\n"
     # A longer fence can hold shorter ones.

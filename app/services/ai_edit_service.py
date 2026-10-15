@@ -192,8 +192,9 @@ class AiEditService:
                 )
 
     async def thread(self, user: UserRead, project_id: UUID) -> AiThreadRead:
-        """The site's chat, oldest first, and the run waiting for the user's answer, if one is (it survives a closed
-        tab). A site with no requests yet has an empty one.
+        """The site's chat, oldest first, and the run waiting for the user's answer or the preview, if one is (it
+        survives a closed tab). A site with no requests yet has an empty one. A run waiting for the preview comes with
+        the files to try, unless the repo can't be read now.
 
         Raises:
             SiteNotFoundError: The site is another user's.
@@ -225,10 +226,15 @@ class AiEditService:
         if kind == "question":
             run.question = Question.model_validate(pause_value(snapshot))
             return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
-        # The edits are in the state; the files they make are worked out again from the base commit.
-        access = await self._site_service.access(user, project_id)
-        files = await self._preview_files(await access.snapshot(values["base_commit"]), values)
-        run.preview = AiPreview(summary=result_of(values).get("summary", ""), files=files)
+        # The edits are in the state; the files they make are worked out again from the base commit. If the repo can't
+        # be read now, the chat still loads, without the edits to try (the run can still be dismissed).
+        try:
+            access = await self._site_service.access(user, project_id)
+            files = await self._preview_files(await access.snapshot(values["base_commit"]), values)
+        except AppError as err:
+            logger.warning("Couldn't rebuild a paused run's preview", extra={"code": err.code})
+        else:
+            run.preview = AiPreview(summary=result_of(values).get("summary", ""), files=files)
         return AiThreadRead(project_id=project_id, status="awaiting_result", turns=turns, run=run)
 
     async def start_over(self, user: UserRead, project_id: UUID) -> None:
@@ -269,7 +275,7 @@ class AiEditService:
         try:
             state = await self._graph.ainvoke(graph_input, config, context=run, durability=DURABILITY)
         except asyncio.CancelledError:
-            await self._after_cancel(user, request, run, run_id, resuming=resuming)
+            await self._after_cancel(user, request, run, resuming=resuming)
             raise
         except AiKeyInvalidError as err:
             if request.model is not None:
@@ -357,9 +363,7 @@ class AiEditService:
             debug=debug,
         )
 
-    async def _after_cancel(
-        self, user: UserRead, request: AiEditRequest, run: EditRun, run_id: UUID, *, resuming: bool
-    ) -> None:
+    async def _after_cancel(self, user: UserRead, request: AiEditRequest, run: EditRun, *, resuming: bool) -> None:
         """Records a cancelled run. A commit that had started is finished first: then the change is on GitHub, so it's
         recorded as applied and added to the chat (where the SPA finds it and offers Undo). A resumed run that's
         stopped ends: its question doesn't come back."""
@@ -379,14 +383,9 @@ class AiEditService:
                     logger.exception("Couldn't end a stopped AI run that was waiting for an answer")
             await self._record_quietly(user, request, run, AiEditOutcome.CANCELLED, summary="stopped")
             return
-        result: RunResult = {**run.committing, "commit_sha": committed}
+        result: RunResult = {**result_of(run.committing), "commit_sha": committed}
         try:
-            finished = EditState(
-                run_id=str(run_id),
-                instruction=request.instruction,
-                target=run_input(run_id, request)["target"],
-                result=result,
-            )
+            finished = EditState(**{**run.committing, "result": result})
             update: dict[str, Any] = {"turns": [turn_for(finished)], "result": result, "messages": [], "reply": ""}
             await self._graph.aupdate_state(self._config(request.project_id), update, as_node="finish")
             await self._uow.rollback()
