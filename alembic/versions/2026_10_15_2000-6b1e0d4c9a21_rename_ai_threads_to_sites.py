@@ -31,9 +31,12 @@ def upgrade() -> None:
     with op.batch_alter_table('sites', schema=None) as batch_op:
         batch_op.alter_column('name', server_default=None)
 
+    # One batch each: SQLite rebuilds the table per batch and can't index a column renamed in the same one.
+    with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
+        batch_op.drop_index('ix_ai_edit_requests_thread_id')
     with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
         batch_op.alter_column('thread_id', new_column_name='site_id')
-        batch_op.drop_index('ix_ai_edit_requests_thread_id')
+    with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_ai_edit_requests_site_id'), ['site_id'], unique=False)
 
 
@@ -41,7 +44,9 @@ def downgrade() -> None:
     """Downgrade schema."""
     with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_ai_edit_requests_site_id'))
+    with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
         batch_op.alter_column('site_id', new_column_name='thread_id')
+    with op.batch_alter_table('ai_edit_requests', schema=None) as batch_op:
         batch_op.create_index('ix_ai_edit_requests_thread_id', ['thread_id'], unique=False)
 
     with op.batch_alter_table('sites', schema=None) as batch_op:
