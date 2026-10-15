@@ -25,6 +25,7 @@ def turn_for(state: EditState) -> Turn:
         target=state["target"],
         outcome=result["outcome"],
         reply=reply,
+        questions=state.get("questions", []),
         commit_sha=result.get("commit_sha"),
         created_at=utc_now().isoformat(),
     )

@@ -6,21 +6,23 @@ from app.agents.ai_edit.prompts.repair import rejection_report, repair_prompt
 from app.agents.ai_edit.state import EditRun, EditState, RunResult
 from app.agents.ai_edit.tools.answer import describe_problem, parse_answer, without_line_numbers
 from app.agents.ai_edit.tools.edits import check_edits
-from app.constants.ai_edit import MAX_ATTEMPTS, MAX_CONTEXT_ROUNDS, AiEditOutcome
-from app.schemas.ai_edit import ModelEdits, ModelEscalation, ModelNeedsContext
+from app.constants.ai_edit import MAX_ATTEMPTS, MAX_CONTEXT_ROUNDS, MAX_QUESTIONS, AiEditOutcome
+from app.schemas.ai_edit import ModelEdits, ModelEscalation, ModelNeedsContext, ModelQuestion
 from app.utils.file_edits import FileEditError
 
 logger = logging.getLogger(__name__)
 
 
 async def check(state: EditState, runtime: Runtime[EditRun]) -> EditState:
-    """Checks the model's reply and says where the run goes next (`step`): more code for the model, a commit of edits
-    that passed the dry run, a repair (a rejected reply goes back once with a report of what failed and where, because
-    free models often get the shape or the search text wrong the first time), or the end."""
+    """Checks the model's reply and says where the run goes next (`step`): more code for the model, a question for the
+    user, a commit of edits that passed the dry run, a repair (a rejected reply goes back once with a report of what
+    failed and where, because free models often get the shape or the search text wrong the first time), or the end."""
     reply, attempt = state["reply"], state["attempt"]
-    # Model calls that answered (or tried to): the ones that asked for code don't count against the retries.
-    answers = attempt - state["context_rounds"]
-    answer: ModelEdits | ModelEscalation | ModelNeedsContext | None = None
+    # Model calls that answered (or tried to): the ones that asked for code or asked the user don't count against
+    # the retries.
+    asked = len(state["questions"])
+    answers = attempt - state["context_rounds"] - asked
+    answer: ModelEdits | ModelEscalation | ModelNeedsContext | ModelQuestion | None = None
     try:
         answer = parse_answer(reply)
         if isinstance(answer, ModelEscalation):
@@ -30,6 +32,13 @@ async def check(state: EditState, runtime: Runtime[EditRun]) -> EditState:
             if state["context_rounds"] < MAX_CONTEXT_ROUNDS:
                 return {"step": "read_more"}
             raise ValueError("you can't ask for more code now: answer with edits for what you were shown, or escalate")
+        if isinstance(answer, ModelQuestion):
+            if asked < MAX_QUESTIONS:
+                return {"step": "ask_user"}
+            raise ValueError(
+                "you can't ask the user anything more: make the change with a sensible choice and say which in the "
+                "summary, or escalate"
+            )
         edits = without_line_numbers(answer.edits)
         check_edits(await runtime.context.files(), edits)
     except (ValueError, FileEditError) as err:  # ValidationError and JSONDecodeError are ValueErrors.

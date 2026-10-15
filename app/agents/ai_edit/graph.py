@@ -8,6 +8,7 @@ START → classify ──Tier 2 rule──────────────�
         generate ◄──────────────────────────────────────────────┐
           │                                                     │
         check ──needContext (≤ 2)──► read_more ─────────────────┤
+          │   ──ask (≤ 2)──► ask_user (interrupt: paused, saved) ──► load_context (the site as it is now)
           │   ──rejected, attempts left (repair report)─────────┘
           │   ──escalated / rejected, out of attempts──────────────────────────────────► finish
           │ ok
@@ -19,7 +20,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.agents.ai_edit.nodes import check, classify, commit, finish, generate, load_context, read_more
+from app.agents.ai_edit.nodes import ask_user, check, classify, commit, finish, generate, load_context, read_more
 from app.agents.ai_edit.state import EditRun, EditState
 
 type EditGraph = CompiledStateGraph[EditState, EditRun, EditState, EditState]
@@ -40,14 +41,16 @@ def _build() -> StateGraph[EditState, EditRun, EditState, EditState]:
     graph.add_node("generate", generate)
     graph.add_node("check", check)
     graph.add_node("read_more", read_more)
+    graph.add_node("ask_user", ask_user)
     graph.add_node("commit", commit)
     graph.add_node("finish", finish)
     graph.add_edge(START, "classify")
     graph.add_conditional_edges("classify", _after_classify, ["load_context", "finish"])
     graph.add_edge("load_context", "generate")
     graph.add_edge("generate", "check")
-    graph.add_conditional_edges("check", _after_check, ["read_more", "generate", "commit", "finish"])
+    graph.add_conditional_edges("check", _after_check, ["read_more", "ask_user", "generate", "commit", "finish"])
     graph.add_edge("read_more", "generate")
+    graph.add_edge("ask_user", "load_context")
     graph.add_edge("commit", "finish")
     graph.add_edge("finish", END)
     return graph

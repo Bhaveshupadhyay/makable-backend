@@ -11,9 +11,13 @@ from uuid import UUID
 from pydantic import AfterValidator, Field, StringConstraints
 
 from app.constants.ai_edit import (
+    MAX_ANSWER,
     MAX_EDITS,
     MAX_ELEMENT_HTML,
     MAX_INSTRUCTION,
+    MAX_OPTION,
+    MAX_OPTIONS,
+    MAX_QUESTION,
     MAX_SCREENSHOT_CHARS,
     MAX_TARGET_LABEL,
     SAFE_REPO_PATH,
@@ -134,7 +138,26 @@ class ModelNeedsContext(CamelModel):
     need_context: ContextRequest
 
 
-ModelAnswer = Annotated[ModelEdits | ModelEscalation | ModelNeedsContext, Field(union_mode="left_to_right")]
+class Question(CamelModel):
+    """A question for the user, with choices to click (colours as CSS colours) and/or free text."""
+
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_QUESTION)]
+    options: Annotated[
+        list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_OPTION)]],
+        Field(max_length=MAX_OPTIONS),
+    ] = Field(default_factory=list)
+    allow_free_text: bool = True
+
+
+class ModelQuestion(CamelModel):
+    """The model's answer when only the user can say what they want."""
+
+    ask: Question
+
+
+ModelAnswer = Annotated[
+    ModelEdits | ModelEscalation | ModelNeedsContext | ModelQuestion, Field(union_mode="left_to_right")
+]
 
 
 class AiEditDebug(CamelModel):
@@ -166,4 +189,24 @@ class AiEditEscalated(CamelModel):
     debug: AiEditDebug | None = None
 
 
-AiEditResult = Annotated[AiEditApplied | AiEditEscalated, Field(discriminator="status")]
+class AiEditNeedsInput(CamelModel):
+    """The run is paused on a question for the user. It's saved: answering continues it (`/answer`), even from another
+    tab or after the page was closed."""
+
+    status: Literal["needs_input"] = "needs_input"
+    run_id: UUID
+    question: Question
+    debug: AiEditDebug | None = None
+
+
+AiEditResult = Annotated[AiEditApplied | AiEditEscalated | AiEditNeedsInput, Field(discriminator="status")]
+
+
+class AiEditAnswer(CamelModel):
+    """The user's answer to a paused run's question. `base_commit` is where the site is now (the SPA saves first):
+    the code is read again there."""
+
+    run_id: UUID
+    answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_ANSWER)]
+    base_commit: CommitSha
+    screenshot: Screenshot | None = None

@@ -45,9 +45,14 @@ def render_ref(files: dict[str, str], ref: ContextRef) -> str:
 def earlier_requests(turns: list[Turn]) -> list[AiEditTurn]:
     """The thread's last turns, for the prompt's `<earlier_requests>`."""
     return [
-        AiEditTurn(instruction=t["instruction"], target=t["target"], reply=t["reply"][:MAX_HISTORY_REPLY])
+        AiEditTurn(instruction=t["instruction"], target=t["target"], reply=_reply(t)[:MAX_HISTORY_REPLY])
         for t in turns[-MAX_HISTORY:]
     ]
+
+
+def _reply(turn: Turn) -> str:
+    asked = "".join(f" (You asked: {q['question']} They said: {q['answer']})" for q in turn.get("questions", []))
+    return turn["reply"] + asked
 
 
 def _file_list(files: dict[str, str]) -> str:

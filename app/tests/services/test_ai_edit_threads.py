@@ -337,4 +337,5 @@ async def test_the_checkpoint_holds_no_file_contents(
     assert values["context"][0] == {"path": HERO_PATH, "start": 1, "end": 8}
     # Plain values only: the serializer warns about (and will block) types it doesn't know, like our enums.
     assert type(values["result"]["outcome"]) is str
-    assert {type(v) for t in values["turns"] for v in t.values()} <= {str, type(None)}
+    assert {type(v) for t in values["turns"] for k, v in t.items() if k != "questions"} <= {str, type(None)}
+    assert values["turns"][0]["questions"] == []

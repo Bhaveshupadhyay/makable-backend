@@ -22,6 +22,13 @@ CONTEXT_WINDOW_LINES = 40
 # The model can ask for more of the code (`needContext`) this many times per request, up to this many lines in all.
 MAX_CONTEXT_ROUNDS = 2
 MAX_EXTRA_CONTEXT_LINES = 800
+# Questions the model can ask the user per request (the run pauses until they answer), and their caps.
+MAX_QUESTIONS = 2
+MAX_QUESTION = 300
+MAX_OPTIONS = 6
+MAX_OPTION = 80
+MAX_ANSWER = 2000
+
 # Paths listed in the prompt's file list, and lines of a file's outline.
 MAX_LISTED_FILES = 300
 MAX_OUTLINE_LINES = 80

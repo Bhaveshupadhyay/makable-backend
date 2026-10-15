@@ -28,6 +28,11 @@ class SiteFiles(Protocol):
     async def commit(self, base_commit: str, changes: dict[str, str | None], message: str) -> str: ...
 
 
+class QuestionAnswer(TypedDict):
+    question: str
+    answer: str
+
+
 class Turn(TypedDict):
     """A finished request in the thread: the chat, and the `<earlier_requests>` of the next prompts."""
 
@@ -36,6 +41,7 @@ class Turn(TypedDict):
     target: str | None
     outcome: str
     reply: str
+    questions: NotRequired[list[QuestionAnswer]]
     commit_sha: str | None
     created_at: str
 
@@ -81,6 +87,8 @@ class EditState(TypedDict, total=False):
     # The current run's fields, all set by its input (`run_input`), so a run never sees an earlier, cancelled or
     # failed one's.
     run_id: str
+    # The request as sent, without its picture: a paused run continues from it (with the answer's base commit).
+    request: dict[str, Any]
     instruction: str
     target: str | None
     base_commit: str
@@ -94,8 +102,10 @@ class EditState(TypedDict, total=False):
     reply: str
     # Model calls made.
     attempt: int
+    # What the model asked the user, and their answers.
+    questions: list[QuestionAnswer]
     problem: str
-    # Where the run goes next after `check`: "read_more", "generate" (a repair), "commit" or "finish".
+    # Where the run goes next after `check`: "read_more", "ask_user", "generate" (a repair), "commit" or "finish".
     step: str
     result: RunResult | None
 
@@ -135,6 +145,7 @@ def run_input(run_id: UUID, request: AiEditRequest) -> EditState:
     """A new run's input. Every per-run field is set."""
     return {
         "run_id": str(run_id),
+        "request": request.model_dump(mode="json", exclude={"screenshot"}),
         "instruction": request.instruction,
         "target": target_label(request.target),
         "base_commit": request.base_commit,
@@ -144,6 +155,7 @@ def run_input(run_id: UUID, request: AiEditRequest) -> EditState:
         "messages": [],
         "reply": "",
         "attempt": 0,
+        "questions": [],
         "problem": "",
         "step": "",
         "result": None,

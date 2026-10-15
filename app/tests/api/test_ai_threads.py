@@ -29,7 +29,10 @@ def test_a_site_with_no_requests_has_an_empty_chat(client: TestClient) -> None:
     res = client.get(THREAD)
 
     assert res.status_code == 200
-    assert res.json() == {"success": True, "data": {"projectId": str(PROJECT_ID), "status": "idle", "turns": []}}
+    assert res.json() == {
+        "success": True,
+        "data": {"projectId": str(PROJECT_ID), "status": "idle", "turns": [], "run": None},
+    }
 
 
 def test_the_chat_comes_from_the_server_and_start_over_clears_it(client: TestClient, model: FakeModelClient) -> None:
@@ -82,3 +85,47 @@ def test_the_app_wont_start_with_langsmith_tracing(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError, match="tracing"):
         refuse_tracing()
+
+
+def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClient, model: FakeModelClient) -> None:
+    sign_in(client)
+    base = create_site(client)
+    ask = '{"ask": {"question": "Which colour?", "options": ["#16a34a"]}}'
+    model.replies += [ask, GOOD_REPLY]
+
+    paused = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+
+    assert paused["status"] == "needs_input"
+    assert paused["question"] == {"question": "Which colour?", "options": ["#16a34a"], "allowFreeText": True}
+    thread = client.get(THREAD).json()["data"]
+    assert thread["status"] == "needs_input"
+    assert thread["run"] == {
+        "runId": paused["runId"],
+        "instruction": "Make the contact button green",
+        "target": 'Ada > <a> "Contact"',
+        "question": paused["question"],
+    }
+
+    answered = client.post(
+        f"{EDIT}/{PROJECT_ID}/answer", json={"runId": paused["runId"], "answer": "green", "baseCommit": base}
+    )
+
+    assert answered.status_code == 200
+    assert answered.json()["data"]["status"] == "applied"
+    [turn] = client.get(THREAD).json()["data"]["turns"]
+    assert turn["questions"] == [{"question": "Which colour?", "answer": "green"}]
+    again = client.post(
+        f"{EDIT}/{PROJECT_ID}/answer", json={"runId": paused["runId"], "answer": "green", "baseCommit": base}
+    )
+    assert again.json()["error"]["code"] in ("ai_run_superseded", "site_conflict")
+
+
+def test_a_question_can_be_dismissed(client: TestClient, model: FakeModelClient) -> None:
+    sign_in(client)
+    base = create_site(client)
+    model.replies.append('{"ask": {"question": "Which colour?"}}')
+    client.post(EDIT, json=request_body(baseCommit=base))
+
+    assert client.delete(f"{THREAD}/run").status_code == 204
+
+    assert client.get(THREAD).json()["data"]["status"] == "idle"
