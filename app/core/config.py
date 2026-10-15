@@ -47,6 +47,9 @@ class DatabaseSettings(BaseSettings):
     # Transaction-mode poolers (Supabase port 6543, PgBouncer) can't keep prepared statements between
     # transactions, so asyncpg's statement cache must be off. Session mode (port 5432) doesn't need this.
     db_transaction_pooler: bool = False
+    # Connections for LangGraph's checkpoints (psycopg, separate from the SQLAlchemy pool above). Count them in the
+    # same budget: workers x (pool_size + max_overflow + checkpoint_pool_size).
+    db_checkpoint_pool_size: int = Field(default=4, ge=1)
 
     @model_validator(mode="after")
     def _database_configured(self) -> Self:

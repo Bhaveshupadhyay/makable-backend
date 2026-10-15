@@ -5,6 +5,7 @@ itself, so all of it is untrusted: it's length-capped here and only ever goes in
 """
 
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import AfterValidator, Field, StringConstraints
 
@@ -77,8 +78,9 @@ Instruction = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 
 
 class AiEditTurn(CamelModel):
-    """An earlier request in this project and how it went, so follow-ups like "make it bigger" work. The
-    browser keeps these, so they're untrusted: they go into the prompt as data, like everything else."""
+    """An earlier request in this project and how it went, so follow-ups like "make it bigger" work. They come
+    from the site's thread on the server now (the browser's are ignored), and still go into the prompt as data:
+    the instructions in them are the user's own, earlier, untrusted text."""
 
     instruction: Instruction
     # A short label for what was selected, e.g. `Hero > <a> "Contact"`.
@@ -88,6 +90,8 @@ class AiEditTurn(CamelModel):
 
 
 class AiEditRequest(CamelModel):
+    # The site (the SPA's `projectId`); its AI thread keeps the chat.
+    project_id: UUID
     instruction: Instruction
     # None when nothing was selected: the request is about the whole page.
     target: AiEditTarget | None
@@ -96,7 +100,7 @@ class AiEditRequest(CamelModel):
     file_tree: Annotated[list[RepoPath], Field(max_length=MAX_FILE_TREE)]
     # The files most likely to change, with their contents.
     files: Annotated[list[AiEditFile], Field(max_length=MAX_FILES)]
-    # Earlier requests, oldest first.
+    # Earlier requests, oldest first. Validated and ignored: the site's thread has them (kept for older SPAs).
     history: Annotated[list[AiEditTurn], Field(max_length=MAX_HISTORY, default_factory=list)]
     # The model the user picked in the chat's menu; left out for makable's own.
     model: ModelChoice | None = None

@@ -10,6 +10,9 @@ from fastapi import Request
 from app.core.exceptions import AppError
 
 POLL_SECONDS = 0.5
+# How long a cancelled piece of work gets to clean up (e.g. record that it was stopped) before the request ends and
+# its database session closes.
+CLEANUP_SECONDS = 5
 
 
 class ClientDisconnectedError(AppError):
@@ -34,4 +37,6 @@ async def cancel_on_disconnect[T](request: Request, work: Coroutine[Any, Any, T]
             if await request.is_disconnected():
                 raise ClientDisconnectedError()
     finally:
-        task.cancel()
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=CLEANUP_SECONDS)

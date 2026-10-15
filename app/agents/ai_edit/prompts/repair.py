@@ -1,8 +1,9 @@
-"""The report sent back to the model after a rejected answer: which edit failed, why and where, with the
-file's real text at that place. It goes inside the repair prompt (`ai_edit_prompt.repair_prompt`)."""
+"""The prompt after a rejected answer: `REPAIR_PROMPT` and a report of which edit failed, why and where, with the
+file's real text at that place."""
 
 from pydantic import ValidationError
 
+from app.agents.ai_edit.prompts.system import REPAIR_PROMPT
 from app.schemas.ai_edit import AiEditRequest, FileEdit
 from app.utils.edit_diagnosis import (
     MIN_MATCH,
@@ -21,6 +22,11 @@ from app.utils.file_edits import FileEditError, apply_file_edits
 MAX_REPORT_CHARS = 6000
 # Characters of the model's own search text quoted back to it.
 QUOTED_SEARCH = 300
+
+
+def repair_prompt(report: str) -> str:
+    """Sent after a rejected answer: how to repair it, then what exactly went wrong (`rejection_report`)."""
+    return f"{REPAIR_PROMPT}\n\n<rejection_report>\n{report}\n</rejection_report>"
 
 
 def rejection_report(request: AiEditRequest, edits: list[FileEdit] | None, err: Exception) -> str:

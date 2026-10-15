@@ -109,3 +109,20 @@ async def test_the_work_is_cancelled_when_the_client_disconnects() -> None:
     await asyncio.sleep(0)
     assert started.is_set()
     assert cancelled.is_set()
+
+
+async def test_cancelled_work_gets_to_clean_up_before_the_request_ends() -> None:
+    cleaned_up = asyncio.Event()
+
+    async def work_that_records_its_cancellation() -> str:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.01)  # e.g. writing the `cancelled` row
+            cleaned_up.set()
+            raise
+        return "done"
+
+    with pytest.raises(ClientDisconnectedError):
+        await cancel_on_disconnect(disconnected_request(), work_that_records_its_cancellation())
+    assert cleaned_up.is_set()

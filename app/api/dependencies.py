@@ -11,6 +11,7 @@ from typing import Annotated
 
 import httpx
 from fastapi import Cookie, Depends
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.cookies import AuthCookies
@@ -31,19 +32,25 @@ from app.constants.api import (
     WORKSPACE_SAVE_EVERY_SECONDS,
 )
 from app.constants.auth import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, Role
-from app.core.client import get_db_session, get_http_client
+from app.core.client import get_checkpointer, get_db_session, get_http_client
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ForbiddenError
-from app.core.limits import ConcurrencyLimit, PerKeyLimit
+from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
 from app.core.security import PayloadSigner, TokenCipher
 from app.repositories.ai_key import AiKeyRepository, SqlAiKeyRepository
+from app.repositories.ai_thread import (
+    AiEditRecordRepository,
+    AiThreadRepository,
+    SqlAiEditRecordRepository,
+    SqlAiThreadRepository,
+)
 from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
 from app.repositories.health import HealthRepository, SqlHealthRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
 from app.repositories.user import SqlUserRepository, UserRepository
 from app.schemas.ai_key import ModelEndpoint
 from app.schemas.user import UserRead
-from app.services.ai_edit_service import AiEditService
+from app.services.ai_edit_service import AiEditService, AiRunInProgressError
 from app.services.ai_key_service import AiKeyService, ModelClientFactory
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
@@ -58,6 +65,14 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 DbSessionDep = Annotated[AsyncSession, Depends(get_db_session)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
+
+
+def get_checkpoint_saver() -> BaseCheckpointSaver[str]:
+    """LangGraph's checkpointer (Postgres, or in memory on SQLite), opened by the lifespan."""
+    return get_checkpointer()
+
+
+CheckpointerDep = Annotated[BaseCheckpointSaver[str], Depends(get_checkpoint_saver)]
 
 # --- Infrastructure ---
 
@@ -133,6 +148,14 @@ def get_ai_key_repository(session: DbSessionDep) -> AiKeyRepository:
     return SqlAiKeyRepository(session)
 
 
+def get_ai_thread_repository(session: DbSessionDep) -> AiThreadRepository:
+    return SqlAiThreadRepository(session)
+
+
+def get_ai_edit_record_repository(session: DbSessionDep) -> AiEditRecordRepository:
+    return SqlAiEditRecordRepository(session)
+
+
 def get_health_repository(session: DbSessionDep) -> HealthRepository:
     return SqlHealthRepository(session)
 
@@ -180,9 +203,14 @@ def get_ai_key_service(
 
 
 def get_ai_edit_service(
-    models: Annotated[AiKeyService, Depends(get_ai_key_service)], settings: SettingsDep
+    models: Annotated[AiKeyService, Depends(get_ai_key_service)],
+    threads: Annotated[AiThreadRepository, Depends(get_ai_thread_repository)],
+    records: Annotated[AiEditRecordRepository, Depends(get_ai_edit_record_repository)],
+    uow: UnitOfWorkDep,
+    checkpointer: CheckpointerDep,
+    settings: SettingsDep,
 ) -> AiEditService:
-    return AiEditService(models, debug=settings.ai_debug)
+    return AiEditService(models, threads, records, uow, checkpointer, AI_RUNS, debug=settings.ai_debug)
 
 
 def get_workspace_service(
@@ -249,6 +277,8 @@ WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_E
 PUBLISH_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS)
 PUBLISHES = PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS)
 AI_KEY_CHECKS = PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
+# One AI request at a time per site (and per user), including Start over. The service holds it.
+AI_RUNS = KeyLock(AiRunInProgressError)
 
 
 async def ai_edit_slot() -> AsyncIterator[None]:

@@ -1,6 +1,5 @@
-"""The Tier 1 prompt. It stays on the server: the browser only sends the request."""
-
-from app.schemas.ai_edit import AiEditRequest, AiEditTarget, AiEditTurn
+"""The fixed text of the Tier 1 prompt: the rules (`SYSTEM_PROMPT`) and how to fix a rejected answer
+(`REPAIR_PROMPT`). It stays on the server: the browser only sends the request."""
 
 SYSTEM_PROMPT = """\
 You edit a website's source code. The user changes the site from a visual builder with a live preview, and you \
@@ -64,49 +63,3 @@ around the text you search for. Copy exactly what is there.
 needs the content file changed.
 - If the change can't be made in the files given, reply {"escalate": "<one sentence: why>"}.
 - Reply with only the JSON object: no prose, no markdown fences."""
-
-WHOLE_PAGE = "<selected_element>none: the request is about the whole page</selected_element>"
-
-
-def build_user_prompt(request: AiEditRequest) -> str:
-    """The request as tagged data: instruction, selection, template, file tree and file contents."""
-    template = request.template
-    parts = [
-        *([_describe_history(request.history)] if request.history else []),
-        f"<instruction>\n{request.instruction}\n</instruction>",
-        _describe_target(request.target) if request.target else WHOLE_PAGE,
-        f'<template name="{_attr(template.name)}" kind="{template.kind}" content_file="{template.content_path}" />',
-        "<file_tree>\n" + "\n".join(request.file_tree) + "\n</file_tree>",
-        *(f'<file path="{f.path}" reason="{_attr(f.reason)}">\n{f.content}\n</file>' for f in request.files),
-    ]
-    return "\n\n".join(parts)
-
-
-def repair_prompt(report: str) -> str:
-    """Sent after a rejected answer: how to repair it, then what exactly went wrong (`ai_edit_repair`)."""
-    return f"{REPAIR_PROMPT}\n\n<rejection_report>\n{report}\n</rejection_report>"
-
-
-def _describe_target(target: AiEditTarget) -> str:
-    lines = [f"- Element: <{target.tag}>{f' showing "{target.text}"' if target.text else ''}"]
-    if target.section:
-        section = target.section
-        id_attr = f' id="{_attr(section.id)}"' if section.id else ""
-        heading = f' with heading "{section.heading}"' if section.heading else ""
-        lines.append(f"- Inside: <{section.tag}{id_attr}>{heading}")
-    if target.content_path:
-        lines.append(f"- Content path: {target.content_path}")
-    lines.append(f"- DOM path: {target.selector}")
-    return "<selected_element>\n" + "\n".join(lines) + f"\n<html>\n{target.html}\n</html>\n</selected_element>"
-
-
-def _describe_history(history: list[AiEditTurn]) -> str:
-    entries = []
-    for i, turn in enumerate(history, start=1):
-        target = f" (selected: {turn.target})" if turn.target else ""
-        entries.append(f"{i}. User{target}: {turn.instruction}\n   Result: {turn.reply}")
-    return "<earlier_requests>\n" + "\n".join(entries) + "\n</earlier_requests>"
-
-
-def _attr(value: str) -> str:
-    return value.translate({ord(c): None for c in '"<>&'})

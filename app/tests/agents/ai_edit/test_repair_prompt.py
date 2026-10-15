@@ -1,21 +1,18 @@
-import json
 from typing import Any
-from uuid import uuid4
 
 import pytest
 
-from app.schemas.ai_edit import AiEditRequest, AiEditTier1, FileEdit, ModelEdits
-from app.services.ai_edit_repair import MAX_REPORT_CHARS, rejection_report
-from app.services.ai_edit_service import AiEditService, check_edits, extract_json
+from app.agents.ai_edit.prompts.repair import MAX_REPORT_CHARS, rejection_report
+from app.agents.ai_edit.tools.answer import extract_json
+from app.agents.ai_edit.tools.edits import check_edits
+from app.schemas.ai_edit import AiEditRequest, FileEdit, ModelEdits
 from app.tests.ai_edit_fixtures import (
     CONTENT_PATH,
-    GOOD_REPLY,
     HERO_PATH,
     PORTFOLIO,
     make_request,
     render_portfolio_source,
 )
-from app.tests.fakes import FakeModelClient, FakeModelSource
 from app.utils.file_edits import FileEditError
 
 BUNDLE_PATH = "assets/MainContainer-CNANTDSP.js"
@@ -128,7 +125,7 @@ def test_replies_that_are_not_answers_are_explained() -> None:
 
 
 def test_the_report_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("app.services.ai_edit_repair.MAX_REPORT_CHARS", 100)
+    monkeypatch.setattr("app.agents.ai_edit.prompts.repair.MAX_REPORT_CHARS", 100)
     report = report_for(make_request(), [FileEdit(path=HERO_PATH, search="function Footer() {}", replace="")])
 
     assert len(report) == 100
@@ -148,24 +145,6 @@ def test_a_forbidden_edit_after_a_failing_one_is_reported_without_replaying_the_
     assert report.startswith("Edit 2 of 2 (package.json) was rejected: package.json can't be edited.")
     assert "Drop this edit. The other edits weren't checked yet." in report
     assert "applied cleanly" not in report
-
-
-async def test_a_forbidden_edit_after_a_failing_one_still_gets_its_retry() -> None:
-    bad = json.dumps(
-        {
-            "summary": "x",
-            "edits": [
-                {"path": HERO_PATH, "search": "nope", "replace": "x"},
-                {"path": "package.json", "search": "a", "replace": "b"},
-            ],
-        }
-    )
-    model = FakeModelClient(bad, GOOD_REPLY)
-
-    result = await AiEditService(FakeModelSource(model)).edit(uuid4(), make_request())
-
-    assert isinstance(result, AiEditTier1)
-    assert "Edit 2 of 2 (package.json) was rejected" in model.calls[1][-1].content
 
 
 def test_text_that_contains_the_quote_marks_gets_other_ones() -> None:

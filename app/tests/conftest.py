@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import SecretStr
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,8 +32,12 @@ from app.constants.api import (
 from app.core.client import close_connection, get_postgres_client, open_connection
 from app.core.config import Settings, get_settings
 from app.core.database import Base
-from app.core.limits import ConcurrencyLimit, PerKeyLimit
+from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
+from app.repositories.ai_thread import SqlAiEditRecordRepository, SqlAiThreadRepository
+from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
+from app.services.ai_edit_service import AiEditService, AiRunInProgressError, ModelSource
 from app.services.workspace_service import VERIFIED_REPOS
+from app.tests.ai_edit_fixtures import MakeAiEditService
 from app.tests.fakes import (
     FakeAiProviders,
     FakeDeployPlatforms,
@@ -81,6 +86,7 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         dependencies, "AI_KEY_CHECKS", PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
     )
     monkeypatch.setattr(dependencies, "AI_EDIT_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS))
+    monkeypatch.setattr(dependencies, "AI_RUNS", KeyLock(AiRunInProgressError))
     monkeypatch.setattr(dependencies, "WORKSPACE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS))
     monkeypatch.setattr(
         dependencies,
@@ -103,6 +109,31 @@ async def session(settings: Settings) -> AsyncIterator[AsyncSession]:
     await open_connection(settings)
     async with get_postgres_client()() as session:
         yield session
+
+
+@pytest.fixture
+def checkpointer() -> InMemorySaver:
+    return InMemorySaver()
+
+
+@pytest.fixture
+def ai_edit_service(session: AsyncSession, checkpointer: InMemorySaver) -> MakeAiEditService:
+    """Builds `AiEditService` on the test database and one checkpointer per test, so two services made in a test
+    are two graph instances on the same saved threads (a closed tab, a restarted server)."""
+    runs = KeyLock(AiRunInProgressError)
+
+    def make(model_source: ModelSource, *, debug: bool = False) -> AiEditService:
+        return AiEditService(
+            model_source,
+            SqlAiThreadRepository(session),
+            SqlAiEditRecordRepository(session),
+            SqlAlchemyUnitOfWork(session),
+            checkpointer,
+            runs,
+            debug=debug,
+        )
+
+    return make
 
 
 @pytest.fixture

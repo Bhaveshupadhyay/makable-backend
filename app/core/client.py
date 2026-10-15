@@ -1,7 +1,9 @@
-"""Shared clients, one per process, created lazily: Postgres (engine + session factory) and HTTP.
+"""Shared clients, one per process, created lazily: Postgres (engine + session factory), LangGraph's checkpointer
+and HTTP.
 
 `open_connection` runs at startup (lifespan) and `close_connection` at shutdown. Everything else gets
-sessions through `get_db_session` (or the factory from `get_postgres_client`) and HTTP through `get_http_client`.
+sessions through `get_db_session` (or the factory from `get_postgres_client`), checkpoints through
+`get_checkpointer` and HTTP through `get_http_client`.
 """
 
 from collections.abc import AsyncIterator
@@ -9,9 +11,17 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import AsyncConnection, sql
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import DictRow, dict_row
+from psycopg_pool import AsyncConnectionPool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.constants.ai_edit import LANGGRAPH_SCHEMA
 from app.core.config import DatabaseSettings
 
 # Shows up in pg_stat_activity, so our connections are easy to spot.
@@ -26,6 +36,8 @@ HTTP_POOL_TIMEOUT_SECONDS = 5
 _postgres_engine: AsyncEngine | None = None
 _postgres_sessionmaker: async_sessionmaker[AsyncSession] | None = None
 _http_client: httpx.AsyncClient | None = None
+_checkpoint_pool: AsyncConnectionPool[AsyncConnection[DictRow]] | None = None
+_checkpointer: BaseCheckpointSaver[str] | None = None
 
 
 def engine_options(settings: DatabaseSettings) -> dict[str, Any]:
@@ -92,9 +104,79 @@ def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def checkpoint_conninfo(settings: DatabaseSettings) -> str:
+    """psycopg's connection string for the database SQLAlchemy uses."""
+    url = settings.sqlalchemy_url
+    return make_conninfo(
+        host=url.host,
+        port=url.port,
+        dbname=url.database,
+        user=url.username,
+        password=url.password,
+        sslmode=settings.db_ssl,
+        application_name=APPLICATION_NAME,
+    )
+
+
+async def _use_langgraph_schema(conn: AsyncConnection[DictRow]) -> None:
+    # The saver's SQL names its tables without a schema, so the search_path puts them in LangGraph's own.
+    await conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(LANGGRAPH_SCHEMA)))
+
+
+def get_checkpointer(settings: DatabaseSettings | None = None) -> BaseCheckpointSaver[str]:
+    """LangGraph's checkpointer, created on first call: Postgres (its own psycopg pool, opened by
+    `open_checkpointer`), or in memory when the database is SQLite (tests, offline dev), where threads don't
+    outlive the process."""
+    global _checkpoint_pool, _checkpointer
+    if _checkpointer is None:
+        settings = settings or DatabaseSettings()
+        if settings.is_sqlite:
+            _checkpointer = InMemorySaver()
+        else:
+            # Autocommit and dict rows are what the saver expects. A transaction-mode pooler can't keep prepared
+            # statements (or a session's search_path, which this pool sets per connection: use session mode).
+            kwargs: dict[str, Any] = {"autocommit": True, "row_factory": dict_row}
+            if settings.db_transaction_pooler:
+                kwargs["prepare_threshold"] = None
+            _checkpoint_pool = AsyncConnectionPool(
+                checkpoint_conninfo(settings),
+                min_size=1,
+                max_size=settings.db_checkpoint_pool_size,
+                kwargs=kwargs,
+                configure=_use_langgraph_schema,
+                # Checks each connection on checkout, like the SQLAlchemy pool's pre-ping.
+                check=AsyncConnectionPool.check_connection,
+                timeout=settings.db_pool_timeout,
+                open=False,
+            )
+            _checkpointer = AsyncPostgresSaver(_checkpoint_pool)
+    return _checkpointer
+
+
+async def open_checkpointer(settings: DatabaseSettings | None = None) -> BaseCheckpointSaver[str]:
+    """Creates the checkpointer and opens its pool. The pool connects in the background, so a database that's
+    down doesn't stop the app from starting."""
+    checkpointer = get_checkpointer(settings)
+    if _checkpoint_pool is not None and _checkpoint_pool.closed:
+        await _checkpoint_pool.open(wait=False)
+    return checkpointer
+
+
+async def setup_checkpointer(settings: DatabaseSettings | None = None) -> None:
+    """Creates LangGraph's schema and tables, or brings them up to date. Safe to run again. The deploy runs it
+    next to `alembic upgrade head` (`python -m app.core.setup_checkpoints`)."""
+    checkpointer = await open_checkpointer(settings)
+    if not isinstance(checkpointer, AsyncPostgresSaver) or _checkpoint_pool is None:
+        return
+    async with _checkpoint_pool.connection() as conn:
+        await conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(LANGGRAPH_SCHEMA)))
+    await checkpointer.setup()
+
+
 async def open_connection(settings: DatabaseSettings | None = None) -> None:
     """Creates every client at startup, so the first request doesn't pay for it."""
     get_postgres_client(settings)
+    await open_checkpointer(settings)
     get_http_client()
 
 
@@ -114,8 +196,17 @@ async def close_http_client() -> None:
     _http_client = None
 
 
+async def close_checkpointer() -> None:
+    global _checkpoint_pool, _checkpointer
+    if _checkpoint_pool is not None:
+        await _checkpoint_pool.close()
+    _checkpoint_pool = None
+    _checkpointer = None
+
+
 async def close_connection() -> None:
     await close_http_client()
+    await close_checkpointer()
     await close_postgres_client()
 
 

@@ -1,11 +1,13 @@
 import logging
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, status
 
 from app.api.dependencies import AiEditServiceDep, CurrentUserDep, ai_edit_slot
 from app.api.disconnect import cancel_on_disconnect
 from app.schemas.ai_edit import AiEditRequest, AiEditResult
+from app.schemas.ai_thread import AiThreadRead
 from app.schemas.common import ApiResponse, ErrorResponse
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,7 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 ERRORS: dict[int | str, dict[str, Any]] = {
     status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+    status.HTTP_409_CONFLICT: {"model": ErrorResponse},
     status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
     status.HTTP_429_TOO_MANY_REQUESTS: {"model": ErrorResponse},
     status.HTTP_502_BAD_GATEWAY: {"model": ErrorResponse},
@@ -34,7 +37,25 @@ async def edit(
 ) -> ApiResponse[AiEditResult]:
     """Tier 1: search/replace edits on the files sent, checked on the server, or `{tier: 2, reason}` when the
     change needs a deeper edit. The SPA applies the edits itself. Closing the request (Stop) cancels the
-    model call."""
+    model call. The site's thread (`projectId`) keeps the chat; 409 `ai_run_in_progress` while it has a request
+    in progress."""
     result = await cancel_on_disconnect(request, ai_edit.edit(user.id, body))
     logger.info("AI edit", extra={"user_id": str(user.id), "tier": result.tier})
     return ApiResponse(data=result)
+
+
+@router.get("/threads/{project_id}", summary="The site's AI chat", responses=ERRORS)
+async def get_thread(project_id: UUID, user: CurrentUserDep, ai_edit: AiEditServiceDep) -> ApiResponse[AiThreadRead]:
+    """The site's finished requests, oldest first; empty for a site with no AI requests yet."""
+    return ApiResponse(data=await ai_edit.thread(user.id, project_id))
+
+
+@router.delete(
+    "/threads/{project_id}",
+    summary="Start the site's AI chat over",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=ERRORS,
+)
+async def delete_thread(project_id: UUID, user: CurrentUserDep, ai_edit: AiEditServiceDep) -> None:
+    """Deletes the chat and the stored requests (Start over). The site itself isn't touched."""
+    await ai_edit.start_over(user.id, project_id)

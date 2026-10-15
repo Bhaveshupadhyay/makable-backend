@@ -1,34 +1,28 @@
-import json
+import asyncio
 import logging
-from typing import Protocol
-from uuid import UUID
+from typing import Any, Protocol
+from uuid import UUID, uuid4
 
-from pydantic import TypeAdapter, ValidationError
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import Durability
 
+from app.agents.ai_edit import EditRun, compile_edit_graph, result_of, run_input
 from app.clients.model import AiKeyInvalidError, ModelClient
-from app.constants.ai_edit import FORBIDDEN_PATH, MAX_ATTEMPTS, SITE_WIDE
-from app.core.exceptions import ExternalServiceError
-from app.schemas.ai_edit import (
-    AiEditDebug,
-    AiEditRequest,
-    AiEditTier1,
-    AiEditTier2,
-    FileEdit,
-    ModelAnswer,
-    ModelEdits,
-    ModelEscalation,
-)
+from app.constants.ai_edit import AiEditOutcome
+from app.core.exceptions import AppError, ConflictError, ExternalServiceError, NotFoundError
+from app.core.limits import KeyLock
+from app.models.ai_thread import AiThread
+from app.repositories.ai_thread import AiEditRecordRepository, AiThreadRepository
+from app.repositories.unit_of_work import UnitOfWork
+from app.schemas.ai_edit import AiEditDebug, AiEditRequest, AiEditTier1, AiEditTier2, FileEdit
 from app.schemas.ai_key import ModelChoice
-from app.schemas.chat import ChatMessage
-from app.services.ai_edit_prompt import SYSTEM_PROMPT, build_user_prompt, repair_prompt
-from app.services.ai_edit_repair import rejection_report
-from app.utils.file_edits import AppliedEdits, FileEditError, apply_file_edits
-from app.utils.portfolio_source import PortfolioSourceError, parse_portfolio_source
-from app.utils.syntax_check import locate_syntax_error, locate_unbalanced_brace, script_language
+from app.schemas.ai_thread import AiEditRecordCreate, AiThreadCreate, AiThreadRead, AiTurnRead
 
 logger = logging.getLogger(__name__)
 
-_ANSWER: TypeAdapter[ModelEdits | ModelEscalation] = TypeAdapter(ModelAnswer)
+# The checkpoint is written when a run ends (or pauses), not after every step: a run is short, and a cancelled or
+# failed one then leaves nothing half-done behind (only its input), which the next run's input replaces.
+DURABILITY: Durability = "exit"
 
 
 class AiEditRejectedError(ExternalServiceError):
@@ -36,77 +30,14 @@ class AiEditRejectedError(ExternalServiceError):
     message = "The AI couldn't make a change that works. Try asking in a different way."
 
 
-def classify(request: AiEditRequest) -> str | None:
-    """The reason a request goes straight to Tier 2 without a model call, or None for Tier 1."""
-    if not request.files:
-        return "No file was found for this change."
-    match = SITE_WIDE.search(request.instruction)
-    if match:
-        return f'"{match.group(0)}" sounds like a change across the site.'
-    return None
+class AiRunInProgressError(ConflictError):
+    code = "ai_run_in_progress"
+    message = "The AI is still working on this site. Wait for it to finish, or stop it first."
 
 
-def check_edits(request: AiEditRequest, edits: list[FileEdit]) -> AppliedEdits:
-    """Dry-runs the edits on the files that were sent, the way the browser will apply them, and checks the
-    result still parses: the content file must stay a valid portfolio, scripts must have no syntax errors, and
-    CSS braces must balance. Edits that change nothing are rejected too, so the user is never told about a
-    change that wasn't made.
-
-    Raises:
-        FileEditError: An edit can't be applied, or it breaks a file. The message is written for the model.
-    """
-    forbidden = next((i for i, e in enumerate(edits, start=1) if FORBIDDEN_PATH.search(e.path)), None)
-    if forbidden:
-        path = edits[forbidden - 1].path
-        raise FileEditError(f"{path} can't be edited", kind="forbidden", edit=forbidden, path=path)
-    applied = apply_file_edits({f.path: f.content for f in request.files}, edits)
-    if not applied.changed:
-        raise FileEditError(
-            "the edits don't change any file; make the requested change, or escalate if you can't", kind="no_change"
-        )
-    same = next((i for i, e in enumerate(edits, start=1) if e.search == e.replace), None)
-    if same:
-        path = edits[same - 1].path
-        raise FileEditError(
-            f"edit {same} ({path}): its search and replace are the same, so it changes nothing",
-            kind="no_change",
-            edit=same,
-            path=path,
-        )
-    for path in applied.changed:
-        found = _problem_in(path, applied.files[path], request.template.content_path)
-        if found:
-            problem, offset = found
-            raise FileEditError(f"{path}: {problem}", kind="broken_file", path=path, offset=offset)
-    return applied
-
-
-def _problem_in(path: str, code: str, content_path: str) -> tuple[str, int | None] | None:
-    """What's wrong with an edited file, and where (a character offset) when that's known."""
-    if path == content_path:
-        try:
-            parse_portfolio_source(code)
-        except PortfolioSourceError as err:
-            return str(err), None
-        return None
-    language = script_language(path)
-    if language is not None:
-        return locate_syntax_error(code, language)
-    if path.endswith(".css"):
-        return locate_unbalanced_brace(code)
-    return None
-
-
-def extract_json(text: str) -> object:
-    """Pulls the JSON object out of a reply that may be wrapped in fences or prose.
-
-    Raises:
-        ValueError: The reply has no JSON object.
-    """
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        raise ValueError("The model did not return JSON")
-    return json.loads(text[start : end + 1])
+class AiThreadNotFoundError(NotFoundError):
+    code = "ai_thread_not_found"
+    message = "This site's AI chat wasn't found."
 
 
 class ModelSource(Protocol):
@@ -118,22 +49,38 @@ class ModelSource(Protocol):
 
 
 class AiEditService:
-    """Tier 1 AI edits: asks the model for search/replace edits on the files the browser sent, and checks
-    them before answering. Prompts and the model call stay on the server."""
+    """Tier 1 AI edits on the LangGraph agent (`app/agents/ai_edit`), one thread per site: asks the model for
+    search/replace edits on the files the browser sent and checks them before answering. Prompts and the model
+    call stay on the server. The thread keeps the chat; `ai_edit_requests` keeps each request as a row."""
 
-    def __init__(self, models: ModelSource, *, debug: bool = False) -> None:
+    def __init__(
+        self,
+        models: ModelSource,
+        threads: AiThreadRepository,
+        records: AiEditRecordRepository,
+        uow: UnitOfWork,
+        checkpointer: BaseCheckpointSaver[str],
+        runs: KeyLock,
+        *,
+        debug: bool = False,
+    ) -> None:
         self._models = models
+        self._threads = threads
+        self._records = records
+        self._uow = uow
+        self._checkpointer = checkpointer
+        self._graph = compile_edit_graph(checkpointer)
+        self._runs = runs
         self._debug = debug
 
     async def edit(self, user_id: UUID, request: AiEditRequest) -> AiEditTier1 | AiEditTier2:
         """Answers Tier 1 edits, or hands the request to Tier 2 (by rule, or because the model escalated).
-        The model is the one the user picked (`request.model`), or makable's own.
-
-        A rejected answer is sent back once with a repair prompt and a report of what failed and where (the
-        file's real text at that place), because free models often get the shape or the search text wrong the
-        first time.
+        The model is the one the user picked (`request.model`), or makable's own. The earlier requests in the
+        prompt come from the site's thread, which is created on its first request.
 
         Raises:
+            AiThreadNotFoundError: The site's thread is another user's.
+            AiRunInProgressError: The site already has a request in progress.
             AiModelRequiredError: Nothing was picked and there's no makable model.
             AiKeyNotFoundError: The picked key isn't the user's (any more).
             AiModelNotEnabledError: The picked model isn't turned on for the key.
@@ -142,52 +89,143 @@ class AiEditService:
             ModelUnavailableError: The model couldn't be reached or answered with an error.
             AiEditRejectedError: The model's answer was rejected on every attempt.
         """
-        rule = classify(request)
-        if rule:
-            return AiEditTier2(reason=rule, debug=self._debug_info("", 0, None))
-        model = await self._models.model_for(user_id, request.model)
-        try:
-            return await self._edit(request, model)
-        except AiKeyInvalidError:
-            if request.model is not None:
-                await self._models.key_refused(user_id, request.model.key_id)
-            raise
-
-    async def _edit(self, request: AiEditRequest, model: ModelClient) -> AiEditTier1 | AiEditTier2:
-        user_prompt = build_user_prompt(request)
-        # One user turn, no system role: the free models behind OmniRoute ignore a system message and answer
-        # in their own agent format, but follow the same text in the user turn.
-        messages = [ChatMessage(role="user", content=f"{SYSTEM_PROMPT}\n\n{user_prompt}")]
-        problem = ""
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            answer: ModelEdits | ModelEscalation | None = None
-            reply = await model.complete(messages)
+        project_id = request.project_id
+        async with self._runs.hold((user_id, project_id)):
+            await self._own_thread(user_id, project_id, create=True)
+            run = EditRun(request, pick_model=lambda: self._models.model_for(user_id, request.model))
+            run_id = uuid4()
             try:
-                answer = _ANSWER.validate_python(extract_json(reply))
-                if isinstance(answer, ModelEscalation):
-                    return AiEditTier2(reason=answer.escalate, debug=self._debug_info(user_prompt, attempt, model))
-                check_edits(request, answer.edits)
-            except (ValueError, FileEditError) as err:  # ValidationError and JSONDecodeError are ValueErrors.
-                problem = _describe(err)
-                logger.info("AI edit answer rejected", extra={"attempt": attempt, "problem": problem[:300]})
-                # A separate prompt for the retry: how to repair an answer, and exactly what failed and where.
-                edits = answer.edits if isinstance(answer, ModelEdits) else None
-                messages += [
-                    ChatMessage(role="assistant", content=reply),
-                    ChatMessage(role="user", content=repair_prompt(rejection_report(request, edits, err))),
-                ]
-                continue
-            debug = self._debug_info(user_prompt, attempt, model)
-            return AiEditTier1(summary=answer.summary, edits=answer.edits, debug=debug)
-        raise AiEditRejectedError(details={"problem": problem[:300]} if self._debug else None)
+                state = await self._graph.ainvoke(
+                    run_input(run_id, request), self._config(project_id), context=run, durability=DURABILITY
+                )
+            except asyncio.CancelledError:
+                await self._record_quietly(user_id, request, run, AiEditOutcome.CANCELLED, summary="stopped")
+                raise
+            except AiKeyInvalidError as err:
+                if request.model is not None:
+                    await self._models.key_refused(user_id, request.model.key_id)
+                await self._record_quietly(user_id, request, run, AiEditOutcome.FAILED, summary=err.code)
+                raise
+            except Exception as err:
+                code = err.code if isinstance(err, AppError) else type(err).__name__
+                await self._record_quietly(user_id, request, run, AiEditOutcome.FAILED, summary=code)
+                raise
+            return await self._finish(user_id, request, run, state)
 
-    def _debug_info(self, model_input: str, attempts: int, model: ModelClient | None) -> AiEditDebug | None:
+    async def thread(self, user_id: UUID, project_id: UUID) -> AiThreadRead:
+        """The site's chat, oldest first. A site with no thread yet has an empty one.
+
+        Raises:
+            AiThreadNotFoundError: The thread is another user's.
+        """
+        thread = await self._own_thread(user_id, project_id, create=False)
+        turns: list[AiTurnRead] = []
+        if thread is not None:
+            snapshot = await self._graph.aget_state(self._config(project_id))
+            turns = [AiTurnRead.model_validate(t) for t in snapshot.values.get("turns", [])]
+        return AiThreadRead(project_id=project_id, status="idle", turns=turns)
+
+    async def start_over(self, user_id: UUID, project_id: UUID) -> None:
+        """Deletes the site's thread (Start over): its checkpoints, its requests and the thread itself. The
+        site's files aren't touched. Nothing to delete is fine.
+
+        Raises:
+            AiThreadNotFoundError: The thread is another user's.
+            AiRunInProgressError: A request is in progress on the site.
+        """
+        async with self._runs.hold((user_id, project_id)):
+            thread = await self._own_thread(user_id, project_id, create=False)
+            if thread is None:
+                return
+            # Checkpoints first: if that fails, the thread row is still there to try again with.
+            await self._checkpointer.adelete_thread(str(project_id))
+            await self._records.delete_for_thread(project_id)
+            await self._threads.delete(thread)
+            await self._uow.commit()
+            logger.info("AI thread deleted", extra={"user_id": str(user_id), "project_id": str(project_id)})
+
+    async def _finish(
+        self, user_id: UUID, request: AiEditRequest, run: EditRun, state: dict[str, Any]
+    ) -> AiEditTier1 | AiEditTier2:
+        result = result_of(state)
+        outcome = AiEditOutcome(result["outcome"])
+        attempts = state.get("attempt", 0)
+        summary = result.get("summary") or result.get("reason") or result.get("problem")
+        await self._record(user_id, request, run, outcome, tier=result.get("tier"), summary=summary, attempts=attempts)
+        await self._prune(request.project_id)
+        if outcome == AiEditOutcome.REJECTED:
+            problem = result.get("problem", "")
+            raise AiEditRejectedError(details={"problem": problem[:300]} if self._debug else None)
+        debug = self._debug_info(run, attempts)
+        if outcome == AiEditOutcome.ESCALATED:
+            return AiEditTier2(reason=result.get("reason", ""), debug=debug)
+        edits = [FileEdit.model_validate(e) for e in result.get("edits", [])]
+        return AiEditTier1(summary=result.get("summary", ""), edits=edits, debug=debug)
+
+    async def _own_thread(self, user_id: UUID, project_id: UUID, *, create: bool) -> AiThread | None:
+        """The site's thread if it's the user's; with `create`, made if there's none (and committed, so the model
+        call doesn't hold a transaction open)."""
+        thread = await self._threads.get(project_id)
+        if thread is not None and thread.user_id != user_id:
+            raise AiThreadNotFoundError()
+        if thread is None and create:
+            thread = await self._threads.create(AiThreadCreate(id=project_id, user_id=user_id))
+            await self._uow.commit()
+        return thread
+
+    async def _record(
+        self,
+        user_id: UUID,
+        request: AiEditRequest,
+        run: EditRun,
+        outcome: AiEditOutcome,
+        *,
+        tier: int | None = None,
+        summary: str | None = None,
+        attempts: int = 0,
+    ) -> None:
+        """Writes the request's row and marks the thread as used."""
+        await self._records.add(
+            AiEditRecordCreate(
+                thread_id=request.project_id,
+                user_id=user_id,
+                instruction=request.instruction,
+                selection=request.target.model_dump(mode="json") if request.target else None,
+                model=run.model.name if run.model else None,
+                tier=tier,
+                outcome=outcome,
+                summary=summary,
+                attempts=attempts,
+            )
+        )
+        await self._threads.touch(request.project_id)
+        await self._uow.commit()
+
+    async def _record_quietly(
+        self, user_id: UUID, request: AiEditRequest, run: EditRun, outcome: AiEditOutcome, *, summary: str
+    ) -> None:
+        """Records a request that ended with an error, without hiding that error if recording fails too."""
+        try:
+            await self._uow.rollback()
+            await self._record(user_id, request, run, outcome, summary=summary)
+        except Exception:
+            logger.exception("Couldn't record an AI edit request", extra={"outcome": outcome.value})
+
+    async def _prune(self, project_id: UUID) -> None:
+        """Keeps only the thread's latest checkpoint: it has the whole chat, and nothing reads older ones."""
+        try:
+            await self._checkpointer.aprune([str(project_id)], strategy="keep_latest")
+        except NotImplementedError:
+            pass  # The in-memory checkpointer (tests, SQLite dev) can't prune; it's gone at exit anyway.
+        except Exception:
+            # Best effort: the next run prunes again.
+            logger.warning("Couldn't prune an AI thread's checkpoints", exc_info=True)
+
+    @staticmethod
+    def _config(project_id: UUID) -> Any:
+        return {"configurable": {"thread_id": str(project_id)}}
+
+    def _debug_info(self, run: EditRun, attempts: int) -> AiEditDebug | None:
         if not self._debug:
             return None
-        return AiEditDebug(model_input=model_input, attempts=attempts, model=model.name if model else "")
-
-
-def _describe(err: Exception) -> str:
-    if isinstance(err, ValidationError):
-        return "; ".join(f"{'.'.join(str(p) for p in e['loc']) or 'the answer'}: {e['msg']}" for e in err.errors()[:5])
-    return str(err)
+        return AiEditDebug(model_input=run.user_prompt, attempts=attempts, model=run.model.name if run.model else "")
