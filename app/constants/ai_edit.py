@@ -32,3 +32,7 @@ SITE_WIDE = re.compile(
 
 # Tries per request: the first answer, plus one retry that tells the model why its answer was rejected.
 MAX_ATTEMPTS = 2
+
+# Postgres schema for LangGraph's checkpoint tables. `AsyncPostgresSaver.setup()` creates them there (through the
+# connection's search_path), not Alembic, so `alembic/env.py` leaves the schema out.
+LANGGRAPH_SCHEMA = "langgraph"
