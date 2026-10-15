@@ -109,13 +109,11 @@ class GithubClient(Protocol):
         self, access_token: str, name: str, description: str, *, private: bool, homepage: str | None = None
     ) -> GithubRepo: ...
 
+    async def set_private(self, access_token: str, full_name: str, private: bool) -> GithubRepo: ...
+
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None: ...
 
     async def list_dir(self, access_token: str, full_name: str, path: str) -> list[GithubDirEntry]: ...
-
-    async def put_file(
-        self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
-    ) -> str: ...
 
     async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead: ...
 
@@ -135,8 +133,6 @@ class GithubClient(Protocol):
     async def get_commit(self, access_token: str, full_name: str, sha: str) -> GithubCommit: ...
 
     async def get_archive(self, access_token: str, full_name: str, ref: str) -> dict[str, bytes]: ...
-
-    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str: ...
 
     async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey: ...
 
@@ -220,6 +216,18 @@ class HttpGithubClient:
             raise GithubRepoExistsError()
         return _parse(GithubRepo, res, "creating the repository")
 
+    async def set_private(self, access_token: str, full_name: str, private: bool) -> GithubRepo:
+        """Makes a repository private or public.
+
+        Raises:
+            GithubNotFoundError: The repository doesn't exist.
+            GithubError: GitHub refused (e.g. an organisation policy) or the request failed.
+        """
+        res = await self._request("PATCH", f"/repos/{full_name}", access_token, json={"private": private})
+        if res.status_code == status.HTTP_404_NOT_FOUND:
+            raise GithubNotFoundError()
+        return _parse(GithubRepo, res, "changing the repository's visibility")
+
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
         """A text file on the default branch, or None if there's no file at `path`.
 
@@ -253,31 +261,6 @@ class HttpGithubClient:
         if not isinstance(data, list):
             return []
         return [GithubDirEntry.model_validate(entry) for entry in data]
-
-    async def put_file(
-        self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
-    ) -> str:
-        """Creates or replaces a text file with one commit on the default branch. Returns the new blob SHA.
-
-        `sha` is the SHA of the file being replaced (None to create it). GitHub refuses the write if the file
-        has changed since, so a concurrent change is never overwritten.
-
-        Raises:
-            GithubConflictError: The file changed since `sha` (or exists although `sha` is None).
-            GithubNotFoundError: The repository doesn't exist (yet).
-            GithubError: The request failed.
-        """
-        body: dict[str, Any] = {"message": message, "content": base64.b64encode(content.encode()).decode()}
-        if sha is not None:
-            body["sha"] = sha
-        res = await self._request("PUT", _contents_url(full_name, path), access_token, json=body)
-        if res.status_code == status.HTTP_409_CONFLICT or (
-            res.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT and sha is None
-        ):
-            raise GithubConflictError()
-        if res.status_code == status.HTTP_404_NOT_FOUND:
-            raise GithubNotFoundError()
-        return str(_json(res, "writing the file")["content"]["sha"])
 
     async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead:
         """The commit a branch points to, and its tree.
@@ -412,21 +395,6 @@ class HttpGithubClient:
         except httpx.HTTPError as err:
             raise GithubError(f"GitHub couldn't be reached: {err}") from err
         return read_archive(bytes(data))
-
-    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
-        """A text file's contents by its blob SHA (which never changes, unlike a path on a branch).
-
-        Raises:
-            GithubNotFoundError: No such blob.
-            GithubError: The request failed, or the file isn't UTF-8 text.
-        """
-        res = await self._request("GET", f"/repos/{full_name}/git/blobs/{sha}", access_token)
-        if res.status_code == status.HTTP_404_NOT_FOUND:
-            raise GithubNotFoundError()
-        try:
-            return base64.b64decode(_json(res, "reading the file")["content"]).decode()
-        except (KeyError, TypeError, ValueError) as err:
-            raise GithubError("reading the file failed: not a text file") from err
 
     async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey:
         """The public key the repo's Actions secrets are encrypted with.

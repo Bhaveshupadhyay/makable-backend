@@ -5,10 +5,10 @@ from fastapi.testclient import TestClient
 
 from app.api import dependencies
 from app.core.limits import ConcurrencyLimit, PerKeyLimit
+from app.tests.ai_edit_fixtures import PROJECT_ID, create_site
 from app.tests.api.test_auth import sign_in
-from app.tests.session_fixtures import PROJECT_ID, save_body
 
-SESSIONS = "/api/v1/workspace/sessions"
+SITE = f"/api/v1/sites/{PROJECT_ID}"
 
 
 def test_an_oversized_body_is_refused_before_it_is_read(client: TestClient) -> None:
@@ -33,16 +33,17 @@ def test_a_streamed_body_is_cut_off_at_the_limit(client: TestClient) -> None:
 
 
 def test_routes_that_need_more_get_their_own_limit(client: TestClient) -> None:
-    # 1 MB is fine for an AI edit (six 60,000-character files); it gets as far as the sign-in check.
+    # 1 MB is fine for an AI edit (with a picture) or a save of manual edits; it gets as far as the sign-in check.
     assert client.post("/api/v1/ai/edit", content=b"x" * 1_000_000).status_code == 401
     assert client.post("/api/v1/ai/edit", content=b"x" * 2_000_001).status_code == 413
+    assert client.put(f"{SITE}/files", content=b"x" * 1_000_000).status_code == 401
 
 
 def test_a_full_worker_answers_busy_with_retry_after(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     sign_in(client)
-    monkeypatch.setattr(dependencies, "WORKSPACE_SLOTS", ConcurrencyLimit(0))
+    monkeypatch.setattr(dependencies, "SITE_SLOTS", ConcurrencyLimit(0))
 
-    res = client.get(f"{SESSIONS}/latest")
+    res = client.get("/api/v1/sites")
 
     assert res.status_code == 503
     assert res.headers["retry-after"] == "5"
@@ -52,11 +53,12 @@ def test_a_full_worker_answers_busy_with_retry_after(client: TestClient, monkeyp
 
 def test_saving_too_often_is_a_429_with_the_wait(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     sign_in(client)
-    monkeypatch.setattr(dependencies, "WORKSPACE_SAVES", PerKeyLimit(burst=1, every=60))
-    first = client.put(f"{SESSIONS}/{PROJECT_ID}", json=save_body())
+    base = create_site(client)
+    monkeypatch.setattr(dependencies, "SITE_SAVES", PerKeyLimit(burst=1, every=60))
+    first = client.put(f"{SITE}/files", json={"baseCommit": base, "files": {"src/a.ts": "export {}\n"}})
     assert first.status_code == 200
 
-    again = client.put(f"{SESSIONS}/{PROJECT_ID}", json=save_body(first.json()["data"]["sha"], []))
+    again = client.put(f"{SITE}/files", json={"baseCommit": first.json()["data"]["commitSha"], "files": {}})
 
     assert again.status_code == 429
     assert again.json()["error"]["code"] == "too_many_requests"

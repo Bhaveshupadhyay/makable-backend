@@ -6,8 +6,6 @@ from enum import StrEnum
 
 MAX_INSTRUCTION = 2000
 MAX_ELEMENT_HTML = 4000
-# The workspace's AI-edited files (legacy template sites) are capped at this size.
-MAX_FILE_CHARS = 60_000
 MAX_EDITS = 10
 # A file an AI edit leaves (or creates) can be at most this long (JavaScript string length, like the browser).
 MAX_EDITED_FILE_CHARS = 200_000

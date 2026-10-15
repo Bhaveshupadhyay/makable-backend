@@ -16,7 +16,7 @@ from uuid import UUID
 
 from app.constants.site import MANIFEST_FORMAT, MANIFEST_VERSION
 
-# The versions the published templates were built and tested with.
+# The versions makable's earlier site templates were built and tested with, in the preview and the deploy.
 DEPENDENCIES = {"lucide-react": "^1.52.0", "react": "^19.2.8", "react-dom": "^19.2.8"}
 DEV_DEPENDENCIES = {
     "@tailwindcss/vite": "^4.3.3",

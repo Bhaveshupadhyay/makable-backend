@@ -319,6 +319,21 @@ class SiteService:
         snapshot = await self.snapshot(token, repo, head.commit_sha)
         return SiteFiles(site=read, **snapshot.model_dump())
 
+    async def github_repo(self, user: UserRead, project_id: UUID) -> tuple[str, GithubRepo]:
+        """The user's GitHub token and the site's repo (checked), for services that call GitHub about the repo
+        itself (publishing). Ends the request's transaction.
+
+        Raises:
+            The errors of `access`.
+        """
+        _, token, repo = await self._site_repo(user, project_id)
+        await self._uow.rollback()
+        return token, repo
+
+    def forget_repo(self, project_id: UUID, full_name: str) -> None:
+        """Drops a repo from the verified cache (e.g. its visibility changed)."""
+        self._verified.discard(project_id, full_name)
+
     async def access(self, user: UserRead, project_id: UUID) -> SiteAccess:
         """The site's repo, checked, for the AI agent. Ends the request's transaction: what follows is slow.
 
@@ -461,15 +476,23 @@ class SiteService:
         return await self._snapshots.get(repo.full_name, commit_sha, download)
 
     async def commit(
-        self, token: str, repo: GithubRepo, base_commit: str, changes: dict[str, str | None], message: str
+        self,
+        token: str,
+        repo: GithubRepo,
+        base_commit: str,
+        changes: dict[str, str | None],
+        message: str,
+        *,
+        own_files: bool = False,
     ) -> str:
-        """Writes `changes` as one commit on top of `base_commit`, which must be where the branch is.
+        """Writes `changes` as one commit on top of `base_commit`, which must be where the branch is. Only makable's
+        own writes (`own_files`: the deploy workflow, the manifest) may touch `.github/` or `.makable/`.
 
         Raises:
             SiteConflictError: The branch isn't at `base_commit`.
             SiteInvalidError: A change touches makable's or git's own files.
         """
-        if any(RESERVED_PATH.match(path) for path in changes):
+        if not own_files and any(RESERVED_PATH.match(path) for path in changes):
             raise SiteInvalidError("makable's own files can't be changed like this.")
         head = await self.branch_head(token, repo)
         if head.commit_sha != base_commit:

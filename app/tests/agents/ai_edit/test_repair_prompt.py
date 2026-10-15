@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.agents.ai_edit.prompts.repair import MAX_REPORT_CHARS, rejection_report
@@ -5,7 +7,6 @@ from app.agents.ai_edit.tools.answer import extract_json
 from app.agents.ai_edit.tools.edits import check_edits
 from app.schemas.ai_edit import FileEdit, ModelEdits
 from app.tests.ai_edit_fixtures import HERO_PATH
-from app.tests.portfolio_fixtures import PORTFOLIO, render_portfolio_source
 from app.utils.file_edits import FileEditError
 
 BUNDLE_PATH = "assets/MainContainer-CNANTDSP.js"
@@ -16,18 +17,25 @@ BUNDLE = (
 )
 
 
+# A content file: an object literal, as a built site's data file looks.
+CONTENT = (
+    "export const portfolio = "
+    + json.dumps({"profile": {"name": "Ada", "headline": "Engineer"}, "skills": ["TypeScript"]}, indent=2)
+    + "\n"
+)
+
 # The site the first tests ran on: a small React component, a content file and a stylesheet.
 HERO = 'export function Hero() {\n  return <a className="bg-blue-600">Contact</a>\n}\n'
 FILES = {
     HERO_PATH: HERO,
-    "src/content/portfolio.ts": render_portfolio_source(PORTFOLIO),
+    "src/content/portfolio.ts": CONTENT,
     "src/index.css": ":root { --bg: #fff; }\n",
 }
 
 
 def hublend_files() -> dict[str, str]:
     """A built site (a minified bundle) with its content file: where models miss most."""
-    return {BUNDLE_PATH: BUNDLE, "content/portfolio.js": render_portfolio_source(PORTFOLIO)}
+    return {BUNDLE_PATH: BUNDLE, "content/portfolio.js": CONTENT}
 
 
 def report_for(files: dict[str, str], edits: list[FileEdit]) -> str:

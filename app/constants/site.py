@@ -22,7 +22,8 @@ MAX_SAVE_FILES = 200
 MAX_FILE_CHARS = 500_000
 MAX_SAVE_CHARS = 1_500_000
 MAX_COMMIT_MESSAGE = 200
-# A save has this long (seconds) to reach its commit; the commit itself isn't cut short (see WorkspaceService).
+# A save has this long (seconds) to reach its commit; the commit itself isn't cut short, since stopping it part-way
+# could move the branch without the browser knowing.
 SAVE_DEADLINE_SECONDS = 20
 
 # Snapshots of sites at a commit (commits never change), kept in memory per worker for this many seconds, up to

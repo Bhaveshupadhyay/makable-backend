@@ -20,20 +20,16 @@ from app.clients.deploy_platforms import DeployPlatformClient, HttpDeployPlatfor
 from app.clients.github import GithubClient, HttpGithubClient
 from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
-from app.clients.templates import HttpTemplateCatalog, TemplateCatalogClient
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_CREATIONS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
     MAX_CONCURRENT_SITE_REQUESTS,
-    MAX_CONCURRENT_WORKSPACE_REQUESTS,
     PUBLISH_BURST,
     PUBLISH_EVERY_SECONDS,
     SITE_SAVE_BURST,
     SITE_SAVE_EVERY_SECONDS,
-    WORKSPACE_SAVE_BURST,
-    WORKSPACE_SAVE_EVERY_SECONDS,
 )
 from app.constants.auth import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, Role
 from app.core.client import get_checkpointer, get_db_session, get_http_client
@@ -61,7 +57,6 @@ from app.services.health_service import HealthService
 from app.services.publish_service import PublishService
 from app.services.site_create_service import SiteCreateService
 from app.services.site_service import SiteService
-from app.services.workspace_service import WorkspaceService
 
 # --- App-wide singletons ---
 
@@ -119,10 +114,6 @@ def get_model_client_factory(http: HttpClientDep, settings: SettingsDep) -> Mode
 
 def get_ai_provider_client(http: HttpClientDep) -> AiProviderClient:
     return HttpAiProviderClient(http)
-
-
-def get_template_catalog(http: HttpClientDep, settings: SettingsDep) -> TemplateCatalogClient:
-    return HttpTemplateCatalog(http, settings.template_catalog_url)
 
 
 def get_deploy_platform_client(http: HttpClientDep) -> DeployPlatformClient:
@@ -231,28 +222,16 @@ def get_ai_edit_service(
     return AiEditService(models, site_service, sites, records, uow, checkpointer, AI_RUNS, debug=settings.ai_debug)
 
 
-def get_workspace_service(
-    github: Annotated[GithubClient, Depends(get_github_client)],
-    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
-    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
-) -> WorkspaceService:
-    return WorkspaceService(github, credentials, cipher)
-
-
 def get_publish_service(
     github: Annotated[GithubClient, Depends(get_github_client)],
-    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
-    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
-    templates: Annotated[TemplateCatalogClient, Depends(get_template_catalog)],
+    sites: Annotated[SiteService, Depends(get_site_service)],
     platforms: Annotated[DeployPlatformClient, Depends(get_deploy_platform_client)],
-    workspace: Annotated[WorkspaceService, Depends(get_workspace_service)],
 ) -> PublishService:
-    return PublishService(github, credentials, cipher, templates, platforms, workspace)
+    return PublishService(github, sites, platforms)
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
-WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 
 
 def get_site_create_service(
@@ -306,8 +285,6 @@ def require_roles(*roles: Role) -> Callable[[UserRead], Awaitable[UserRead]]:
 
 AI_EDIT_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS)
 AI_CREATE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_CREATIONS)
-WORKSPACE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS)
-WORKSPACE_SAVES = PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS)
 PUBLISH_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS)
 PUBLISHES = PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS)
 AI_KEY_CHECKS = PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
@@ -334,27 +311,6 @@ async def ai_create_slot() -> AsyncIterator[None]:
         ServiceBusyError: This worker has as many creations in progress as it allows.
     """
     async with AI_CREATE_SLOTS.slot():
-        yield
-
-
-async def workspace_slot() -> AsyncIterator[None]:
-    """A slot for a workspace request (it waits on GitHub), held until the response is done.
-
-    Raises:
-        ServiceBusyError: This worker has as many in progress as it allows.
-    """
-    async with WORKSPACE_SLOTS.slot():
-        yield
-
-
-async def workspace_save_limit(user: CurrentUserDep) -> AsyncIterator[None]:
-    """One save at a time per user, in bursts of at most `WORKSPACE_SAVE_BURST`, then one per
-    `WORKSPACE_SAVE_EVERY_SECONDS`. The SPA already saves far less often; this is for clients that don't.
-
-    Raises:
-        TooManyRequestsError: The user has a save in progress, or saved too often.
-    """
-    async with WORKSPACE_SAVES.hold(user.id):
         yield
 
 

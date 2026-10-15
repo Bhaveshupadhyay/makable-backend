@@ -17,22 +17,17 @@ from app.api.dependencies import (
     get_deploy_platform_client,
     get_github_client,
     get_supabase_client,
-    get_template_catalog,
 )
-from app.clients.templates import TEMPLATE_CACHE
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_CREATIONS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
     MAX_CONCURRENT_SITE_REQUESTS,
-    MAX_CONCURRENT_WORKSPACE_REQUESTS,
     PUBLISH_BURST,
     PUBLISH_EVERY_SECONDS,
     SITE_SAVE_BURST,
     SITE_SAVE_EVERY_SECONDS,
-    WORKSPACE_SAVE_BURST,
-    WORKSPACE_SAVE_EVERY_SECONDS,
 )
 from app.core.client import close_connection, get_postgres_client, open_connection
 from app.core.config import Settings, get_settings
@@ -45,7 +40,6 @@ from app.services.ai_edit_service import AiEditService, AiRunInProgressError, Mo
 from app.services.site_create_service import SiteCreateService
 from app.services.site_service import VERIFIED_SITES, SiteService
 from app.services.site_snapshots import SITE_SNAPSHOTS
-from app.services.workspace_service import VERIFIED_REPOS
 from app.tests.ai_edit_fixtures import PROJECT_ID, REPO_NAME, USER, MakeAiEditService, add_site_repo
 from app.tests.fakes import (
     FAKE_CIPHER,
@@ -54,7 +48,6 @@ from app.tests.fakes import (
     FakeDeployPlatforms,
     FakeGithubClient,
     FakeSupabaseClient,
-    FakeTemplateCatalog,
 )
 from main import create_app
 
@@ -89,10 +82,8 @@ def settings(db_path: Path) -> Settings:
 @pytest.fixture(autouse=True)
 def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The caches and the request limits are process-wide; tests mustn't see each other's."""
-    VERIFIED_REPOS.clear()
     VERIFIED_SITES.clear()
     SITE_SNAPSHOTS.clear()
-    TEMPLATE_CACHE.clear()
     monkeypatch.setattr(dependencies, "PUBLISH_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS))
     monkeypatch.setattr(dependencies, "PUBLISHES", PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS))
     monkeypatch.setattr(
@@ -103,14 +94,7 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(dependencies, "AI_RUNS", KeyLock(AiRunInProgressError))
     monkeypatch.setattr(dependencies, "SITE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_SITE_REQUESTS))
     monkeypatch.setattr(dependencies, "SITE_SAVES", PerKeyLimit(burst=SITE_SAVE_BURST, every=SITE_SAVE_EVERY_SECONDS))
-    monkeypatch.setattr(dependencies, "WORKSPACE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS))
-    monkeypatch.setattr(
-        dependencies,
-        "WORKSPACE_SAVES",
-        PerKeyLimit(burst=WORKSPACE_SAVE_BURST, every=WORKSPACE_SAVE_EVERY_SECONDS),
-    )
     yield
-    VERIFIED_REPOS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -222,11 +206,6 @@ def supabase() -> FakeSupabaseClient:
 
 
 @pytest.fixture
-def templates() -> FakeTemplateCatalog:
-    return FakeTemplateCatalog()
-
-
-@pytest.fixture
 def platforms() -> FakeDeployPlatforms:
     return FakeDeployPlatforms()
 
@@ -242,14 +221,12 @@ def client(
     ai_providers: FakeAiProviders,
     github: FakeGithubClient,
     supabase: FakeSupabaseClient,
-    templates: FakeTemplateCatalog,
     platforms: FakeDeployPlatforms,
 ) -> Iterator[TestClient]:
     app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_github_client] = lambda: github
     app.dependency_overrides[get_supabase_client] = lambda: supabase
-    app.dependency_overrides[get_template_catalog] = lambda: templates
     app.dependency_overrides[get_deploy_platform_client] = lambda: platforms
     app.dependency_overrides[get_ai_provider_client] = lambda: ai_providers
     # The SPA's origin: in dev the Vite proxy serves the API under it.

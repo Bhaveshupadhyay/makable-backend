@@ -17,7 +17,6 @@ from app.clients.github import (
 )
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.clients.supabase import SupabaseRejectedError
-from app.clients.templates import TemplateNotFoundError
 from app.constants.ai_keys import AiProvider
 from app.constants.publish import PublishTarget
 from app.core.database import utc_now
@@ -39,7 +38,6 @@ from app.schemas.github import (
     GithubWorkflowRun,
 )
 from app.schemas.supabase import SupabaseSession, SupabaseUser
-from app.schemas.template import TemplateEntry, TemplateFiles
 from app.utils.git import git_blob_sha
 
 VALID_CODE = "good-code"
@@ -134,8 +132,6 @@ class FakeGithubClient:
         self.files: dict[str, dict[str, GithubFile]] = {}
         self.heads: dict[str, GithubBranchHead] = {}
         self.trees: dict[str, dict[str, GithubFile]] = {}
-        # Writes to a new repo fail with 404 this many times, like a repo GitHub is still setting up.
-        self.not_ready_writes = 0
         # Commits: (repo, message, changed paths).
         self.commits: list[tuple[str, str, list[str]]] = []
         # How often the workspace repo was looked up (the check a cache saves).
@@ -161,7 +157,6 @@ class FakeGithubClient:
         # Starting a workflow fails with 404 this many times, like a workflow file GitHub hasn't registered yet.
         self.dispatch_not_ready = 0
         self.run_queries: list[str | None] = []
-        self.blob_reads = 0
         # Every commit by SHA: (tree SHA, parent SHA or "", message).
         self.commit_objects: dict[str, tuple[str, str, str]] = {}
         self.archive_reads: list[tuple[str, str]] = []
@@ -185,6 +180,12 @@ class FakeGithubClient:
             raise GithubRepoExistsError()
         return self.add_repo(name, private=private, files={"README.md": f"# {name}\n"}, description=description)
 
+    async def set_private(self, access_token: str, full_name: str, private: bool) -> GithubRepo:
+        if full_name not in self.repos:
+            raise GithubNotFoundError()
+        self.repos[full_name] = self.repos[full_name].model_copy(update={"private": private})
+        return self.repos[full_name]
+
     async def get_file(self, access_token: str, full_name: str, path: str) -> GithubFile | None:
         return self.files.get(full_name, {}).get(path)
 
@@ -193,19 +194,6 @@ class FakeGithubClient:
         files = self.files.get(full_name, {})
         names = sorted({p[len(prefix) :].split("/")[0] for p in files if p.startswith(prefix)})
         return [GithubDirEntry(name=n, path=prefix + n, type="file" if prefix + n in files else "dir") for n in names]
-
-    async def put_file(
-        self, access_token: str, full_name: str, path: str, content: str, *, message: str, sha: str | None
-    ) -> str:
-        self._before_write(full_name)
-        if self.not_ready_writes:
-            self.not_ready_writes -= 1
-            raise GithubNotFoundError()
-        current = self.files[full_name].get(path)
-        if (current.sha if current else None) != sha:
-            raise GithubConflictError()
-        self._commit(full_name, message, {**self.files[full_name], path: _file(content)}, [path])
-        return self.files[full_name][path].sha
 
     async def get_branch_head(self, access_token: str, full_name: str, branch: str) -> GithubBranchHead:
         await asyncio.sleep(self.head_delay)
@@ -260,14 +248,6 @@ class FakeGithubClient:
         return {
             path: _RAW.get(f.sha, f.content.encode()) for path, f in self.trees[self.commit_objects[ref][0]].items()
         }
-
-    async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
-        self.blob_reads += 1
-        for files in self.trees.values():
-            for file in files.values():
-                if file.sha == sha:
-                    return file.content
-        raise GithubNotFoundError()
 
     async def get_actions_key(self, access_token: str, full_name: str) -> GithubActionsKey:
         self._before_write(full_name)
@@ -364,57 +344,6 @@ def _file(content: str | bytes) -> GithubFile:
         _RAW[sha] = content
     text = content if isinstance(content, str) else base64.b64encode(content).decode()
     return GithubFile(content=text, sha=sha)
-
-
-class FakeTemplateCatalog:
-    """A catalog with a React template (two themes sharing files, like the real one) and a static one with an
-    image. `unavailable` fails every read."""
-
-    def __init__(self) -> None:
-        self.react_files = TemplateFiles(
-            text={
-                "index.html": "<div id=root></div>\n",
-                "package.json": '{"name": "portfolio"}\n',
-                "src/App.tsx": "export default function App() { return null }\n",
-                "src/content/portfolio.ts": "// placeholder\n",
-                "src/index.css": "body { margin: 0 }\n",
-            },
-            binary={},
-        )
-        self.static_files = TemplateFiles(
-            text={"index.html": "<main></main>\n", "content/portfolio.js": "// placeholder\n", "css/style.css": ""},
-            binary={"assets/me.png": b"\x89PNG\r\n\x1a\n"},
-        )
-        self.entries = {
-            "minimal": self._entry("minimal", "react", theme="minimal"),
-            "terminal": self._entry("terminal", "react", theme="terminal"),
-            "paper": self._entry("paper", "static"),
-        }
-        self.version = 1
-
-    @staticmethod
-    def _entry(id: str, kind: str, theme: str | None = None) -> TemplateEntry:
-        content_path = "src/content/portfolio.ts" if kind == "react" else "content/portfolio.js"
-        folder = "portfolio" if kind == "react" else id
-        return TemplateEntry.model_validate(
-            {
-                "id": id,
-                "kind": kind,
-                "version": 1,
-                "theme": theme,
-                "contentPath": content_path,
-                "filesUrl": f"https://templates.example/{folder}/1/files.json",
-            }
-        )
-
-    async def get_template(self, template_id: str) -> TemplateEntry:
-        entry = self.entries.get(template_id)
-        if entry is None:
-            raise TemplateNotFoundError()
-        return entry.model_copy(update={"version": self.version})
-
-    async def get_files(self, entry: TemplateEntry) -> TemplateFiles:
-        return self.react_files if entry.kind == "react" else self.static_files
 
 
 class FakeDeployPlatforms:
