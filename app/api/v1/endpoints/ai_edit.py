@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.api.dependencies import AiEditServiceDep, CurrentUserDep, ai_edit_slot
 from app.api.disconnect import cancel_on_disconnect
-from app.schemas.ai_edit import AiEditAnswer, AiEditRequest, AiEditResult
+from app.schemas.ai_edit import AiEditAnswer, AiEditPreviewReport, AiEditRequest, AiEditResult
 from app.schemas.ai_thread import AiThreadRead
 from app.schemas.common import ApiResponse, ErrorResponse
 
@@ -35,11 +35,12 @@ ERRORS: dict[int | str, dict[str, Any]] = {
 async def edit(
     body: AiEditRequest, request: Request, user: CurrentUserDep, ai_edit: AiEditServiceDep
 ) -> ApiResponse[AiEditResult]:
-    """The agent reads the site's code at `baseCommit` from its repo, makes the change and commits it:
-    `{status: "applied", commitSha, files}` (the files it changed, as they are now), or `{status: "escalated", reason}`
-    when the change needs a deeper edit. Closing the request (Stop) cancels it, unless the commit had started (then
-    it's in the chat). 409 `ai_run_in_progress` while the site has a request in progress, 409 `site_conflict` when
-    the site isn't at `baseCommit` on GitHub any more."""
+    """The agent reads the site's code at `baseCommit` from its repo and makes the change: `{status:
+    "awaiting_result", files}` (the files it changes, for the preview to try; report with `/result`, and it's committed
+    once the preview works), `{status: "needs_input", question}` (answer with `/answer`), or `{status: "escalated",
+    reason}` when the change needs a deeper edit. Closing the request (Stop) cancels it. 409 `ai_run_in_progress`
+    while the site has a request in progress, 409 `site_conflict` when the site isn't at `baseCommit` on GitHub any
+    more."""
     result = await cancel_on_disconnect(request, ai_edit.edit(user, body))
     logger.info("AI edit", extra={"user_id": str(user.id), "status": result.status})
     return ApiResponse(data=result)
@@ -59,6 +60,25 @@ async def answer(
     first). Answers like `/edit`. 409 `ai_run_superseded` when no run is waiting for it any more."""
     result = await cancel_on_disconnect(request, ai_edit.answer(user, project_id, body))
     logger.info("AI edit answered", extra={"user_id": str(user.id), "status": result.status})
+    return ApiResponse(data=result)
+
+
+@router.post(
+    "/edit/{project_id}/result",
+    summary="Report how the preview went",
+    responses=ERRORS,
+    response_model_exclude_none=True,
+    dependencies=[Depends(ai_edit_slot)],
+)
+async def report(
+    project_id: UUID, body: AiEditPreviewReport, request: Request, user: CurrentUserDep, ai_edit: AiEditServiceDep
+) -> ApiResponse[AiEditResult]:
+    """How the preview went with a run's edits (`{status: "awaiting_result"}`): `ok` commits them (Stop once the commit
+    started still commits, and the chat shows it); an `error` goes back to the model, which answers like `/edit` again
+    (502 `ai_edit_broke_preview` when it can't fix it). 409 `ai_run_superseded` when no run is waiting for it any
+    more."""
+    result = await cancel_on_disconnect(request, ai_edit.report(user, project_id, body))
+    logger.info("AI edit preview reported", extra={"user_id": str(user.id), "ok": body.ok, "status": result.status})
     return ApiResponse(data=result)
 
 

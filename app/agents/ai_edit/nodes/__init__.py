@@ -8,6 +8,7 @@ from app.agents.ai_edit.nodes.commit import commit
 from app.agents.ai_edit.nodes.finish import finish
 from app.agents.ai_edit.nodes.generate import generate
 from app.agents.ai_edit.nodes.load_context import load_context
+from app.agents.ai_edit.nodes.preview import preview
 from app.agents.ai_edit.nodes.read_more import read_more
 
-__all__ = ["ask_user", "check", "classify", "commit", "finish", "generate", "load_context", "read_more"]
+__all__ = ["ask_user", "check", "classify", "commit", "finish", "generate", "load_context", "preview", "read_more"]

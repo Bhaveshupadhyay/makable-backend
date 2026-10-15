@@ -112,3 +112,17 @@ def create_site(client: TestClient) -> str:
     assert res.status_code == 201, res.json()
     commit: str = res.json()["data"]["commitSha"]
     return commit
+
+
+async def confirmed(service: AiEditService, request: AiEditRequest) -> Any:
+    """Sends the edit, and reports that the preview works when it asks (what the SPA does when nothing breaks)."""
+    return await confirm(service, await service.edit(USER, request))
+
+
+async def confirm(service: AiEditService, result: Any, project_id: UUID = PROJECT_ID) -> Any:
+    """Reports that the preview works, if the run is waiting for it."""
+    from app.schemas.ai_edit import AiEditAwaitingResult, AiEditPreviewReport
+
+    if isinstance(result, AiEditAwaitingResult):
+        result = await service.report(USER, project_id, AiEditPreviewReport(run_id=result.run_id, ok=True))
+    return result

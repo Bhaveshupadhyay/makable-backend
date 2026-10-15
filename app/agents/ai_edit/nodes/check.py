@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 
 async def check(state: EditState, runtime: Runtime[EditRun]) -> EditState:
     """Checks the model's reply and says where the run goes next (`step`): more code for the model, a question for the
-    user, a commit of edits that passed the dry run, a repair (a rejected reply goes back once with a report of what
+    user, the preview for edits that passed the dry run, a repair (a rejected reply goes back once with a report of what
     failed and where, because free models often get the shape or the search text wrong the first time), or the end."""
     reply, attempt = state["reply"], state["attempt"]
     # Model calls that answered (or tried to): the ones that asked for code or asked the user don't count against
     # the retries.
     asked = len(state["questions"])
-    answers = attempt - state["context_rounds"] - asked
+    answers = attempt - state["context_rounds"] - asked - state["preview_rounds"]
     answer: ModelEdits | ModelEscalation | ModelNeedsContext | ModelQuestion | None = None
     try:
         answer = parse_answer(reply)
@@ -54,4 +54,4 @@ async def check(state: EditState, runtime: Runtime[EditRun]) -> EditState:
     applied = RunResult(
         outcome=AiEditOutcome.APPLIED.value, tier=1, summary=answer.summary, edits=[e.model_dump() for e in edits]
     )
-    return {"step": "commit", "result": applied}
+    return {"step": "preview", "result": applied}

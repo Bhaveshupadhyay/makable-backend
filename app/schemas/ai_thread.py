@@ -31,19 +31,28 @@ class AiTurnRead(CamelModel):
     created_at: datetime
 
 
+class AiPreview(CamelModel):
+    """Edits waiting for the preview's verdict: what they change, and the files as they'd be (None: deleted)."""
+
+    summary: str
+    files: dict[str, str | None]
+
+
 class AiPausedRun(CamelModel):
-    """A run waiting for the user: the question it asked (answer it with `/ai/edit/{projectId}/answer`)."""
+    """A run waiting for the user (the question it asked: answer it with `/ai/edit/{projectId}/answer`) or for the
+    preview (the edits to try: report with `/ai/edit/{projectId}/result`)."""
 
     run_id: UUID
     instruction: str
     target: str | None
-    question: Question
+    question: Question | None = None
+    preview: AiPreview | None = None
 
 
 class AiThreadRead(CamelModel):
     """The site's chat, oldest first, and the run that's waiting for the user, if one is."""
 
     project_id: UUID
-    status: Literal["idle", "needs_input"]
+    status: Literal["idle", "needs_input", "awaiting_result"]
     turns: list[AiTurnRead]
     run: AiPausedRun | None = None

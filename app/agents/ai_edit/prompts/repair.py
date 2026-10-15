@@ -3,8 +3,9 @@ file's real text at that place."""
 
 from pydantic import ValidationError
 
-from app.agents.ai_edit.prompts.system import REPAIR_PROMPT
-from app.schemas.ai_edit import FileEdit
+from app.agents.ai_edit.prompts.system import PREVIEW_PROMPT, REPAIR_PROMPT
+from app.constants.ai_edit import MAX_PREVIEW_ERROR, PREVIEW_EXCERPT_LINES
+from app.schemas.ai_edit import FileEdit, PreviewError
 from app.utils.edit_diagnosis import (
     MIN_MATCH,
     count_occurrences,
@@ -27,6 +28,23 @@ QUOTED_SEARCH = 300
 def repair_prompt(report: str) -> str:
     """Sent after a rejected answer: how to repair it, then what exactly went wrong (`rejection_report`)."""
     return f"{REPAIR_PROMPT}\n\n<rejection_report>\n{report}\n</rejection_report>"
+
+
+def preview_prompt(error: PreviewError, edited: dict[str, str]) -> str:
+    """Sent after the preview failed on the model's edits: what it showed, and the edited code around it."""
+    lines = [f"The preview showed this error: {_quote(error.message[:MAX_PREVIEW_ERROR])}"]
+    text = edited.get(error.path) if error.path else None
+    if error.path and text is not None and error.line:
+        start = max(1, error.line - PREVIEW_EXCERPT_LINES)
+        numbered = [
+            f"{n:>4}{'>' if n == error.line else '|'} {line}"
+            for n, line in enumerate(text.split("\n")[start - 1 : error.line + PREVIEW_EXCERPT_LINES], start=start)
+        ]
+        lines += [f"It's in {error.path}, line {error.line}. That file with your edits, around it:", *numbered]
+    elif error.path:
+        lines.append(f"It's in {error.path}.")
+    report = "\n".join(lines)
+    return f"{PREVIEW_PROMPT}\n\n<preview_report>\n{report}\n</preview_report>"
 
 
 def rejection_report(files: dict[str, str], edits: list[FileEdit] | None, err: Exception) -> str:

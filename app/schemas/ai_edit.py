@@ -17,6 +17,7 @@ from app.constants.ai_edit import (
     MAX_INSTRUCTION,
     MAX_OPTION,
     MAX_OPTIONS,
+    MAX_PREVIEW_ERROR,
     MAX_QUESTION,
     MAX_SCREENSHOT_CHARS,
     MAX_TARGET_LABEL,
@@ -199,7 +200,36 @@ class AiEditNeedsInput(CamelModel):
     debug: AiEditDebug | None = None
 
 
-AiEditResult = Annotated[AiEditApplied | AiEditEscalated | AiEditNeedsInput, Field(discriminator="status")]
+class AiEditAwaitingResult(CamelModel):
+    """The edits passed the checks and wait for the preview: the SPA puts `files` (the files they change, as they'd be;
+    None: deleted) in its preview and reports how it went (`/result`). Nothing is committed until it says it works."""
+
+    status: Literal["awaiting_result"] = "awaiting_result"
+    run_id: UUID
+    summary: str
+    files: dict[str, str | None]
+    debug: AiEditDebug | None = None
+
+
+AiEditResult = Annotated[
+    AiEditApplied | AiEditEscalated | AiEditNeedsInput | AiEditAwaitingResult, Field(discriminator="status")
+]
+
+
+class PreviewError(CamelModel):
+    """What the preview reported: its message, and where in the code when it knows."""
+
+    message: Annotated[str, Field(max_length=MAX_PREVIEW_ERROR * 4)]
+    path: RepoPath | None = None
+    line: Annotated[int, Field(ge=1, le=1_000_000)] | None = None
+
+
+class AiEditPreviewReport(CamelModel):
+    """How the preview went with a run's edits: `ok`, or the `error` it showed."""
+
+    run_id: UUID
+    ok: bool
+    error: PreviewError | None = None
 
 
 class AiEditAnswer(CamelModel):

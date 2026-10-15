@@ -8,7 +8,7 @@ from langgraph.types import Command, Durability, StateSnapshot
 
 from app.agents.ai_edit import EditRun, EditState, RunResult, compile_edit_graph, result_of, run_input, turn_for
 from app.clients.model import AiKeyInvalidError, ModelClient
-from app.constants.ai_edit import AiEditOutcome
+from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
 from app.core.limits import KeyLock
 from app.repositories.site import AiEditRecordRepository, SiteRepository
@@ -16,21 +16,25 @@ from app.repositories.unit_of_work import UnitOfWork
 from app.schemas.ai_edit import (
     AiEditAnswer,
     AiEditApplied,
+    AiEditAwaitingResult,
     AiEditDebug,
     AiEditEscalated,
     AiEditNeedsInput,
+    AiEditPreviewReport,
     AiEditRequest,
+    FileEdit,
     Question,
 )
 from app.schemas.ai_key import ModelChoice
-from app.schemas.ai_thread import AiPausedRun, AiThreadRead, AiTurnRead
-from app.schemas.site import AiEditRecordCreate
+from app.schemas.ai_thread import AiPausedRun, AiPreview, AiThreadRead, AiTurnRead
+from app.schemas.site import AiEditRecordCreate, SiteSnapshot
 from app.schemas.user import UserRead
 from app.services.site_service import SiteAccess, SiteConflictError, SiteNotFoundError, SiteService
+from app.utils.file_edits import apply_file_edits
 
 logger = logging.getLogger(__name__)
 
-type AiEditResult = AiEditApplied | AiEditEscalated | AiEditNeedsInput
+type AiEditResult = AiEditApplied | AiEditEscalated | AiEditNeedsInput | AiEditAwaitingResult
 
 # The checkpoint is written when a run ends (or pauses), not after every step: a run is short, and a cancelled or
 # failed one then leaves nothing half-done behind (only its input), which the next run's input replaces.
@@ -45,6 +49,13 @@ class AiEditRejectedError(ExternalServiceError):
 class AiRunInProgressError(ConflictError):
     code = "ai_run_in_progress"
     message = "The AI is still working on this site. Wait for it to finish, or stop it first."
+
+
+class AiEditBrokePreviewError(ExternalServiceError):
+    """The AI's edits broke the preview, and its fixes did too. Nothing was committed; the SPA undoes them."""
+
+    code = "ai_edit_broke_preview"
+    message = "The AI's change broke the preview, and it couldn't fix it. Nothing was saved. Try asking differently."
 
 
 class AiRunSupersededError(ConflictError):
@@ -127,12 +138,31 @@ class AiEditService:
         async with self._runs.hold((user.id, project_id)):
             site = await self._site_at(user, project_id, body.base_commit)
             paused = await self._paused(project_id)
-            if paused is None or paused.values.get("run_id") != str(body.run_id):
+            if paused is None or _pause_kind(paused) != "question" or paused.values.get("run_id") != str(body.run_id):
                 raise AiRunSupersededError()
             request = AiEditRequest.model_validate(
                 {**paused.values["request"], "base_commit": body.base_commit, "screenshot": body.screenshot}
             )
             resume: Command[Any] = Command(resume=body.answer, update={"base_commit": body.base_commit})
+            return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
+
+    async def report(self, user: UserRead, project_id: UUID, body: AiEditPreviewReport) -> AiEditResult:
+        """Continues a run waiting for the preview with how it went: it works, and the edits are committed; or it
+        failed, and the model tries again with the error (or the request gives up).
+
+        Raises:
+            AiRunSupersededError: No run is waiting for that preview any more.
+            AiEditBrokePreviewError: The preview failed on every try.
+            The errors of `edit`.
+        """
+        async with self._runs.hold((user.id, project_id)):
+            paused = await self._paused(project_id)
+            if paused is None or _pause_kind(paused) != "preview" or paused.values.get("run_id") != str(body.run_id):
+                raise AiRunSupersededError()
+            base = paused.values["base_commit"]
+            site = await self._site_at(user, project_id, base)
+            request = AiEditRequest.model_validate({**paused.values["request"], "base_commit": base})
+            resume: Command[Any] = Command(resume=body.model_dump(mode="json"))
             return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
 
     async def dismiss(self, user: UserRead, project_id: UUID) -> None:
@@ -163,16 +193,19 @@ class AiEditService:
             return AiThreadRead(project_id=project_id, status="idle", turns=[])
         snapshot = await self._graph.aget_state(self._config(project_id))
         turns = [AiTurnRead.model_validate(t) for t in snapshot.values.get("turns", [])]
-        paused = _paused_question(snapshot)
-        if paused is None:
+        kind = _pause_kind(snapshot)
+        if kind is None:
             return AiThreadRead(project_id=project_id, status="idle", turns=turns)
-        run = AiPausedRun(
-            run_id=snapshot.values["run_id"],
-            instruction=snapshot.values["instruction"],
-            target=snapshot.values.get("target"),
-            question=paused,
-        )
-        return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
+        values = snapshot.values
+        run = AiPausedRun(run_id=values["run_id"], instruction=values["instruction"], target=values.get("target"))
+        if kind == "question":
+            run.question = Question.model_validate(_pause_value(snapshot))
+            return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
+        # The edits are in the state; the files they make are worked out again from the base commit.
+        access = await self._site_service.access(user, project_id)
+        files = await self._preview_files(await access.snapshot(values["base_commit"]), values)
+        run.preview = AiPreview(summary=result_of(values).get("summary", ""), files=files)
+        return AiThreadRead(project_id=project_id, status="awaiting_result", turns=turns, run=run)
 
     async def start_over(self, user: UserRead, project_id: UUID) -> None:
         """Forgets the site in makable (Start over): its chat (the checkpoints), its requests and its row. The repo on
@@ -224,10 +257,23 @@ class AiEditService:
             await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=code)
             raise
         if state.get("__interrupt__"):
-            question = Question.model_validate(state["__interrupt__"][0].value)
+            value = state["__interrupt__"][0].value
             debug = self._debug_info(run, state.get("attempt", 0))
-            return AiEditNeedsInput(run_id=run_id, question=question, debug=debug)
+            if value.get("type") == "preview":
+                files = await self._preview_files(
+                    SiteSnapshot(commit_sha="", files=await run.files(), binary=[]), state
+                )
+                summary = result_of(state).get("summary", "")
+                return AiEditAwaitingResult(run_id=run_id, summary=summary, files=files, debug=debug)
+            return AiEditNeedsInput(run_id=run_id, question=Question.model_validate(value), debug=debug)
         return await self._finish(user, request, run, run_id, state)
+
+    @staticmethod
+    async def _preview_files(base: SiteSnapshot, values: dict[str, Any]) -> dict[str, str | None]:
+        """The files a run's checked edits make, from the base commit's: what the preview tries."""
+        edits = [FileEdit.model_validate(e) for e in result_of(values).get("edits", [])]
+        applied = apply_file_edits(base.files, edits)
+        return {path: applied.files[path] for path in applied.changed}
 
     async def _site_at(self, user: UserRead, project_id: UUID, base_commit: str) -> SiteAccess:
         """The site's repo, which must be at `base_commit`: the browser saves its own edits first, so if it isn't,
@@ -243,12 +289,13 @@ class AiEditService:
         return site
 
     async def _paused(self, project_id: UUID) -> StateSnapshot | None:
-        """The thread's state, if a run is waiting for the user's answer."""
+        """The thread's state, if a run is waiting (for the user's answer, or for the preview)."""
         snapshot = await self._graph.aget_state(self._config(project_id))
-        return snapshot if _paused_question(snapshot) is not None else None
+        return snapshot if _pause_kind(snapshot) is not None else None
 
     async def _skip_paused(self, user: UserRead, project_id: UUID) -> None:
-        """Ends a run that's waiting for the user (a new instruction or Dismiss replaces it), recorded as skipped."""
+        """Ends a run that's waiting (for an answer or the preview; a new instruction or Dismiss replaces it), recorded
+        as skipped."""
         paused = await self._paused(project_id)
         if paused is None:
             return
@@ -279,12 +326,15 @@ class AiEditService:
         result = result_of(state)
         outcome = AiEditOutcome(result["outcome"])
         attempts = state.get("attempt", 0)
-        await self._record(user, request, run, outcome, result=result, attempts=attempts)
+        await self._record(user, request, run, outcome, result=result, attempts=attempts, model=state.get("model"))
         await self._prune(request.project_id)
         if outcome == AiEditOutcome.REJECTED:
             problem = result.get("problem", "")
-            raise AiEditRejectedError(details={"problem": problem[:300]} if self._debug else None)
-        debug = self._debug_info(run, attempts)
+            details = {"problem": problem[:300]} if self._debug else None
+            if state.get("preview_rounds", 0) > MAX_PREVIEW_ROUNDS:
+                raise AiEditBrokePreviewError(details=details)
+            raise AiEditRejectedError(details=details)
+        debug = self._debug_info(run, attempts, state.get("model"))
         if outcome == AiEditOutcome.ESCALATED:
             return AiEditEscalated(run_id=run_id, reason=result.get("reason", ""), debug=debug)
         return AiEditApplied(
@@ -342,8 +392,10 @@ class AiEditService:
         result: RunResult | None = None,
         summary: str | None = None,
         attempts: int = 0,
+        model: str | None = None,
     ) -> None:
-        """Writes the request's row and marks the site as used."""
+        """Writes the request's row and marks the site as used. `model` is the model the run used (from its state),
+        else the one this request picked."""
         if result is not None:
             summary = result.get("summary") or result.get("reason") or result.get("problem")
         await self._records.add(
@@ -352,7 +404,7 @@ class AiEditService:
                 user_id=user.id,
                 instruction=request.instruction,
                 selection=request.target.model_dump(mode="json") if request.target else None,
-                model=run.model.name if run.model else None,
+                model=model or (run.model.name if run.model else None),
                 tier=result.get("tier") if result else None,
                 outcome=outcome,
                 summary=summary,
@@ -387,16 +439,22 @@ class AiEditService:
     def _config(project_id: UUID) -> Any:
         return {"configurable": {"thread_id": str(project_id)}}
 
-    def _debug_info(self, run: EditRun, attempts: int) -> AiEditDebug | None:
+    def _debug_info(self, run: EditRun, attempts: int, model: str | None = None) -> AiEditDebug | None:
         if not self._debug:
             return None
-        return AiEditDebug(model_input=run.model_input, attempts=attempts, model=run.model.name if run.model else "")
+        name = model or (run.model.name if run.model else "")
+        return AiEditDebug(model_input=run.model_input, attempts=attempts, model=name)
 
 
-def _paused_question(snapshot: StateSnapshot) -> Question | None:
-    """The question a paused run is waiting on, if the thread has one."""
+def _pause_value(snapshot: StateSnapshot) -> dict[str, Any] | None:
+    """What a paused run is waiting on (the `interrupt` value), if the thread has one."""
     for interrupt in snapshot.interrupts:
-        value = interrupt.value
-        if isinstance(value, dict) and value.get("type") == "question":
-            return Question.model_validate(value)
+        if isinstance(interrupt.value, dict) and interrupt.value.get("type") in ("question", "preview"):
+            return interrupt.value
     return None
+
+
+def _pause_kind(snapshot: StateSnapshot) -> str | None:
+    """ "question" or "preview" when a run is waiting for one, else None."""
+    value = _pause_value(snapshot)
+    return value["type"] if value else None

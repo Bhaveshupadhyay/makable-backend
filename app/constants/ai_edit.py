@@ -29,6 +29,12 @@ MAX_OPTIONS = 6
 MAX_OPTION = 80
 MAX_ANSWER = 2000
 
+# Times the preview can fail on the AI's edits before the request gives up (each failure goes back to the model),
+# and how much of the preview's error goes back.
+MAX_PREVIEW_ROUNDS = 2
+MAX_PREVIEW_ERROR = 1000
+PREVIEW_EXCERPT_LINES = 12
+
 # Paths listed in the prompt's file list, and lines of a file's outline.
 MAX_LISTED_FILES = 300
 MAX_OUTLINE_LINES = 80

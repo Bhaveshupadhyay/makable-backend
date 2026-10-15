@@ -39,7 +39,8 @@ def test_the_chat_comes_from_the_server_and_start_over_clears_it(client: TestCli
     sign_in(client)
     base = create_site(client)
     model.replies += [GOOD_REPLY, '{"escalate": "Needs the navbar."}']
-    applied = client.post(EDIT, json=request_body(baseCommit=base))
+    waiting = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+    applied = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": waiting["runId"], "ok": True})
     assert applied.status_code == 200
     head = applied.json()["data"]["commitSha"]
     assert (
@@ -104,6 +105,7 @@ def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClien
         "instruction": "Make the contact button green",
         "target": 'Ada > <a> "Contact"',
         "question": paused["question"],
+        "preview": None,
     }
 
     answered = client.post(
@@ -111,7 +113,12 @@ def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClien
     )
 
     assert answered.status_code == 200
-    assert answered.json()["data"]["status"] == "applied"
+    assert answered.json()["data"]["status"] == "awaiting_result"
+    preview = client.get(THREAD).json()["data"]
+    assert preview["status"] == "awaiting_result"
+    assert preview["run"]["preview"]["summary"] == "Made it green."
+    done = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": paused["runId"], "ok": True})
+    assert done.json()["data"]["status"] == "applied"
     [turn] = client.get(THREAD).json()["data"]["turns"]
     assert turn["questions"] == [{"question": "Which colour?", "answer": "green"}]
     again = client.post(

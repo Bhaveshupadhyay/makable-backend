@@ -8,11 +8,12 @@ from fastapi.testclient import TestClient
 from app.api.dependencies import get_model_client
 from app.api.disconnect import ClientDisconnectedError, cancel_on_disconnect
 from app.core.config import Settings
-from app.tests.ai_edit_fixtures import GOOD_REPLY, GREEN_HERO, HERO_PATH, create_site, request_body
+from app.tests.ai_edit_fixtures import GOOD_REPLY, GREEN_HERO, HERO_PATH, PROJECT_ID, create_site, request_body
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import FakeModelClient
 
 EDIT = "/api/v1/ai/edit"
+SITE = f"/api/v1/sites/{PROJECT_ID}"
 
 
 @pytest.fixture
@@ -37,14 +38,18 @@ def test_commits_the_change_and_answers_the_changed_files_without_debug(
     base = create_site(client)
     model.replies.append(GOOD_REPLY)
 
-    res = client.post(EDIT, json=request_body(baseCommit=base))
+    waiting = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+    assert (waiting["status"], waiting["files"]) == ("awaiting_result", {HERO_PATH: GREEN_HERO})
+    assert client.get(SITE).json()["data"]["commitSha"] == base
+
+    res = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": waiting["runId"], "ok": True})
 
     assert res.status_code == 200
     data = res.json()["data"]
     assert (data["status"], data["summary"], data["files"]) == ("applied", "Made it green.", {HERO_PATH: GREEN_HERO})
     assert data["commitSha"] != base
     assert "debug" not in data
-    assert client.get("/api/v1/sites/" + request_body()["projectId"]).json()["data"]["commitSha"] == data["commitSha"]
+    assert client.get(SITE).json()["data"]["commitSha"] == data["commitSha"]
 
 
 def test_adds_debug_when_ai_debug_is_on(client: TestClient, model: FakeModelClient, settings: Settings) -> None:
@@ -106,7 +111,8 @@ def test_an_edit_on_an_old_commit_is_a_conflict(client: TestClient, model: FakeM
     sign_in(client)
     base = create_site(client)
     model.replies.append(GOOD_REPLY)
-    assert client.post(EDIT, json=request_body(baseCommit=base)).status_code == 200
+    waiting = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+    assert client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": waiting["runId"], "ok": True}).status_code == 200
 
     res = client.post(EDIT, json=request_body(baseCommit=base))
 
@@ -156,3 +162,22 @@ async def test_cancelled_work_gets_to_clean_up_before_the_request_ends() -> None
     with pytest.raises(ClientDisconnectedError):
         await cancel_on_disconnect(disconnected_request(), work_that_records_its_cancellation())
     assert cleaned_up.is_set()
+
+
+def test_a_preview_that_keeps_failing_is_a_502_and_nothing_is_committed(
+    client: TestClient, model: FakeModelClient
+) -> None:
+    sign_in(client)
+    base = create_site(client)
+    model.replies += [GOOD_REPLY] * 3
+    data = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+    error = {"message": "Something broke"}
+
+    for _ in range(2):
+        data = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": data["runId"], "ok": False, "error": error})
+        data = data.json()["data"]
+        assert data["status"] == "awaiting_result"
+    res = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": data["runId"], "ok": False, "error": error})
+
+    assert (res.status_code, res.json()["error"]["code"]) == (502, "ai_edit_broke_preview")
+    assert client.get(SITE).json()["data"]["commitSha"] == base

@@ -16,7 +16,7 @@ from app.clients.model import AiKeyInvalidError, ModelUnavailableError
 from app.constants.ai_edit import MAX_HISTORY, AiEditOutcome
 from app.constants.auth import Role
 from app.models.site import AiEditRecord, Site
-from app.schemas.ai_edit import AiEditApplied, AiEditEscalated
+from app.schemas.ai_edit import AiEditApplied, AiEditAwaitingResult, AiEditEscalated, AiEditPreviewReport
 from app.schemas.chat import ChatMessage
 from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiEditRejectedError, AiRunInProgressError
@@ -30,6 +30,7 @@ from app.tests.ai_edit_fixtures import (
     REPO,
     USER,
     MakeAiEditService,
+    confirmed,
     make_request,
 )
 from app.tests.fakes import FakeGithubClient, FakeModelClient, FakeModelSource
@@ -119,7 +120,7 @@ async def test_each_route_records_the_request_and_adds_a_turn(
 ) -> None:
     model = FakeModelClient(*replies)
 
-    result = await ai_edit_service(FakeModelSource(model)).edit(USER, make_request(instruction=instruction))
+    result = await confirmed(ai_edit_service(FakeModelSource(model)), make_request(instruction=instruction))
 
     assert len(model.calls) == attempts
     [record] = await records(session)
@@ -145,7 +146,7 @@ async def test_rejected_twice_is_recorded_but_not_added_to_the_chat(
     service = ai_edit_service(FakeModelSource(FakeModelClient("not json", "still not json")))
 
     with pytest.raises(AiEditRejectedError):
-        await service.edit(USER, make_request())
+        await confirmed(service, make_request())
 
     [record] = await records(session)
     assert (record.outcome, record.tier, record.attempts) == (AiEditOutcome.REJECTED, None, 2)
@@ -158,11 +159,11 @@ async def test_turns_accumulate_and_come_back_as_earlier_requests(
 ) -> None:
     model = FakeModelClient(GOOD_REPLY, note_reply(1))
 
-    await ai_edit_service(FakeModelSource(model)).edit(USER, make_request())
+    await confirmed(ai_edit_service(FakeModelSource(model)), make_request())
     # A new graph instance on the same saved thread: a closed tab, or a restarted server.
     head = github.heads[REPO].commit_sha
-    await ai_edit_service(FakeModelSource(model)).edit(
-        USER, make_request(instruction="Make it bigger", baseCommit=head)
+    await confirmed(
+        ai_edit_service(FakeModelSource(model)), make_request(instruction="Make it bigger", baseCommit=head)
     )
 
     second_prompt = model.calls[1][0].text
@@ -183,7 +184,7 @@ async def test_only_the_last_turns_go_into_the_prompt(
 
     for i in range(MAX_HISTORY + 2):
         head = github.heads[REPO].commit_sha
-        await service.edit(USER, make_request(instruction=f"Request {i}", baseCommit=head))
+        await confirmed(service, make_request(instruction=f"Request {i}", baseCommit=head))
 
     last_prompt = model.calls[-1][0].text
     assert "Request 0\n" not in last_prompt
@@ -193,7 +194,7 @@ async def test_only_the_last_turns_go_into_the_prompt(
 async def test_another_users_site_is_not_found(ai_edit_service: MakeAiEditService, session: AsyncSession) -> None:
     model = FakeModelClient(GOOD_REPLY)
     service = ai_edit_service(FakeModelSource(model))
-    await service.edit(USER, make_request())
+    await confirmed(service, make_request())
 
     with pytest.raises(SiteNotFoundError):
         await service.edit(OTHER_USER, make_request())
@@ -217,7 +218,7 @@ async def test_start_over_forgets_the_site_but_leaves_its_repo(
     ai_edit_service: MakeAiEditService, session: AsyncSession, checkpointer: InMemorySaver, github: FakeGithubClient
 ) -> None:
     service = ai_edit_service(FakeModelSource(FakeModelClient(GOOD_REPLY)))
-    await service.edit(USER, make_request())
+    await confirmed(service, make_request())
     assert await checkpointer.aget_tuple(CONFIG) is not None
 
     await service.start_over(USER, PROJECT_ID)
@@ -247,7 +248,7 @@ async def test_a_cancelled_run_is_recorded_and_doesnt_leak_into_the_next(
     assert (record.outcome, record.model, record.summary) == (AiEditOutcome.CANCELLED, "blocking-model", "stopped")
     assert github.commits == []
     model = FakeModelClient(GOOD_REPLY)
-    result = await ai_edit_service(FakeModelSource(model)).edit(USER, make_request(instruction="Try again"))
+    result = await confirmed(ai_edit_service(FakeModelSource(model)), make_request(instruction="Try again"))
     assert isinstance(result, AiEditApplied)
     assert "<earlier_requests>\n" not in model.calls[0][0].text
     turns = (await ai_edit_service(FakeModelSource(model)).thread(USER, PROJECT_ID)).turns
@@ -259,7 +260,10 @@ async def test_stop_during_the_commit_still_commits_and_the_chat_shows_it(
 ) -> None:
     github.commit_delay = 0.2
     service = ai_edit_service(FakeModelSource(FakeModelClient(GOOD_REPLY)))
-    run = asyncio.create_task(service.edit(USER, make_request()))
+    waiting = await service.edit(USER, make_request())
+    assert isinstance(waiting, AiEditAwaitingResult)
+    report = AiEditPreviewReport(run_id=waiting.run_id, ok=True)
+    run = asyncio.create_task(service.report(USER, PROJECT_ID, report))
     await github.commit_started.wait()
     await asyncio.sleep(0.05)  # Into the commit.
 
@@ -283,12 +287,12 @@ async def test_one_run_at_a_time_per_site(ai_edit_service: MakeAiEditService) ->
     other = ai_edit_service(FakeModelSource(FakeModelClient(GOOD_REPLY)))
 
     with pytest.raises(AiRunInProgressError):
-        await other.edit(USER, make_request())
+        await confirmed(other, make_request())
     with pytest.raises(AiRunInProgressError):
         await other.start_over(USER, PROJECT_ID)
     # Another site isn't held up (this one isn't the user's, so it's not found rather than busy).
     with pytest.raises(SiteNotFoundError):
-        await other.edit(USER, make_request(projectId="33333333-3333-4333-8333-333333333333"))
+        await confirmed(other, make_request(projectId="33333333-3333-4333-8333-333333333333"))
 
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -299,7 +303,7 @@ async def test_a_failing_model_is_recorded_as_failed(ai_edit_service: MakeAiEdit
     service = ai_edit_service(FakeModelSource(FailingModel(ModelUnavailableError())))
 
     with pytest.raises(ModelUnavailableError):
-        await service.edit(USER, make_request())
+        await confirmed(service, make_request())
 
     [record] = await records(session)
     assert (record.outcome, record.summary) == (AiEditOutcome.FAILED, ModelUnavailableError.code)
@@ -325,7 +329,7 @@ async def test_the_checkpoint_holds_no_file_contents(
 ) -> None:
     ask = '{"needContext": {"path": "src/App.tsx"}}'
     model = FakeModelClient(ask, bad_reply(), GOOD_REPLY)
-    await ai_edit_service(FakeModelSource(model)).edit(USER, make_request())
+    await confirmed(ai_edit_service(FakeModelSource(model)), make_request())
 
     saved = await checkpointer.aget_tuple(CONFIG)
 

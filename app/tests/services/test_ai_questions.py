@@ -23,6 +23,8 @@ from app.tests.ai_edit_fixtures import (
     REPO,
     USER,
     MakeAiEditService,
+    confirm,
+    confirmed,
     make_request,
 )
 from app.tests.fakes import FakeGithubClient, FakeModelClient, FakeModelSource
@@ -42,7 +44,7 @@ def answer(paused: AiEditNeedsInput, text: str = "#16a34a", base: str = BASE_COM
 
 async def ask_first(ai_edit_service: MakeAiEditService, *replies: str) -> tuple[AiEditNeedsInput, FakeModelClient]:
     model = FakeModelClient(ASK, *replies)
-    paused = await ai_edit_service(FakeModelSource(model)).edit(USER, make_request(instruction="Change the colour"))
+    paused = await confirmed(ai_edit_service(FakeModelSource(model)), make_request(instruction="Change the colour"))
     assert isinstance(paused, AiEditNeedsInput)
     return paused, model
 
@@ -67,7 +69,10 @@ async def test_a_question_pauses_the_run_and_survives_a_closed_tab(
         paused.question,
     )
 
-    result = await ai_edit_service(FakeModelSource(model)).answer(USER, PROJECT_ID, answer(paused))
+    result = await confirm(
+        ai_edit_service(FakeModelSource(model)),
+        await ai_edit_service(FakeModelSource(model)).answer(USER, PROJECT_ID, answer(paused)),
+    )
 
     assert isinstance(result, AiEditApplied)
     assert result.run_id == paused.run_id
@@ -91,7 +96,10 @@ async def test_the_answer_works_on_the_site_as_it_is_then(
     github.edit_on_github(REPO, HERO_PATH, github.files[REPO][HERO_PATH].content.replace("Contact", "Say hi"))
     head = github.heads[REPO].commit_sha
 
-    result = await ai_edit_service(FakeModelSource(model)).answer(USER, PROJECT_ID, answer(paused, base=head))
+    result = await confirm(
+        ai_edit_service(FakeModelSource(model)),
+        await ai_edit_service(FakeModelSource(model)).answer(USER, PROJECT_ID, answer(paused, base=head)),
+    )
 
     assert isinstance(result, AiEditApplied)
     assert ">Say hi</a>" in model.calls[1][0].text
@@ -105,14 +113,19 @@ async def test_a_new_instruction_while_paused_skips_the_paused_run(
     paused, _ = await ask_first(ai_edit_service)
     model = FakeModelClient(GOOD_REPLY)
 
-    result = await ai_edit_service(FakeModelSource(model)).edit(USER, make_request())
+    result = await confirmed(ai_edit_service(FakeModelSource(model)), make_request())
 
     assert isinstance(result, AiEditApplied)
     skipped, applied = await records(session)
     assert (skipped.instruction, skipped.outcome) == ("Change the colour", AiEditOutcome.SKIPPED)
     assert applied.outcome == AiEditOutcome.APPLIED
     with pytest.raises(AiRunSupersededError):
-        await ai_edit_service(FakeModelSource(model)).answer(USER, PROJECT_ID, answer(paused, base=result.commit_sha))
+        await confirm(
+            ai_edit_service(FakeModelSource(model)),
+            await ai_edit_service(FakeModelSource(model)).answer(
+                USER, PROJECT_ID, answer(paused, base=result.commit_sha)
+            ),
+        )
 
 
 async def test_dismiss_ends_the_paused_run(ai_edit_service: MakeAiEditService, session: AsyncSession) -> None:
@@ -157,7 +170,7 @@ async def test_only_two_questions_per_request(ai_edit_service: MakeAiEditService
 
     second = await service.answer(USER, PROJECT_ID, answer(paused))
     assert isinstance(second, AiEditNeedsInput)
-    result = await service.answer(USER, PROJECT_ID, answer(second, "green"))
+    result = await confirm(service, await service.answer(USER, PROJECT_ID, answer(second, "green")))
 
     assert isinstance(result, AiEditApplied)
     # The third question was rejected, and the repair answered with edits.
@@ -193,10 +206,16 @@ async def test_a_failure_after_answering_ends_the_run(
             raise ModelUnavailableError()
 
     with pytest.raises(ModelUnavailableError):
-        await ai_edit_service(FakeModelSource(Failing())).answer(USER, PROJECT_ID, answer(paused))
+        await confirm(
+            ai_edit_service(FakeModelSource(Failing())),
+            await ai_edit_service(FakeModelSource(Failing())).answer(USER, PROJECT_ID, answer(paused)),
+        )
 
     assert (await ai_edit_service(FakeModelSource(Failing())).thread(USER, PROJECT_ID)).status == "idle"
     [record] = await records(session)
     assert (record.outcome, record.summary) == (AiEditOutcome.FAILED, "ai_unavailable")
     with pytest.raises(AiRunSupersededError):
-        await ai_edit_service(FakeModelSource(FakeModelClient())).answer(USER, PROJECT_ID, answer(paused))
+        await confirm(
+            ai_edit_service(FakeModelSource(FakeModelClient())),
+            await ai_edit_service(FakeModelSource(FakeModelClient())).answer(USER, PROJECT_ID, answer(paused)),
+        )

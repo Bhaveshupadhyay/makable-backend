@@ -32,4 +32,4 @@ async def generate(state: EditState, runtime: Runtime[EditRun]) -> EditState:
             messages.append(ChatMessage(role=message["role"], content=message["content"]))
     run.model_input = "\n\n".join(m.text for m in messages)
     reply = await model.complete(messages)
-    return {"reply": reply, "attempt": state["attempt"] + 1}
+    return {"reply": reply, "attempt": state["attempt"] + 1, "model": model.name}

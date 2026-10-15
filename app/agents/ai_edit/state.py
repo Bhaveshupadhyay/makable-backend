@@ -100,12 +100,16 @@ class EditState(TypedDict, total=False):
     # reference to code it asked for, which is read again when the prompt is built).
     messages: list[dict[str, Any]]
     reply: str
-    # Model calls made.
+    # Model calls made, and the model's name (the run can end in a later request than its model calls).
     attempt: int
+    model: str
     # What the model asked the user, and their answers.
     questions: list[QuestionAnswer]
+    # Times the preview failed on the model's edits.
+    preview_rounds: int
     problem: str
-    # Where the run goes next after `check`: "read_more", "ask_user", "generate" (a repair), "commit" or "finish".
+    # Where the run goes next after `check` or `preview`: "read_more", "ask_user", "generate" (a repair), "preview",
+    # "commit" or "finish".
     step: str
     result: RunResult | None
 
@@ -155,7 +159,9 @@ def run_input(run_id: UUID, request: AiEditRequest) -> EditState:
         "messages": [],
         "reply": "",
         "attempt": 0,
+        "model": "",
         "questions": [],
+        "preview_rounds": 0,
         "problem": "",
         "step": "",
         "result": None,
