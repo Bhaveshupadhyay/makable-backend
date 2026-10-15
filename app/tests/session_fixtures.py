@@ -4,7 +4,7 @@ import json
 from typing import Any
 from uuid import UUID
 
-from app.tests.ai_edit_fixtures import PORTFOLIO
+from app.tests.portfolio_fixtures import PORTFOLIO
 
 PROJECT_ID = UUID("3f2a9c4e-8b1d-4c6a-9e2f-1a2b3c4d5e6f")
 

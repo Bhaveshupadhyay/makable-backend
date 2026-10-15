@@ -1,7 +1,9 @@
 """The real GitHub client against a mocked transport: request shapes and status mapping."""
 
 import base64
+import io
 import json
+import tarfile
 import time
 from collections.abc import Callable
 from typing import Any
@@ -16,6 +18,7 @@ from app.clients.github import (
     GithubPagesUnavailableError,
     GithubRateLimitedError,
     GithubRepoExistsError,
+    GithubRepoTooLargeError,
     GithubUnauthorizedError,
     HttpGithubClient,
 )
@@ -346,3 +349,70 @@ async def test_runs_since_a_time_and_a_workflow_github_hasnt_registered() -> Non
     # "Workflow does not have 'workflow_dispatch' trigger": GitHub still has the old file. Retried by the caller.
     with pytest.raises(GithubNotFoundError):
         await client(lambda _: httpx.Response(422)).dispatch_workflow("tok", REPO, "x.yml", "main")
+
+
+def tarball(
+    files: dict[str, bytes], *, top: str = "octocat-my-site-abc1234", links: dict[str, str] | None = None
+) -> bytes:
+    """A repo archive as GitHub sends it: every file under one top folder."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        folder = tarfile.TarInfo(top)
+        folder.type = tarfile.DIRTYPE
+        archive.addfile(folder)
+        for path, data in files.items():
+            info = tarfile.TarInfo(f"{top}/{path}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        for path, target in (links or {}).items():
+            link = tarfile.TarInfo(f"{top}/{path}")
+            link.type = tarfile.SYMTYPE
+            link.linkname = target
+            archive.addfile(link)
+    return out.getvalue()
+
+
+async def test_an_archive_is_read_through_githubs_redirect_without_the_token_on_the_other_host() -> None:
+    seen: list[httpx.Request] = []
+    files = {"src/App.tsx": b"export {}\n", "public/logo.png": b"\x89PNG\r\n\x1a\x00", "../evil": b"x"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "api.github.com":
+            return httpx.Response(
+                302, headers={"location": "https://codeload.github.com/octocat/my-site/tar.gz/abc?token=t"}
+            )
+        return httpx.Response(200, content=tarball(files, links={"link": "/etc/passwd"}))
+
+    archive = await client(handler).get_archive("tok", "octocat/my-site", "abc")
+
+    assert archive == {"src/App.tsx": b"export {}\n", "public/logo.png": b"\x89PNG\r\n\x1a\x00"}
+    assert seen[0].url.path == "/repos/octocat/my-site/tarball/abc"
+    assert seen[0].headers["authorization"] == "Bearer tok"
+    assert "authorization" not in seen[1].headers
+
+
+async def test_an_archive_past_the_limit_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.clients.github.MAX_ARCHIVE_BYTES", 100)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 1000)
+
+    with pytest.raises(GithubRepoTooLargeError):
+        await client(handler).get_archive("tok", "octocat/my-site", "main")
+
+
+async def test_a_missing_archive_is_not_found() -> None:
+    with pytest.raises(GithubNotFoundError):
+        await client(lambda _: httpx.Response(404)).get_archive("tok", "octocat/my-site", "main")
+
+
+async def test_a_commit_is_read_with_its_tree_and_parents() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/repos/octocat/my-site/git/commits/{'c' * 40}"
+        body = {"sha": "c" * 40, "tree": {"sha": "t" * 40}, "parents": [{"sha": "p" * 40}], "message": "Make it green"}
+        return httpx.Response(200, json=body)
+
+    commit = await client(handler).get_commit("tok", "octocat/my-site", "c" * 40)
+
+    assert (commit.tree_sha, commit.parents, commit.message) == ("t" * 40, ["p" * 40], "Make it green")

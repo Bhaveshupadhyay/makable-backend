@@ -1,18 +1,19 @@
-"""Search/replace edits on text files: a port of `applyFileEdits` from `@makable/shared` `ai-edit-files.ts`.
+"""Search/replace edits on text files, first ported from `applyFileEdits` in `@makable/shared` `ai-edit-files.ts`.
 
-The model's edits are checked here before they're sent, and the SPA applies them again with the TypeScript
-original, so the two must agree. Keep them in sync (the tests mirror `ai-edit-files.test.ts`).
+The server applies the model's edits itself now (it dry-runs them, then commits the result), and sends the SPA the
+files they produce, so only this version runs. It also creates files: an edit with an empty search on a path that
+doesn't exist yet.
 """
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from app.constants.ai_edit import MAX_FILE_CHARS
+from app.constants.ai_edit import MAX_EDITED_FILE_CHARS
 from app.schemas.ai_edit import FileEdit
 
 EditProblem = Literal[
-    "file_not_sent", "not_found", "ambiguous", "empty_search", "too_large", "forbidden", "no_change", "broken_file"
+    "file_not_found", "not_found", "ambiguous", "empty_search", "too_large", "forbidden", "no_change", "broken_file"
 ]
 
 
@@ -53,25 +54,40 @@ def apply_file_edits(files: Mapping[str, str], edits: Sequence[FileEdit]) -> App
     whitespace, because models often get indentation wrong. Either way the match must be unique, so an edit
     can never land in the wrong place.
 
+    An empty search creates the file with `replace` as its text, if there's no such file yet.
+
     Raises:
-        FileEditError: An edit targets a file that wasn't given, its search text isn't found exactly once,
-            or the file would get too large.
+        FileEditError: An edit targets a file that doesn't exist (with a search), its search text isn't found
+            exactly once, or the file would get too large.
     """
     result = dict(files)
     changed: dict[str, None] = {}
     for i, edit in enumerate(edits, start=1):
         where = f"edit {i} ({edit.path})"
         if edit.path not in result:
+            if edit.search:
+                raise FileEditError(
+                    f"{where}: there's no such file; to create it, send an empty search",
+                    kind="file_not_found",
+                    edit=i,
+                    path=edit.path,
+                )
+            text = edit.replace
+        elif not edit.search:
             raise FileEditError(
-                f"{where}: that file wasn't sent, so it can't be edited", kind="file_not_sent", edit=i, path=edit.path
+                f"{where}: the file exists, so the search must be text from it",
+                kind="empty_search",
+                edit=i,
+                path=edit.path,
             )
-        try:
-            text = _replace_once(result[edit.path], edit.search, edit.replace)
-        except FileEditError as err:
-            raise FileEditError(f"{where}: {err}", kind=err.kind, edit=i, path=edit.path) from None
-        if _js_length(text) > MAX_FILE_CHARS:
+        else:
+            try:
+                text = _replace_once(result[edit.path], edit.search, edit.replace)
+            except FileEditError as err:
+                raise FileEditError(f"{where}: {err}", kind=err.kind, edit=i, path=edit.path) from None
+        if _js_length(text) > MAX_EDITED_FILE_CHARS:
             raise FileEditError(f"{where}: the file would be too large", kind="too_large", edit=i, path=edit.path)
-        if text != files[edit.path]:
+        if text != files.get(edit.path):
             changed[edit.path] = None
         result[edit.path] = text
     return AppliedEdits(files=result, changed=list(changed))

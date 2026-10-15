@@ -35,27 +35,29 @@ ERRORS: dict[int | str, dict[str, Any]] = {
 async def edit(
     body: AiEditRequest, request: Request, user: CurrentUserDep, ai_edit: AiEditServiceDep
 ) -> ApiResponse[AiEditResult]:
-    """Tier 1: search/replace edits on the files sent, checked on the server, or `{tier: 2, reason}` when the
-    change needs a deeper edit. The SPA applies the edits itself. Closing the request (Stop) cancels the
-    model call. The site's thread (`projectId`) keeps the chat; 409 `ai_run_in_progress` while it has a request
-    in progress."""
-    result = await cancel_on_disconnect(request, ai_edit.edit(user.id, body))
-    logger.info("AI edit", extra={"user_id": str(user.id), "tier": result.tier})
+    """The agent reads the site's code at `baseCommit` from its repo, makes the change and commits it:
+    `{status: "applied", commitSha, files}` (the files it changed, as they are now), or `{status: "escalated", reason}`
+    when the change needs a deeper edit. Closing the request (Stop) cancels it, unless the commit had started (then
+    it's in the chat). 409 `ai_run_in_progress` while the site has a request in progress, 409 `site_conflict` when
+    the site isn't at `baseCommit` on GitHub any more."""
+    result = await cancel_on_disconnect(request, ai_edit.edit(user, body))
+    logger.info("AI edit", extra={"user_id": str(user.id), "status": result.status})
     return ApiResponse(data=result)
 
 
 @router.get("/threads/{project_id}", summary="The site's AI chat", responses=ERRORS)
 async def get_thread(project_id: UUID, user: CurrentUserDep, ai_edit: AiEditServiceDep) -> ApiResponse[AiThreadRead]:
     """The site's finished requests, oldest first; empty for a site with no AI requests yet."""
-    return ApiResponse(data=await ai_edit.thread(user.id, project_id))
+    return ApiResponse(data=await ai_edit.thread(user, project_id))
 
 
 @router.delete(
     "/threads/{project_id}",
-    summary="Start the site's AI chat over",
+    summary="Forget the site (Start over)",
     status_code=status.HTTP_204_NO_CONTENT,
     responses=ERRORS,
 )
 async def delete_thread(project_id: UUID, user: CurrentUserDep, ai_edit: AiEditServiceDep) -> None:
-    """Deletes the chat and the stored requests (Start over). The site itself isn't touched."""
-    await ai_edit.start_over(user.id, project_id)
+    """Deletes the site's chat, its stored requests and makable's record of it (Start over). Its repo on GitHub
+    isn't touched."""
+    await ai_edit.start_over(user, project_id)

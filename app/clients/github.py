@@ -2,6 +2,9 @@
 (`app/clients/supabase.py`)."""
 
 import base64
+import io
+import posixpath
+import tarfile
 import time
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -15,6 +18,7 @@ from app.core.limits import ServiceBusyError
 from app.schemas.github import (
     GithubActionsKey,
     GithubBranchHead,
+    GithubCommit,
     GithubDirEntry,
     GithubFile,
     GithubRepo,
@@ -28,6 +32,11 @@ API_VERSION = "2022-11-28"
 # Text sent inline in one tree request, in total (characters). Files past it are uploaded as blobs first, one
 # request each, so the tree request stays small however large the commit is.
 MAX_INLINE_TREE_CHARS = 3_000_000
+# A repo's archive (tar.gz) is read up to this size, and its files up to this size in total once unpacked. A site
+# made in makable is well under a megabyte; past these it isn't a site makable can work on.
+MAX_ARCHIVE_BYTES = 30_000_000
+MAX_ARCHIVE_FILES_BYTES = 60_000_000
+MAX_ARCHIVE_FILES = 5_000
 
 
 class GithubError(ExternalServiceError):
@@ -65,6 +74,12 @@ class GithubRepoExistsError(GithubError):
     status_code = status.HTTP_409_CONFLICT
     code = "github_repo_exists"
     message = "A repository with that name already exists"
+
+
+class GithubRepoTooLargeError(GithubError):
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    code = "github_repo_too_large"
+    message = "This repository is too large for makable to work on."
 
 
 class GithubConflictError(GithubError):
@@ -116,6 +131,10 @@ class GithubClient(Protocol):
     ) -> str: ...
 
     async def get_tree(self, access_token: str, full_name: str, tree_sha: str) -> dict[str, str]: ...
+
+    async def get_commit(self, access_token: str, full_name: str, sha: str) -> GithubCommit: ...
+
+    async def get_archive(self, access_token: str, full_name: str, ref: str) -> dict[str, bytes]: ...
 
     async def get_blob(self, access_token: str, full_name: str, sha: str) -> str: ...
 
@@ -344,6 +363,56 @@ class HttpGithubClient:
             raise GithubError("reading the files failed: the repository has too many files")
         return {str(e["path"]): str(e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"}
 
+    async def get_commit(self, access_token: str, full_name: str, sha: str) -> GithubCommit:
+        """A commit: its tree and its parents.
+
+        Raises:
+            GithubNotFoundError: No such commit in the repo.
+            GithubError: The request failed.
+        """
+        res = await self._request("GET", f"/repos/{full_name}/git/commits/{quote(sha)}", access_token)
+        if res.status_code in (status.HTTP_404_NOT_FOUND, status.HTTP_422_UNPROCESSABLE_CONTENT):
+            raise GithubNotFoundError()
+        data = _json(res, "reading the commit")
+        try:
+            return GithubCommit(
+                sha=data["sha"],
+                tree_sha=data["tree"]["sha"],
+                parents=[p["sha"] for p in data.get("parents", [])],
+                message=data.get("message", ""),
+            )
+        except (KeyError, TypeError) as err:
+            raise GithubError("reading the commit failed: unexpected response") from err
+
+    async def get_archive(self, access_token: str, full_name: str, ref: str) -> dict[str, bytes]:
+        """Every file of the repo at `ref` (a commit SHA or branch), in one request: path -> bytes. GitHub sends a
+        tar.gz (through a redirect to codeload.github.com); symlinks and other special entries are left out.
+
+        Raises:
+            GithubNotFoundError: The repo or `ref` doesn't exist.
+            GithubRepoTooLargeError: The archive or its files are past makable's limits.
+            GithubError: The request failed.
+        """
+        url = f"{API_URL}/repos/{full_name}/tarball/{quote(ref)}"
+        data = bytearray()
+        try:
+            # The redirect goes to another host, so httpx doesn't send the token there (the URL carries its own).
+            async with self._http.stream("GET", url, headers=self._headers(access_token), follow_redirects=True) as res:
+                self._check(res)
+                if res.status_code == status.HTTP_404_NOT_FOUND:
+                    raise GithubNotFoundError()
+                if res.is_error:
+                    raise GithubError(f"reading the repository failed: HTTP {res.status_code}")
+                async for chunk in res.aiter_bytes():
+                    data += chunk
+                    if len(data) > MAX_ARCHIVE_BYTES:
+                        raise GithubRepoTooLargeError()
+        except httpx.PoolTimeout as err:
+            raise ServiceBusyError() from err
+        except httpx.HTTPError as err:
+            raise GithubError(f"GitHub couldn't be reached: {err}") from err
+        return read_archive(bytes(data))
+
     async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
         """A text file's contents by its blob SHA (which never changes, unlike a path on a branch).
 
@@ -471,21 +540,26 @@ class HttpGithubClient:
         self, method: str, path: str, access_token: str, *, json: dict[str, Any] | None = None
     ) -> httpx.Response:
         try:
-            res = await self._http.request(
-                method,
-                f"{API_URL}{path}",
-                json=json,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {access_token}",
-                    "X-GitHub-Api-Version": API_VERSION,
-                },
-            )
+            res = await self._http.request(method, f"{API_URL}{path}", json=json, headers=self._headers(access_token))
         except httpx.PoolTimeout as err:
             # Every connection to GitHub from this worker is busy: back off rather than wait.
             raise ServiceBusyError() from err
         except httpx.HTTPError as err:
             raise GithubError(f"GitHub couldn't be reached: {err}") from err
+        self._check(res)
+        return res
+
+    @staticmethod
+    def _headers(access_token: str) -> dict[str, str]:
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {access_token}",
+            "X-GitHub-Api-Version": API_VERSION,
+        }
+
+    @staticmethod
+    def _check(res: httpx.Response) -> None:
+        """Raises for the answers every request treats alike: a revoked token and GitHub's rate limits."""
         if res.status_code == status.HTTP_401_UNAUTHORIZED:
             raise GithubUnauthorizedError()
         limited = res.status_code == status.HTTP_429_TOO_MANY_REQUESTS or (
@@ -494,7 +568,6 @@ class HttpGithubClient:
         )
         if limited:
             raise GithubRateLimitedError(_retry_after(res.headers))
-        return res
 
 
 # GitHub's advice when a limit is hit without saying how long to wait (secondary limits).
@@ -511,6 +584,38 @@ def _retry_after(headers: httpx.Headers) -> int:
     except ValueError:
         pass
     return DEFAULT_RETRY_AFTER
+
+
+def read_archive(data: bytes) -> dict[str, bytes]:
+    """The regular files of a repo archive (tar.gz), by their path in the repo. GitHub puts everything in one
+    top folder (`<owner>-<repo>-<sha>/`), which is dropped. Unsafe paths (absolute, `..`) are skipped.
+
+    Raises:
+        GithubRepoTooLargeError: Too many files, or too many bytes once unpacked.
+        GithubError: The archive can't be read.
+    """
+    files: dict[str, bytes] = {}
+    total = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                _, _, path = member.name.partition("/")
+                path = posixpath.normpath(path) if path else ""
+                if not path or path.startswith(("/", "../")) or path == "..":
+                    continue
+                if len(files) >= MAX_ARCHIVE_FILES:
+                    raise GithubRepoTooLargeError()
+                total += member.size
+                if total > MAX_ARCHIVE_FILES_BYTES:
+                    raise GithubRepoTooLargeError()
+                extracted = archive.extractfile(member)
+                if extracted is not None:
+                    files[path] = extracted.read()
+    except (tarfile.TarError, OSError, EOFError) as err:
+        raise GithubError(f"reading the repository failed: {err}") from err
+    return files
 
 
 def _contents_url(full_name: str, path: str) -> str:

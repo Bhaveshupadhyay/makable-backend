@@ -1,38 +1,74 @@
-"""The request as the model reads it: earlier requests, the instruction, the selection and the files, all as tagged
-data."""
+"""The request as the model reads it: earlier requests, the instruction, the selection, the site's file list and the
+code it's shown, all as tagged data. The code is read from the snapshot each time (the state only says which lines),
+and shown as numbered lines."""
 
-from app.agents.ai_edit.state import Turn
-from app.constants.ai_edit import MAX_HISTORY, MAX_HISTORY_REPLY
+from app.agents.ai_edit.state import ContextRef, Selection, Turn
+from app.agents.ai_edit.tools.context import line_count, outline
+from app.constants.ai_edit import MAX_HISTORY, MAX_HISTORY_REPLY, MAX_LISTED_FILES
+from app.constants.site import RESERVED_PATH
 from app.schemas.ai_edit import AiEditRequest, AiEditTarget, AiEditTurn
 
-WHOLE_PAGE = "<selected_element>none: the request is about the whole page</selected_element>"
+WHOLE_SITE = "<selected_element>none: the request is about the whole site</selected_element>"
 
 
-def build_user_prompt(request: AiEditRequest, history: list[AiEditTurn] | None = None) -> str:
-    """The request as tagged data: earlier requests, instruction, selection, template, file tree and file
-    contents. `history` is the thread's (the graph passes it); without it, the request's own."""
-    template = request.template
-    history = request.history if history is None else history
+def build_user_prompt(
+    request: AiEditRequest,
+    selection: Selection | None,
+    files: dict[str, str],
+    context: list[ContextRef],
+    history: list[AiEditTurn],
+) -> str:
+    """The first prompt: earlier requests, the instruction, the selection, the file list and the code it starts with."""
     parts = [
         *([_describe_history(history)] if history else []),
         f"<instruction>\n{request.instruction}\n</instruction>",
-        _describe_target(request.target) if request.target else WHOLE_PAGE,
-        f'<template name="{_attr(template.name)}" kind="{template.kind}" content_file="{template.content_path}" />',
-        "<file_tree>\n" + "\n".join(request.file_tree) + "\n</file_tree>",
-        *(f'<file path="{f.path}" reason="{_attr(f.reason)}">\n{f.content}\n</file>' for f in request.files),
+        _describe_target(request.target, selection) if request.target else WHOLE_SITE,
+        _file_list(files),
+        *(render_ref(files, ref) for ref in context),
     ]
     return "\n\n".join(parts)
 
 
-def _describe_target(target: AiEditTarget) -> str:
+def render_ref(files: dict[str, str], ref: ContextRef) -> str:
+    """Some lines of a file, numbered, or its outline."""
+    text = files.get(ref["path"], "")
+    total = line_count(text)
+    path = _attr(ref["path"])
+    if ref.get("outline"):
+        lines = "\n".join(_numbered(n, line) for n, line in outline(text, ref["path"]))
+        return f'<file_outline path="{path}" total_lines="{total}">\n{lines}\n</file_outline>'
+    start, end = ref["start"], min(ref["end"], total)
+    body = "\n".join(_numbered(n, line) for n, line in enumerate(text.split("\n")[start - 1 : end], start=start))
+    return f'<file path="{path}" lines="{start}-{end}" total_lines="{total}">\n{body}\n</file>'
+
+
+def earlier_requests(turns: list[Turn]) -> list[AiEditTurn]:
+    """The thread's last turns, for the prompt's `<earlier_requests>`."""
+    return [
+        AiEditTurn(instruction=t["instruction"], target=t["target"], reply=t["reply"][:MAX_HISTORY_REPLY])
+        for t in turns[-MAX_HISTORY:]
+    ]
+
+
+def _file_list(files: dict[str, str]) -> str:
+    """The site's text files, without makable's and git's own (the model can't change those)."""
+    paths = sorted(path for path in files if not RESERVED_PATH.match(path))
+    listed = "\n".join(f"{path} ({line_count(files[path])} lines)" for path in paths[:MAX_LISTED_FILES])
+    more = f"\n... and {len(paths) - MAX_LISTED_FILES} more" if len(paths) > MAX_LISTED_FILES else ""
+    return f"<file_list>\n{listed}{more}\n</file_list>"
+
+
+def _describe_target(target: AiEditTarget, selection: Selection | None) -> str:
     lines = [f"- Element: <{target.tag}>{f' showing "{target.text}"' if target.text else ''}"]
+    if selection is not None:
+        lines.append(f"- In the code: {selection['path']}, the element starting at line {selection['line']}")
+    else:
+        lines.append("- In the code: not found (it may be made by a script); find it from the outline and HTML")
     if target.section:
         section = target.section
         id_attr = f' id="{_attr(section.id)}"' if section.id else ""
         heading = f' with heading "{section.heading}"' if section.heading else ""
         lines.append(f"- Inside: <{section.tag}{id_attr}>{heading}")
-    if target.content_path:
-        lines.append(f"- Content path: {target.content_path}")
     lines.append(f"- DOM path: {target.selector}")
     return "<selected_element>\n" + "\n".join(lines) + f"\n<html>\n{target.html}\n</html>\n</selected_element>"
 
@@ -45,13 +81,9 @@ def _describe_history(history: list[AiEditTurn]) -> str:
     return "<earlier_requests>\n" + "\n".join(entries) + "\n</earlier_requests>"
 
 
+def _numbered(number: int, line: str) -> str:
+    return f"{number:>4}| {line}"
+
+
 def _attr(value: str) -> str:
     return value.translate({ord(c): None for c in '"<>&'})
-
-
-def earlier_requests(turns: list[Turn]) -> list[AiEditTurn]:
-    """The thread's last turns, for the prompt's `<earlier_requests>`."""
-    return [
-        AiEditTurn(instruction=t["instruction"], target=t["target"], reply=t["reply"][:MAX_HISTORY_REPLY])
-        for t in turns[-MAX_HISTORY:]
-    ]

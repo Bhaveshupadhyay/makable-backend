@@ -23,9 +23,12 @@ from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
+    MAX_CONCURRENT_SITE_REQUESTS,
     MAX_CONCURRENT_WORKSPACE_REQUESTS,
     PUBLISH_BURST,
     PUBLISH_EVERY_SECONDS,
+    SITE_SAVE_BURST,
+    SITE_SAVE_EVERY_SECONDS,
     WORKSPACE_SAVE_BURST,
     WORKSPACE_SAVE_EVERY_SECONDS,
 )
@@ -33,13 +36,18 @@ from app.core.client import close_connection, get_postgres_client, open_connecti
 from app.core.config import Settings, get_settings
 from app.core.database import Base
 from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
-from app.repositories.ai_thread import SqlAiEditRecordRepository, SqlAiThreadRepository
+from app.models.site import Site
+from app.repositories.site import SqlAiEditRecordRepository, SqlSiteRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.services.ai_edit_service import AiEditService, AiRunInProgressError, ModelSource
+from app.services.site_service import VERIFIED_SITES, SiteService
+from app.services.site_snapshots import SITE_SNAPSHOTS
 from app.services.workspace_service import VERIFIED_REPOS
-from app.tests.ai_edit_fixtures import MakeAiEditService
+from app.tests.ai_edit_fixtures import PROJECT_ID, REPO_NAME, USER, MakeAiEditService, add_site_repo
 from app.tests.fakes import (
+    FAKE_CIPHER,
     FakeAiProviders,
+    FakeCredentials,
     FakeDeployPlatforms,
     FakeGithubClient,
     FakeSupabaseClient,
@@ -79,6 +87,8 @@ def settings(db_path: Path) -> Settings:
 def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The caches and the request limits are process-wide; tests mustn't see each other's."""
     VERIFIED_REPOS.clear()
+    VERIFIED_SITES.clear()
+    SITE_SNAPSHOTS.clear()
     TEMPLATE_CACHE.clear()
     monkeypatch.setattr(dependencies, "PUBLISH_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS))
     monkeypatch.setattr(dependencies, "PUBLISHES", PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS))
@@ -87,6 +97,8 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     )
     monkeypatch.setattr(dependencies, "AI_EDIT_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_AI_EDITS))
     monkeypatch.setattr(dependencies, "AI_RUNS", KeyLock(AiRunInProgressError))
+    monkeypatch.setattr(dependencies, "SITE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_SITE_REQUESTS))
+    monkeypatch.setattr(dependencies, "SITE_SAVES", PerKeyLimit(burst=SITE_SAVE_BURST, every=SITE_SAVE_EVERY_SECONDS))
     monkeypatch.setattr(dependencies, "WORKSPACE_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_WORKSPACE_REQUESTS))
     monkeypatch.setattr(
         dependencies,
@@ -117,15 +129,35 @@ def checkpointer() -> InMemorySaver:
 
 
 @pytest.fixture
-def ai_edit_service(session: AsyncSession, checkpointer: InMemorySaver) -> MakeAiEditService:
-    """Builds `AiEditService` on the test database and one checkpointer per test, so two services made in a test
-    are two graph instances on the same saved threads (a closed tab, a restarted server)."""
+async def site(session: AsyncSession, github: FakeGithubClient) -> str:
+    """`USER`'s site (`PROJECT_ID`): its row, and its repo on the fake GitHub. Returns the commit it's at."""
+    base = add_site_repo(github)
+    session.add(Site(id=PROJECT_ID, user_id=USER.id, name="My site", repo_name=REPO_NAME))
+    await session.commit()
+    return base
+
+
+def make_site_service(session: AsyncSession, github: FakeGithubClient) -> SiteService:
+    return SiteService(
+        github, SqlSiteRepository(session), FakeCredentials(), FAKE_CIPHER, SqlAlchemyUnitOfWork(session)
+    )
+
+
+@pytest.fixture
+def ai_edit_service(
+    session: AsyncSession, checkpointer: InMemorySaver, github: FakeGithubClient, site: str
+) -> MakeAiEditService:
+    """Builds `AiEditService` on the test database, the fake GitHub (with `USER`'s site) and one checkpointer per
+    test, so two services made in a test are two graph instances on the same saved threads (a closed tab, a
+    restarted server)."""
     runs = KeyLock(AiRunInProgressError)
 
     def make(model_source: ModelSource, *, debug: bool = False) -> AiEditService:
+        sites = SqlSiteRepository(session)
         return AiEditService(
             model_source,
-            SqlAiThreadRepository(session),
+            make_site_service(session, github),
+            sites,
             SqlAiEditRecordRepository(session),
             SqlAlchemyUnitOfWork(session),
             checkpointer,

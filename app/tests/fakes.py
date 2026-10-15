@@ -5,6 +5,7 @@ from datetime import timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
+from cryptography.fernet import Fernet
 from nacl.public import PrivateKey, SealedBox
 
 from app.clients.deploy_platforms import PlatformTokenInvalidError, PreparedProject
@@ -20,13 +21,16 @@ from app.clients.templates import TemplateNotFoundError
 from app.constants.ai_keys import AiProvider
 from app.constants.publish import PublishTarget
 from app.core.database import utc_now
-from app.core.security import InvalidTokenError, generate_token, pkce_challenge
+from app.core.security import InvalidTokenError, TokenCipher, generate_token, pkce_challenge
+from app.models.github_credential import GithubCredential
 from app.schemas.ai_key import ModelChoice
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
 from app.schemas.github import (
     GithubActionsKey,
     GithubBranchHead,
+    GithubCommit,
+    GithubCredentialUpsert,
     GithubDirEntry,
     GithubFile,
     GithubRepo,
@@ -36,10 +40,26 @@ from app.schemas.github import (
 )
 from app.schemas.supabase import SupabaseSession, SupabaseUser
 from app.schemas.template import TemplateEntry, TemplateFiles
-from app.services.workspace_service import git_blob_sha
+from app.utils.git import git_blob_sha
 
 VALID_CODE = "good-code"
 GITHUB_TOKEN = "gho_access"
+FAKE_CIPHER = TokenCipher(Fernet.generate_key().decode())
+
+
+class FakeCredentials:
+    """A stored GitHub token for every user (encrypted with `FAKE_CIPHER`), or none."""
+
+    def __init__(self, token: str | None = GITHUB_TOKEN) -> None:
+        self.token = token
+
+    async def get(self, user_id: UUID) -> GithubCredential | None:
+        if self.token is None:
+            return None
+        return GithubCredential(user_id=user_id, access_token=FAKE_CIPHER.encrypt(self.token))
+
+    async def upsert(self, data: GithubCredentialUpsert) -> GithubCredential:
+        raise NotImplementedError
 
 
 class FakeSupabaseClient:
@@ -127,6 +147,8 @@ class FakeGithubClient:
         # Seconds that reading the branch head and committing take (a slow GitHub).
         self.head_delay = 0.0
         self.commit_delay = 0.0
+        # Set when a commit starts (before its delay).
+        self.commit_started = asyncio.Event()
         # The token's OAuth scopes (None: GitHub didn't say).
         self.scopes: set[str] | None = {"repo", "workflow"}
         # Actions secrets per repo, decrypted with the repo's private key (so tests see what was sealed).
@@ -140,6 +162,9 @@ class FakeGithubClient:
         self.dispatch_not_ready = 0
         self.run_queries: list[str | None] = []
         self.blob_reads = 0
+        # Every commit by SHA: (tree SHA, parent SHA or "", message).
+        self.commit_objects: dict[str, tuple[str, str, str]] = {}
+        self.archive_reads: list[tuple[str, str]] = []
 
     async def get_user(self, access_token: str) -> GithubUser:
         self.tokens_seen.append(access_token)
@@ -198,6 +223,7 @@ class FakeGithubClient:
         *,
         message: str,
     ) -> str:
+        self.commit_started.set()
         await asyncio.sleep(self.commit_delay)
         self._before_write(full_name)
         if self.races:
@@ -216,6 +242,24 @@ class FakeGithubClient:
 
     async def get_tree(self, access_token: str, full_name: str, tree_sha: str) -> dict[str, str]:
         return {path: file.sha for path, file in self.trees[tree_sha].items()}
+
+    async def get_commit(self, access_token: str, full_name: str, sha: str) -> GithubCommit:
+        if sha not in self.commit_objects:
+            raise GithubNotFoundError()
+        tree, parent, message = self.commit_objects[sha]
+        return GithubCommit(sha=sha, tree_sha=tree, parents=[parent] if parent else [], message=message)
+
+    async def get_archive(self, access_token: str, full_name: str, ref: str) -> dict[str, bytes]:
+        self.archive_reads.append((full_name, ref))
+        if full_name not in self.repos:
+            raise GithubNotFoundError()
+        if ref == self.repos[full_name].default_branch:
+            ref = self.heads[full_name].commit_sha
+        if ref not in self.commit_objects:
+            raise GithubNotFoundError()
+        return {
+            path: _RAW.get(f.sha, f.content.encode()) for path, f in self.trees[self.commit_objects[ref][0]].items()
+        }
 
     async def get_blob(self, access_token: str, full_name: str, sha: str) -> str:
         self.blob_reads += 1
@@ -302,16 +346,24 @@ class FakeGithubClient:
         parent = self.heads[full_name].commit_sha if full_name in self.heads else ""
         commit = hashlib.sha1(f"{parent}{tree.hexdigest()}{message}".encode(), usedforsecurity=False).hexdigest()
         self.trees[tree.hexdigest()] = files
+        self.commit_objects[commit] = (tree.hexdigest(), parent, message)
         self.heads[full_name] = GithubBranchHead(commit_sha=commit, tree_sha=tree.hexdigest())
         self.files[full_name] = files
         if record:
             self.commits.append((full_name, message, paths))
 
 
+# The bytes of every binary file the fake GitHub holds, by blob SHA (its `GithubFile` text is the base64).
+_RAW: dict[str, bytes] = {}
+
+
 def _file(content: str | bytes) -> GithubFile:
     """A file with the SHA git gives that content (a binary file's text is its base64)."""
+    sha = git_blob_sha(content)
+    if isinstance(content, bytes):
+        _RAW[sha] = content
     text = content if isinstance(content, str) else base64.b64encode(content).decode()
-    return GithubFile(content=text, sha=git_blob_sha(content))
+    return GithubFile(content=text, sha=sha)
 
 
 class FakeTemplateCatalog:
@@ -396,9 +448,10 @@ class FakeModelClient:
 
     name = "fake-model"
 
-    def __init__(self, *replies: str) -> None:
+    def __init__(self, *replies: str, accepts_images: bool = False) -> None:
         self.replies = list(replies)
         self.calls: list[list[ChatMessage]] = []
+        self.accepts_images = accepts_images
 
     async def complete(self, messages: list[ChatMessage]) -> str:
         self.calls.append(list(messages))

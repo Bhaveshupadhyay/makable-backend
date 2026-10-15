@@ -4,7 +4,7 @@ file's real text at that place."""
 from pydantic import ValidationError
 
 from app.agents.ai_edit.prompts.system import REPAIR_PROMPT
-from app.schemas.ai_edit import AiEditRequest, FileEdit
+from app.schemas.ai_edit import FileEdit
 from app.utils.edit_diagnosis import (
     MIN_MATCH,
     count_occurrences,
@@ -29,14 +29,15 @@ def repair_prompt(report: str) -> str:
     return f"{REPAIR_PROMPT}\n\n<rejection_report>\n{report}\n</rejection_report>"
 
 
-def rejection_report(request: AiEditRequest, edits: list[FileEdit] | None, err: Exception) -> str:
-    """Explains a rejected answer to the model. `edits` is None when the reply wasn't a valid answer at all."""
+def rejection_report(files: dict[str, str], edits: list[FileEdit] | None, err: Exception) -> str:
+    """Explains a rejected answer to the model, from the site's files (at the request's base commit). `edits` is None
+    when the reply wasn't a valid answer at all."""
     if not isinstance(err, FileEditError) or edits is None:
         report = _invalid_answer(err)
     elif err.edit is not None and 1 <= err.edit <= len(edits):
-        report = _failed_edit(request, edits, err.edit, err)
+        report = _failed_edit(files, edits, err.edit, err)
     else:
-        report = _whole_answer(request, edits, err)
+        report = _whole_answer(files, edits, err)
     return report if len(report) <= MAX_REPORT_CHARS else report[: MAX_REPORT_CHARS - 1] + "…"
 
 
@@ -47,8 +48,8 @@ def _invalid_answer(err: Exception) -> str:
         )
         return (
             f"Your reply was JSON, but not in the answer format: {problems}.\n"
-            'It must be {"summary": "...", "edits": [{"path": "...", "search": "...", "replace": "..."}]} '
-            'or {"escalate": "..."}.'
+            'It must be {"summary": "...", "edits": [{"path": "...", "search": "...", "replace": "..."}]}, '
+            '{"needContext": {"path": "...", "lines": [first, last]}} or {"escalate": "..."}.'
         )
     return (
         f"Your reply couldn't be read as JSON ({err}). Reply with exactly one JSON object; escape newlines in "
@@ -56,7 +57,7 @@ def _invalid_answer(err: Exception) -> str:
     )
 
 
-def _failed_edit(request: AiEditRequest, edits: list[FileEdit], index: int, err: FileEditError) -> str:
+def _failed_edit(site_files: dict[str, str], edits: list[FileEdit], index: int, err: FileEditError) -> str:
     edit = edits[index - 1]
     lines = [f"Edit {index} of {len(edits)} ({edit.path}) was rejected: {_reason(err)}."]
     if err.kind == "forbidden":
@@ -69,23 +70,24 @@ def _failed_edit(request: AiEditRequest, edits: list[FileEdit], index: int, err:
     if index < len(edits):
         lines.append(f"Edits after it ({index + 1}-{len(edits)}) weren't checked yet.")
     # The file as the failing edit saw it: the earlier edits applied. They did apply (the check stopped at this
-    # one), but a report must never fail, so fall back to the files as sent.
-    as_sent = {f.path: f.content for f in request.files}
+    # one), but a report must never fail, so fall back to the site's files.
     try:
-        files = apply_file_edits(as_sent, edits[: index - 1]).files
+        files = apply_file_edits(site_files, edits[: index - 1]).files
     except FileEditError:
-        files = as_sent
+        files = site_files
     text = files.get(edit.path)
     lines.append("")
     if err.kind == "not_found" and text is not None:
         lines += _not_found(files, edit, text)
     elif err.kind == "ambiguous" and text is not None:
         lines += _ambiguous(edit, text)
-    elif err.kind == "file_not_sent":
-        sent = ", ".join(f.path for f in request.files)
-        lines.append(f"Only the files you were given can be edited: {sent}. Edit one of those, or escalate.")
+    elif err.kind == "file_not_found":
+        lines.append(
+            f"There's no file {edit.path} in the site (see <file_list>). Edit a file that exists, or create this one "
+            'with an empty "search" and the whole file as "replace".'
+        )
     elif err.kind == "empty_search":
-        lines.append('"search" must contain text that is already in the file.')
+        lines.append(f'{edit.path} already exists, so "search" must contain text that is already in it.')
     elif err.kind == "too_large":
         lines.append("The edit makes the file too large. Replace a smaller part of it.")
     elif err.kind == "no_change":
@@ -157,7 +159,7 @@ def _ambiguous(edit: FileEdit, text: str) -> list[str]:
     return lines
 
 
-def _whole_answer(request: AiEditRequest, edits: list[FileEdit], err: FileEditError) -> str:
+def _whole_answer(site_files: dict[str, str], edits: list[FileEdit], err: FileEditError) -> str:
     """Problems with the result of all the edits together: nothing changed, or a file no longer parses."""
     if err.kind == "no_change":
         return (
@@ -168,17 +170,12 @@ def _whole_answer(request: AiEditRequest, edits: list[FileEdit], err: FileEditEr
     if err.path is not None:
         touching = ", ".join(str(i) for i, e in enumerate(edits, start=1) if e.path == err.path)
         lines.append(f"The edits to {err.path} are: {touching}. One of them breaks the file.")
-        text = apply_file_edits({f.path: f.content for f in request.files}, edits).files.get(err.path)
+        text = apply_file_edits(site_files, edits).files.get(err.path)
         if text is not None and err.offset is not None:
             lines += [
                 f"The problem is at {line_col(text, err.offset)} of the edited file:",
                 _quote(excerpt(text, err.offset)),
             ]
-        if err.path == request.template.content_path:
-            lines.append(
-                "The content file is a JSON object literal: double quotes, no trailing commas, no comments, "
-                "and the same keys as before."
-            )
     return "\n".join(lines)
 
 

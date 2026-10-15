@@ -1,4 +1,5 @@
-"""Mirrors `@makable/shared` `ai-edit-files.test.ts`: the SPA applies the same edits with the TypeScript original."""
+"""Started as a mirror of `@makable/shared` `ai-edit-files.test.ts`; the server now applies edits itself, and also
+creates files."""
 
 import pytest
 
@@ -42,7 +43,8 @@ def test_falls_back_to_a_line_match_that_ignores_indentation() -> None:
     [
         ([edit("src/Hero.tsx", "nope", "x")], "not found"),
         ([edit("src/index.css", "a { color: red; }", "x")], "more than once"),
-        ([edit("src/App.tsx", "a", "b")], "wasn't sent"),
+        ([edit("src/App.tsx", "a", "b")], "no such file"),
+        ([edit("src/Hero.tsx", "", "x")], "the file exists"),
         ([edit("src/Hero.tsx", "Contact", "Hi"), edit("src/Hero.tsx", "Contact", "Again")], "edit 2"),
     ],
 )
@@ -56,7 +58,7 @@ def test_rejects_missing_ambiguous_and_unknown_file_edits(edits: list[FileEdit],
     [
         ([edit("src/Hero.tsx", "nope", "x")], "not_found", 1, "src/Hero.tsx"),
         ([edit("src/Hero.tsx", "Contact", "Hi"), edit("src/index.css", "a {", "b {")], "ambiguous", 2, "src/index.css"),
-        ([edit("src/App.tsx", "a", "b")], "file_not_sent", 1, "src/App.tsx"),
+        ([edit("src/App.tsx", "a", "b")], "file_not_found", 1, "src/App.tsx"),
         ([edit("src/Hero.tsx", "\n\n", "x")], "empty_search", 1, "src/Hero.tsx"),
     ],
 )
@@ -78,6 +80,21 @@ def test_later_edits_see_earlier_ones_and_no_op_edits_are_not_changes() -> None:
 
 def test_the_size_cap_counts_like_javascript() -> None:
     # An emoji is one code point in Python but two UTF-16 code units in JavaScript.
-    files = {"a.txt": "x"}
+    # 100,001 characters here, 200,001 in JavaScript: one past the cap.
+    files = {"a.txt": "😀" * 100_000 + "x"}
     with pytest.raises(FileEditError, match="too large"):
-        apply_file_edits(files, [edit("a.txt", "x", "😀" * 30_001)])
+        apply_file_edits(files, [edit("a.txt", "x", "y")])
+
+
+def test_an_empty_search_creates_a_new_file_that_later_edits_can_change() -> None:
+    result = apply_file_edits(
+        FILES,
+        [
+            edit("src/Contact.tsx", "", "export function Contact() {\n  return <p>Hi</p>\n}\n"),
+            edit("src/Contact.tsx", "Hi", "Hello"),
+        ],
+    )
+
+    assert result.files["src/Contact.tsx"] == "export function Contact() {\n  return <p>Hello</p>\n}\n"
+    assert result.changed == ["src/Contact.tsx"]
+    assert "src/Contact.tsx" not in FILES

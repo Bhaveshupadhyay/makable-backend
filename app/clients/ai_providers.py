@@ -8,6 +8,7 @@ import httpx
 
 from app.clients.model import raise_for_provider_status
 from app.constants.ai_keys import (
+    IMAGE_MODEL,
     KEY_CHECK_TIMEOUT_SECONDS,
     MAX_LISTED_MODELS,
     MODEL_ID,
@@ -28,11 +29,23 @@ class AiProviderError(ExternalServiceError):
     message = "The AI provider didn't answer as expected. Try again shortly."
 
 
+def model_accepts_images(model: str) -> bool:
+    """Whether a model reads images, from its id (providers' model lists don't say). OpenRouter's ids carry the
+    provider (`openai/gpt-4o`): the part after the slash is what counts."""
+    return bool(IMAGE_MODEL.search(model.rsplit("/", 1)[-1]))
+
+
 def provider_endpoint(provider: AiProvider, api_key: str, model: str) -> ModelEndpoint:
     """How to call `model` at `provider` with the user's key."""
     spec = PROVIDERS[provider]
     headers = {name: value.replace("{key}", api_key) for name, value in spec.extra_headers.items()}
-    return ModelEndpoint(base_url=spec.base_url, api_key=api_key, model=model, headers=headers)
+    return ModelEndpoint(
+        base_url=spec.base_url,
+        api_key=api_key,
+        model=model,
+        headers=headers,
+        accepts_images=model_accepts_images(model),
+    )
 
 
 class AiProviderClient(Protocol):

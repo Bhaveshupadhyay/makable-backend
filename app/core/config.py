@@ -110,6 +110,8 @@ class Settings(DatabaseSettings):
     ai_api_key: SecretStr | None = None
     ai_model: str = "auto"
     ai_timeout_seconds: float = Field(default=90, gt=0)
+    # Whether makable's own model reads images (a picture of the selected element goes with AI edits then).
+    ai_accepts_images: bool = False
     # Adds what the model was given to AI edit responses. Never turn it on in production.
     ai_debug: bool = False
 

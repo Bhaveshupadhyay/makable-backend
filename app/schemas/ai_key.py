@@ -91,6 +91,8 @@ class AiModelOption(CamelModel):
     key_id: UUID | None
     provider: AiProvider | None
     model: str
+    # The model reads images: the SPA sends a picture of the selected element with the request.
+    accepts_images: bool = False
 
 
 class ModelChoice(CamelModel):
@@ -124,3 +126,4 @@ class ModelEndpoint(BaseModel):
     api_key: str | None
     model: str
     headers: dict[str, str] = {}
+    accepts_images: bool = False

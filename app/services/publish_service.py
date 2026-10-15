@@ -54,7 +54,8 @@ from app.schemas.publish import (
 from app.schemas.template import TemplateEntry, TemplateFiles
 from app.schemas.user import UserRead
 from app.services.publish_workflows import render_workflow
-from app.services.workspace_service import WorkspaceService, git_blob_sha
+from app.services.workspace_service import WorkspaceService
+from app.utils.git import git_blob_sha
 from app.utils.portfolio_source import render_portfolio_source
 
 logger = logging.getLogger(__name__)

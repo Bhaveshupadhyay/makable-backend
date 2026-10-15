@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from app.api.dependencies import get_model_client
 from app.core.lifespan import refuse_tracing
-from app.tests.ai_edit_fixtures import GOOD_REPLY, PROJECT_ID, request_body
+from app.tests.ai_edit_fixtures import GOOD_REPLY, PROJECT_ID, create_site, request_body
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import FakeModelClient
 
@@ -34,9 +34,15 @@ def test_a_site_with_no_requests_has_an_empty_chat(client: TestClient) -> None:
 
 def test_the_chat_comes_from_the_server_and_start_over_clears_it(client: TestClient, model: FakeModelClient) -> None:
     sign_in(client)
+    base = create_site(client)
     model.replies += [GOOD_REPLY, '{"escalate": "Needs the navbar."}']
-    assert client.post(EDIT, json=request_body()).status_code == 200
-    assert client.post(EDIT, json=request_body(instruction="Make it bigger", target=None)).status_code == 200
+    applied = client.post(EDIT, json=request_body(baseCommit=base))
+    assert applied.status_code == 200
+    head = applied.json()["data"]["commitSha"]
+    assert (
+        client.post(EDIT, json=request_body(instruction="Make it bigger", target=None, baseCommit=head)).status_code
+        == 200
+    )
 
     turns = client.get(THREAD).json()["data"]["turns"]
 
@@ -49,6 +55,8 @@ def test_the_chat_comes_from_the_server_and_start_over_clears_it(client: TestCli
     assert client.delete(THREAD).status_code == 204
     assert client.get(THREAD).json()["data"]["turns"] == []
     assert client.delete(THREAD).status_code == 204
+    # The site is forgotten (its repo stays on GitHub).
+    assert client.get(f"/api/v1/sites/{PROJECT_ID}").status_code == 404
 
 
 def test_an_edit_needs_the_project_id(client: TestClient, model: FakeModelClient) -> None:

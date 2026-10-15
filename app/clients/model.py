@@ -66,6 +66,9 @@ class ModelClient(Protocol):
     @property
     def name(self) -> str: ...
 
+    @property
+    def accepts_images(self) -> bool: ...
+
     async def complete(self, messages: list[ChatMessage]) -> str: ...
 
 
@@ -79,11 +82,16 @@ class HttpModelClient:
         if endpoint.api_key:
             self._headers["Authorization"] = f"Bearer {endpoint.api_key}"
         self._model = endpoint.model
+        self._accepts_images = endpoint.accepts_images
         self._timeout = timeout_seconds
 
     @property
     def name(self) -> str:
         return self._model
+
+    @property
+    def accepts_images(self) -> bool:
+        return self._accepts_images
 
     async def complete(self, messages: list[ChatMessage]) -> str:
         """Returns the reply's text.
@@ -95,7 +103,7 @@ class HttpModelClient:
         """
         body = {
             "model": self._model,
-            "messages": [m.model_dump() for m in messages],
+            "messages": [m.model_dump(exclude_none=True) for m in messages],
             "temperature": 0.2,
             "stream": False,
         }

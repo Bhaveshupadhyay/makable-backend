@@ -9,7 +9,7 @@ import pytest
 from app.clients.model import AiKeyInvalidError, HttpModelClient, ModelRateLimitedError, ModelUnavailableError
 from app.core.limits import ServiceBusyError
 from app.schemas.ai_key import ModelEndpoint
-from app.schemas.chat import ChatMessage
+from app.schemas.chat import ChatMessage, ImagePart, ImageUrl, TextPart
 
 URL = "http://model.test/v1"
 MESSAGES = [ChatMessage(role="user", content="hi")]
@@ -110,3 +110,24 @@ async def test_a_rate_limit_carries_the_providers_wait() -> None:
         await client(lambda _: response).complete(MESSAGES)
     assert err.value.details == {"retryAfter": 12}
     assert err.value.headers == {"Retry-After": "12"}
+
+
+async def test_a_message_with_a_picture_is_sent_as_content_parts() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    endpoint = ModelEndpoint(base_url="https://api.example.com/v1", api_key="k", model="gpt-4o", accepts_images=True)
+    model = HttpModelClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), endpoint, timeout_seconds=5)
+    message = ChatMessage(role="user", content=[TextPart(text="hi"), ImagePart(image_url=ImageUrl(url="data:x"))])
+
+    assert await model.complete([message]) == "ok"
+    assert model.accepts_images
+    assert seen[0]["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:x"}}],
+        }
+    ]

@@ -1,7 +1,7 @@
 import pytest
 
 from app.schemas.portfolio import Portfolio
-from app.tests.ai_edit_fixtures import PORTFOLIO, render_portfolio_source
+from app.tests.portfolio_fixtures import PORTFOLIO, render_portfolio_source
 from app.utils.portfolio_source import PortfolioSourceError, parse_portfolio_source
 from app.utils.portfolio_source import render_portfolio_source as render
 from app.utils.syntax_check import (

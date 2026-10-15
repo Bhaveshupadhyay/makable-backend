@@ -30,12 +30,12 @@ from app.services.workspace_service import (
     WorkspacePartNotFoundError,
     WorkspaceService,
     WorkspaceSessionNotFoundError,
-    git_blob_sha,
 )
-from app.tests.ai_edit_fixtures import PORTFOLIO, render_portfolio_source
 from app.tests.fakes import VALID_PLATFORM_TOKEN, FakeDeployPlatforms, FakeGithubClient, FakeTemplateCatalog
+from app.tests.portfolio_fixtures import PORTFOLIO, render_portfolio_source
 from app.tests.services.test_workspace_service import CIPHER, USER, FakeCredentials, no_sleep
 from app.tests.session_fixtures import PROJECT_ID, save_body
+from app.utils.git import git_blob_sha
 
 PAGES_REPO = "octocat/octocat.github.io"
 NOW = datetime(2026, 10, 11, 13, 45, 7, 512000, tzinfo=UTC)

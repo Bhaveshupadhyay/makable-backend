@@ -12,7 +12,7 @@ from app.core.security import TokenCipher
 from app.models.ai_key import AiKey
 from app.schemas.ai_key import ModelEndpoint
 from app.schemas.chat import ChatMessage
-from app.tests.ai_edit_fixtures import GOOD_REPLY, request_body
+from app.tests.ai_edit_fixtures import GOOD_REPLY, create_site, request_body
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import VALID_AI_KEY, FakeAiProviders, FakeModelClient
 
@@ -129,9 +129,9 @@ def test_models_are_picked_and_shown_in_the_menu(client: TestClient, models: dic
 
     assert res.json()["data"]["models"] == ["o4-mini", "gpt-5"]
     assert client.get(f"{AI}/models").json()["data"] == [
-        {"keyId": None, "provider": None, "model": "fake-model"},
-        {"keyId": key["id"], "provider": "openai", "model": "o4-mini"},
-        {"keyId": key["id"], "provider": "openai", "model": "gpt-5"},
+        {"keyId": None, "provider": None, "model": "fake-model", "acceptsImages": False},
+        {"keyId": key["id"], "provider": "openai", "model": "o4-mini", "acceptsImages": True},
+        {"keyId": key["id"], "provider": "openai", "model": "gpt-5", "acceptsImages": True},
     ]
 
 
@@ -202,10 +202,13 @@ def test_key_checks_are_rate_limited(client: TestClient) -> None:
 
 def test_an_edit_uses_the_picked_model_with_the_users_key(client: TestClient, models: dict[str, Any]) -> None:
     sign_in(client)
+    base = create_site(client)
     key = add_key(client, provider="anthropic", models=["gpt-5"]).json()["data"]["key"]
     models["user"].replies.append(GOOD_REPLY)
 
-    res = client.post("/api/v1/ai/edit", json=request_body(model={"keyId": key["id"], "model": "gpt-5"}))
+    res = client.post(
+        "/api/v1/ai/edit", json=request_body(baseCommit=base, model={"keyId": key["id"], "model": "gpt-5"})
+    )
 
     assert res.status_code == 200
     assert models["default"].calls == []
@@ -215,22 +218,27 @@ def test_an_edit_uses_the_picked_model_with_the_users_key(client: TestClient, mo
         api_key=VALID_AI_KEY,
         model="gpt-5",
         headers={"x-api-key": VALID_AI_KEY, "anthropic-version": "2023-06-01"},
+        accepts_images=True,
     )
 
 
 def test_an_edit_without_a_pick_uses_makables_model(client: TestClient, models: dict[str, Any]) -> None:
     sign_in(client)
+    base = create_site(client)
     models["default"].replies.append(GOOD_REPLY)
 
-    assert client.post("/api/v1/ai/edit", json=request_body()).status_code == 200
+    assert client.post("/api/v1/ai/edit", json=request_body(baseCommit=base)).status_code == 200
     assert models["endpoints"] == []
 
 
 def test_an_edit_with_a_model_that_isnt_turned_on_is_refused(client: TestClient, models: dict[str, Any]) -> None:
     sign_in(client)
+    base = create_site(client)
     key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
 
-    res = client.post("/api/v1/ai/edit", json=request_body(model={"keyId": key["id"], "model": "o4-mini"}))
+    res = client.post(
+        "/api/v1/ai/edit", json=request_body(baseCommit=base, model={"keyId": key["id"], "model": "o4-mini"})
+    )
 
     assert (res.status_code, res.json()["error"]["code"]) == (422, "ai_model_not_enabled")
     assert models["endpoints"] == []
@@ -238,16 +246,17 @@ def test_an_edit_with_a_model_that_isnt_turned_on_is_refused(client: TestClient,
 
 def test_a_key_refused_during_an_edit_is_marked_invalid(client: TestClient, models: dict[str, Any]) -> None:
     sign_in(client)
+    base = create_site(client)
     key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
     models["user"] = RefusingModel()
     pick = {"keyId": key["id"], "model": "gpt-5"}
 
-    res = client.post("/api/v1/ai/edit", json=request_body(model=pick))
+    res = client.post("/api/v1/ai/edit", json=request_body(baseCommit=base, model=pick))
 
     assert (res.status_code, res.json()["error"]["code"]) == (422, "ai_key_invalid")
     assert client.get(f"{AI}/keys").json()["data"][0]["status"] == "invalid"
     # Later edits with it are refused without calling the provider.
-    again = client.post("/api/v1/ai/edit", json=request_body(model=pick))
+    again = client.post("/api/v1/ai/edit", json=request_body(baseCommit=base, model=pick))
     assert again.json()["error"]["code"] == "ai_key_invalid"
     assert len(models["endpoints"]) == 1
 
@@ -257,10 +266,13 @@ def test_without_makables_model_the_menu_has_only_the_users_and_an_edit_must_pic
 ) -> None:
     client.app.dependency_overrides[get_model_client] = lambda: None  # type: ignore[attr-defined]
     sign_in(client)
+    base = create_site(client)
     assert client.get(f"{AI}/models").json()["data"] == []
 
-    res = client.post("/api/v1/ai/edit", json=request_body())
+    res = client.post("/api/v1/ai/edit", json=request_body(baseCommit=base))
 
     assert (res.status_code, res.json()["error"]["code"]) == (422, "ai_model_required")
     key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
-    assert client.get(f"{AI}/models").json()["data"] == [{"keyId": key["id"], "provider": "openai", "model": "gpt-5"}]
+    assert client.get(f"{AI}/models").json()["data"] == [
+        {"keyId": key["id"], "provider": "openai", "model": "gpt-5", "acceptsImages": True}
+    ]

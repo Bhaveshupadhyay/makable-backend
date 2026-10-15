@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import logging
 import time
@@ -41,6 +40,7 @@ from app.schemas.workspace import (
     WorkspaceStateRead,
     check_part_path,
 )
+from app.utils.git import git_blob_sha
 
 logger = logging.getLogger(__name__)
 
@@ -452,9 +452,3 @@ def _conflict_details(current: GithubFile | None) -> dict[str, str] | None:
 def _serialize(state: WorkspaceState) -> str:
     # exclude_unset keeps explicit nulls (a draft with no portfolio yet) and leaves out fields the SPA omitted.
     return json.dumps(state.model_dump(mode="json", by_alias=True, exclude_unset=True), indent=2) + "\n"
-
-
-def git_blob_sha(content: str | bytes) -> str:
-    """The SHA git (and so GitHub) gives a file with this content: what the next save must send back."""
-    data = content.encode() if isinstance(content, str) else content
-    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()

@@ -24,10 +24,10 @@ from app.services.workspace_service import (
     WorkspaceSaveTimeoutError,
     WorkspaceService,
     WorkspaceSessionNotFoundError,
-    git_blob_sha,
 )
 from app.tests.fakes import FakeGithubClient
 from app.tests.session_fixtures import AI_HISTORY, PROJECT_ID, chunk, save_body
+from app.utils.git import git_blob_sha
 
 CIPHER = TokenCipher(Fernet.generate_key().decode())
 USER = UserRead(id=uuid4(), login="octocat", name=None, avatar_url="https://github.com/octocat.png", role=Role.USER)

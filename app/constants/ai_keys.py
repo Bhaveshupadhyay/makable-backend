@@ -71,6 +71,15 @@ NOT_CHAT_MODEL = re.compile(
     re.IGNORECASE,
 )
 # Most models a provider's list is cut to (OpenRouter lists hundreds).
+# Model ids of models that read images (the selected element's picture goes with AI edits to them). A model not
+# matched just gets no picture.
+IMAGE_MODEL = re.compile(
+    r"^(gpt-4o|chatgpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|o1(?!-mini)|o3|o4|claude-(3|sonnet|opus|haiku-4|.*-4)|gemini"
+    r"|gemma-3|grok-4|grok-.*vision|pixtral|llama-4|mistral-(medium|small)-(3|2505|2506|latest))"
+    r"|vision|-vl\b|-vl-",
+    re.IGNORECASE,
+)
+
 MAX_LISTED_MODELS = 500
 # Models a key can show in the chat's model menu.
 MAX_ENABLED_MODELS = 20

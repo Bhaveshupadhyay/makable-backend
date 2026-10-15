@@ -25,9 +25,12 @@ from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_PUBLISH_REQUESTS,
+    MAX_CONCURRENT_SITE_REQUESTS,
     MAX_CONCURRENT_WORKSPACE_REQUESTS,
     PUBLISH_BURST,
     PUBLISH_EVERY_SECONDS,
+    SITE_SAVE_BURST,
+    SITE_SAVE_EVERY_SECONDS,
     WORKSPACE_SAVE_BURST,
     WORKSPACE_SAVE_EVERY_SECONDS,
 )
@@ -38,14 +41,14 @@ from app.core.exceptions import ForbiddenError
 from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
 from app.core.security import PayloadSigner, TokenCipher
 from app.repositories.ai_key import AiKeyRepository, SqlAiKeyRepository
-from app.repositories.ai_thread import (
-    AiEditRecordRepository,
-    AiThreadRepository,
-    SqlAiEditRecordRepository,
-    SqlAiThreadRepository,
-)
 from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
 from app.repositories.health import HealthRepository, SqlHealthRepository
+from app.repositories.site import (
+    AiEditRecordRepository,
+    SiteRepository,
+    SqlAiEditRecordRepository,
+    SqlSiteRepository,
+)
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
 from app.repositories.user import SqlUserRepository, UserRepository
 from app.schemas.ai_key import ModelEndpoint
@@ -55,6 +58,7 @@ from app.services.ai_key_service import AiKeyService, ModelClientFactory
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 from app.services.publish_service import PublishService
+from app.services.site_service import SiteService
 from app.services.workspace_service import WorkspaceService
 
 # --- App-wide singletons ---
@@ -101,6 +105,7 @@ def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient 
         base_url=settings.ai_base_url,
         api_key=settings.ai_api_key.get_secret_value() if settings.ai_api_key else None,
         model=settings.ai_model,
+        accepts_images=settings.ai_accepts_images,
     )
     return HttpModelClient(http, endpoint, timeout_seconds=settings.ai_timeout_seconds)
 
@@ -148,8 +153,8 @@ def get_ai_key_repository(session: DbSessionDep) -> AiKeyRepository:
     return SqlAiKeyRepository(session)
 
 
-def get_ai_thread_repository(session: DbSessionDep) -> AiThreadRepository:
-    return SqlAiThreadRepository(session)
+def get_site_repository(session: DbSessionDep) -> SiteRepository:
+    return SqlSiteRepository(session)
 
 
 def get_ai_edit_record_repository(session: DbSessionDep) -> AiEditRecordRepository:
@@ -202,15 +207,26 @@ def get_ai_key_service(
     return AiKeyService(keys, providers, cipher, uow, default_model=default_model, model_client=model_client)
 
 
+def get_site_service(
+    github: Annotated[GithubClient, Depends(get_github_client)],
+    sites: Annotated[SiteRepository, Depends(get_site_repository)],
+    credentials: Annotated[GithubCredentialRepository, Depends(get_github_credential_repository)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+    uow: UnitOfWorkDep,
+) -> SiteService:
+    return SiteService(github, sites, credentials, cipher, uow)
+
+
 def get_ai_edit_service(
     models: Annotated[AiKeyService, Depends(get_ai_key_service)],
-    threads: Annotated[AiThreadRepository, Depends(get_ai_thread_repository)],
+    site_service: Annotated[SiteService, Depends(get_site_service)],
+    sites: Annotated[SiteRepository, Depends(get_site_repository)],
     records: Annotated[AiEditRecordRepository, Depends(get_ai_edit_record_repository)],
     uow: UnitOfWorkDep,
     checkpointer: CheckpointerDep,
     settings: SettingsDep,
 ) -> AiEditService:
-    return AiEditService(models, threads, records, uow, checkpointer, AI_RUNS, debug=settings.ai_debug)
+    return AiEditService(models, site_service, sites, records, uow, checkpointer, AI_RUNS, debug=settings.ai_debug)
 
 
 def get_workspace_service(
@@ -236,6 +252,7 @@ AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
 WorkspaceServiceDep = Annotated[WorkspaceService, Depends(get_workspace_service)]
 AiEditServiceDep = Annotated[AiEditService, Depends(get_ai_edit_service)]
+SiteServiceDep = Annotated[SiteService, Depends(get_site_service)]
 AiKeyServiceDep = Annotated[AiKeyService, Depends(get_ai_key_service)]
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
 
@@ -279,6 +296,8 @@ PUBLISHES = PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS)
 AI_KEY_CHECKS = PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS)
 # One AI request at a time per site (and per user), including Start over. The service holds it.
 AI_RUNS = KeyLock(AiRunInProgressError)
+SITE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_SITE_REQUESTS)
+SITE_SAVES = PerKeyLimit(burst=SITE_SAVE_BURST, every=SITE_SAVE_EVERY_SECONDS)
 
 
 async def ai_edit_slot() -> AsyncIterator[None]:
@@ -342,4 +361,25 @@ async def ai_key_check_limit(user: CurrentUserDep) -> AsyncIterator[None]:
         TooManyRequestsError: The user has one in progress, or checked too often.
     """
     async with AI_KEY_CHECKS.hold(user.id):
+        yield
+
+
+async def site_slot() -> AsyncIterator[None]:
+    """A slot for a site request (it waits on GitHub), held until the response is done.
+
+    Raises:
+        ServiceBusyError: This worker has as many in progress as it allows.
+    """
+    async with SITE_SLOTS.slot():
+        yield
+
+
+async def site_save_limit(user: CurrentUserDep) -> AsyncIterator[None]:
+    """One save of manual edits at a time per user, in bursts of at most `SITE_SAVE_BURST`, then one per
+    `SITE_SAVE_EVERY_SECONDS`.
+
+    Raises:
+        TooManyRequestsError: The user has a save in progress, or saved too often.
+    """
+    async with SITE_SAVES.hold(user.id):
         yield
