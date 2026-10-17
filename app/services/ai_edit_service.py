@@ -8,6 +8,7 @@ from langgraph.types import Command, StateSnapshot
 
 from app.agents.ai_edit import EditRun, EditState, RunResult, compile_edit_graph, result_of, run_input, turn_for
 from app.agents.create_site import compile_create_graph
+from app.agents.thread import UserReply
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
@@ -143,7 +144,8 @@ class AiEditService:
             request = AiEditRequest.model_validate(
                 {**paused.values["request"], "base_commit": body.base_commit, "screenshot": body.screenshot}
             )
-            resume: Command[Any] = Command(resume=body.answer, update={"base_commit": body.base_commit})
+            reply = UserReply(answer=body.answer, chat=body.chat)
+            resume: Command[Any] = Command(resume=reply, update={"base_commit": body.base_commit})
             return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
 
     async def report(self, user: UserRead, project_id: UUID, body: AiEditPreviewReport) -> AiEditResult:
@@ -216,13 +218,20 @@ class AiEditService:
                 instruction=creation.values["prompt"],
                 target=None,
                 question=Question.model_validate(asked),
+                questions=creation.values.get("questions", []),
+                steps=creation.values.get("steps", []),
             )
             return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)
         kind = pause_kind(snapshot)
         if kind is None:
             return AiThreadRead(project_id=project_id, status="idle", turns=turns)
         values = snapshot.values
-        run = AiPausedRun(run_id=values["run_id"], instruction=values["instruction"], target=values.get("target"))
+        run = AiPausedRun(
+            run_id=values["run_id"],
+            instruction=values["instruction"],
+            target=values.get("target"),
+            questions=values.get("questions", []),
+        )
         if kind == "question":
             run.question = Question.model_validate(pause_value(snapshot))
             return AiThreadRead(project_id=project_id, status="needs_input", turns=turns, run=run)

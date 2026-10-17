@@ -22,9 +22,10 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     plan, index = state["plan"], state["index"]
     file = plan[index]
     path = file["path"]
-    progress("write", f"Writing {path}", path=path, done=index, total=len(plan))
+    said = progress("write", f"Writing {path}", path=path, done=index, total=len(plan))
     base = await run.base_files(state["base_commit"])
-    text = f"{CREATE_SYSTEM}\n\n{write_prompt(state['prompt'], state['name'], plan, file, run.files, base)}"
+    asked = state["brief"]
+    text = f"{CREATE_SYSTEM}\n\n{write_prompt(state['prompt'], state['name'], asked, plan, file, run.files, base)}"
     run.model_input = text
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
@@ -49,6 +50,7 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         "written": [*state["written"], path],
         "attempt": attempt,
         "model": model.name,
+        "steps": said,
         "step": "write" if nxt < len(plan) else "verify",
     }
 

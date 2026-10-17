@@ -1,17 +1,19 @@
 """The create agent's prompts: the plan, each file, and the fixes the checks ask for."""
 
 from app.agents.create_site.state import PlannedFile
+from app.agents.create_site.tools.brief import brief_block
 from app.agents.create_site.tools.checks import exported_names
+from app.agents.thread import QuestionAnswer
 from app.constants.ai_create import MAX_CREATE_FILES, SHOWN_WHOLE_CHARS
 
 
-def plan_prompt(prompt: str, name: str) -> str:
+def plan_prompt(prompt: str, name: str, brief: list[QuestionAnswer]) -> str:
     return f"""\
 <site_name>{name}</site_name>
 <description>
 {prompt}
 </description>
-
+{_answers(brief)}
 Plan the site's files. Reply with ONLY one JSON object, no prose:
 {{"summary": "<one sentence for the user: the site you'll build>", "files": [{{"path": "src/...", "purpose": \
 "<what it holds: its sections, data or styles>"}}]}}
@@ -20,11 +22,19 @@ Plan the site's files. Reply with ONLY one JSON object, no prose:
 styles). Then one file per section or shared component, under src/components/, and src/data.ts if the content is \
 best kept as data (menus, products, services...).
 - At most {MAX_CREATE_FILES} files. Paths end in .tsx, .ts or .css. Don't list src/main.tsx.
-- List files so that each one only imports files listed before it (App.tsx last)."""
+- List files so that each one only imports files listed before it (App.tsx last).
+- The user's answers to makable's questions (<user_answers>, if there are any) say what kind of site it is and \
+what it needs: plan that site."""
 
 
 def write_prompt(
-    prompt: str, name: str, plan: list[PlannedFile], file: PlannedFile, written: dict[str, str], base: dict[str, str]
+    prompt: str,
+    name: str,
+    brief: list[QuestionAnswer],
+    plan: list[PlannedFile],
+    file: PlannedFile,
+    written: dict[str, str],
+    base: dict[str, str],
 ) -> str:
     planned = "\n".join(f"- {f['path']}: {f['purpose']}" for f in plan)
     shown = "\n\n".join(_show(path, code) for path, code in written.items())
@@ -37,7 +47,7 @@ def write_prompt(
 <description>
 {prompt}
 </description>
-
+{_answers(brief)}
 <plan>
 {planned}
 </plan>
@@ -58,6 +68,12 @@ def fix_prompt(path: str, code: str, problems: list[str]) -> str:
 {code}</file>
 
 Reply with the complete corrected file in one ``` code block and nothing else. Keep everything else as it is."""
+
+
+def _answers(brief: list[QuestionAnswer]) -> str:
+    """The user's answers to the questions about the site, after the description (a blank line when there are none)."""
+    block = brief_block(brief)
+    return f"\n{block}" if block else ""
 
 
 def _show(path: str, code: str) -> str:

@@ -22,6 +22,25 @@ class SiteFiles(Protocol):
 class QuestionAnswer(TypedDict):
     question: str
     answer: str
+    # The user chatted about the question instead of answering it ("Chat about this"): the AI replied and asked again.
+    chat: NotRequired[bool]
+    # What the AI did before it asked (the create agent's progress), shown above the question.
+    steps: NotRequired[list[str]]
+
+
+class UserReply(TypedDict):
+    """What a paused run is resumed with after a question: the user's text, and whether it answers the question or is
+    a message about it (`chat`)."""
+
+    answer: str
+    chat: bool
+
+
+def read_reply(value: object) -> UserReply:
+    """The resume value of a question, as `UserReply` (a plain string is an answer)."""
+    if isinstance(value, dict):
+        return UserReply(answer=str(value.get("answer", "")), chat=bool(value.get("chat", False)))
+    return UserReply(answer=str(value), chat=False)
 
 
 class Turn(TypedDict):
@@ -33,6 +52,8 @@ class Turn(TypedDict):
     outcome: str
     reply: str
     questions: NotRequired[list[QuestionAnswer]]
+    # What the AI did after the last question (the create agent's progress), shown above the reply.
+    steps: NotRequired[list[str]]
     commit_sha: str | None
     created_at: str
 

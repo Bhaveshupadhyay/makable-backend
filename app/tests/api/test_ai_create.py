@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.api.dependencies import get_model_client
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import FakeGithubClient, FakeModelClient
-from app.tests.services.test_site_create import CSS, HERO, NEW, PROMPT, replies
+from app.tests.services.test_site_create import CSS, HERO, NEW, PROMPT, READY, replies
 
 CREATE = "/api/v1/ai/create"
 
@@ -56,7 +56,7 @@ def test_a_site_is_created_over_a_stream(client: TestClient, model: FakeModelCli
 
 def test_errors_after_the_stream_starts_are_error_lines(client: TestClient, model: FakeModelClient) -> None:
     sign_in(client)
-    model.replies += ["not json", "still not json"]
+    model.replies += [READY, "not json", "still not json"]
     asked = stream(client, CREATE, {"projectId": str(NEW), "prompt": PROMPT})[-1]
 
     events = stream(client, f"{CREATE}/{NEW}/answer", {"runId": asked["data"]["runId"], "answer": "Ada's Bakery"})

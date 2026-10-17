@@ -15,8 +15,9 @@ async def fix(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     model = await run.model_client()
     files = await run.site_files(state["base_commit"])
     attempt = state["attempt"]
+    said: list[str] = []
     for path, problems in state["problems"].items():
-        progress("fix", f"Fixing {path}", path=path)
+        said += progress("fix", f"Fixing {path}", path=path)
         text = f"{CREATE_SYSTEM}\n\n{fix_prompt(path, files.get(path, ''), problems)}"
         run.model_input = text
         reply = await model.complete([ChatMessage(role="user", content=text)])
@@ -26,4 +27,5 @@ async def fix(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         except ValueError:
             continue
     written = [*state["written"], *(p for p in state["problems"] if p not in state["written"])]
-    return {"fix_rounds": state["fix_rounds"] + 1, "attempt": attempt, "written": written, "step": "verify"}
+    fixed: CreateState = {"fix_rounds": state["fix_rounds"] + 1, "attempt": attempt, "written": written}
+    return {**fixed, "steps": said, "step": "verify"}

@@ -15,6 +15,7 @@ async def finish(state: CreateState) -> CreateState:
         outcome=result["outcome"],
         reply=result.get("summary", ""),
         questions=state["questions"],
+        steps=state["steps"],
         commit_sha=result.get("commit_sha"),
         created_at=utc_now().isoformat(),
     )

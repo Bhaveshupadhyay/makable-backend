@@ -19,8 +19,8 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     """
     run = runtime.context
     model = await run.model_client()
-    progress("plan", "Planning the site")
-    text = f"{CREATE_SYSTEM}\n\n{plan_prompt(state['prompt'], state['name'])}"
+    said = progress("plan", "Planning the site")
+    text = f"{CREATE_SYSTEM}\n\n{plan_prompt(state['prompt'], state['name'], state['brief'])}"
     run.model_input = text
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
@@ -48,5 +48,6 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         "written": [],
         "attempt": attempt,
         "model": model.name,
+        "steps": said,
         "step": "write",
     }

@@ -88,6 +88,37 @@ def test_the_app_wont_start_with_langsmith_tracing(monkeypatch: pytest.MonkeyPat
         refuse_tracing()
 
 
+def test_chatting_about_a_question_gets_a_reply_and_the_question_again(
+    client: TestClient, model: FakeModelClient
+) -> None:
+    sign_in(client)
+    base = create_site(client)
+    ask = '{"ask": {"question": "Which colour?", "options": ["#16a34a", "#dc2626"]}}'
+    reply = '{"ask": {"question": "Green fits your logo. Which colour?", "options": ["#16a34a"]}}'
+    # Re-asking after a chat doesn't count against the questions the model may ask (MAX_QUESTIONS = 2).
+    model.replies += [ask, reply, reply, GOOD_REPLY]
+    paused = client.post(EDIT, json=request_body(baseCommit=base)).json()["data"]
+    answer = f"{EDIT}/{PROJECT_ID}/answer"
+
+    for _ in range(2):
+        chatted = client.post(
+            answer, json={"runId": paused["runId"], "answer": "Which is better?", "baseCommit": base, "chat": True}
+        ).json()["data"]
+        assert chatted["status"] == "needs_input"
+        assert chatted["runId"] == paused["runId"]
+        assert chatted["question"]["question"] == "Green fits your logo. Which colour?"
+
+    assert "they chose to talk about it, and wrote:\n<message>\nWhich is better?\n</message>" in model.calls[1][-1].text
+    run = client.get(THREAD).json()["data"]["run"]
+    assert run["questions"] == [
+        {"question": "Which colour?", "answer": "Which is better?", "chat": True, "steps": []},
+        {"question": "Green fits your logo. Which colour?", "answer": "Which is better?", "chat": True, "steps": []},
+    ]
+    done = client.post(answer, json={"runId": paused["runId"], "answer": "#16a34a", "baseCommit": base}).json()
+    assert done["data"]["status"] == "awaiting_result"
+    assert "The user answered your question:\n<answer>\n#16a34a\n</answer>" in model.calls[3][-1].text
+
+
 def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClient, model: FakeModelClient) -> None:
     sign_in(client)
     base = create_site(client)
@@ -106,6 +137,8 @@ def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClien
         "instruction": "Make the contact button green",
         "target": 'Ada > <a> "Contact"',
         "question": {**paused["question"], "kind": None},
+        "questions": [],
+        "steps": [],
         "preview": None,
     }
 
@@ -121,7 +154,7 @@ def test_a_question_is_asked_shown_after_a_reload_and_answered(client: TestClien
     done = client.post(f"{EDIT}/{PROJECT_ID}/result", json={"runId": paused["runId"], "ok": True})
     assert done.json()["data"]["status"] == "applied"
     [turn] = client.get(THREAD).json()["data"]["turns"]
-    assert turn["questions"] == [{"question": "Which colour?", "answer": "green"}]
+    assert turn["questions"] == [{"question": "Which colour?", "answer": "green", "chat": False, "steps": []}]
     again = client.post(
         f"{EDIT}/{PROJECT_ID}/answer", json={"runId": paused["runId"], "answer": "green", "baseCommit": base}
     )

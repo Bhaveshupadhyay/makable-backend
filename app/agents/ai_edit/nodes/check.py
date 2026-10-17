@@ -34,7 +34,8 @@ async def check(state: EditState, runtime: Runtime[EditRun]) -> EditState:
                 return {"step": "read_more"}
             raise ValueError("you can't ask for more code now: answer with edits for what you were shown, or escalate")
         if isinstance(answer, ModelQuestion):
-            if asked < MAX_QUESTIONS:
+            # Asking again after the user chatted about a question is the reply to them: it doesn't count.
+            if sum(not q.get("chat") for q in state["questions"]) < MAX_QUESTIONS:
                 return {"step": "ask_user"}
             raise ValueError(
                 "you can't ask the user anything more: make the change with a sensible choice and say which in the "

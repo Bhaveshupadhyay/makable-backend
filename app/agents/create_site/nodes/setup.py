@@ -14,13 +14,16 @@ async def setup(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     """
     if state["base_commit"]:
         return {"step": "plan"}
-    progress("setup", f"Creating the repository for {state['name']} on your GitHub")
+    said = progress("setup", f"Creating the repository for {state['name']} on your GitHub")
     try:
         base = await runtime.context.site.create(state["name"])
     except NameTakenError as err:
         tries = state["name_tries"] + 1
         if tries >= MAX_NAME_TRIES:
             raise
-        problem = f'You already have a repository called "{err.repo_name}" on GitHub.'
-        return {"name": "", "name_problem": problem, "name_tries": tries, "step": "ask_name"}
-    return {"base_commit": base, "step": "plan"}
+        question = (
+            f'You already have a repository called "{err.repo_name}" on GitHub. What should we call this site instead?'
+        )
+        asking: CreateState = {"name": "", "name_question": question, "name_options": [], "name_tries": tries}
+        return {**asking, "steps": said, "step": "ask_name"}
+    return {"base_commit": base, "steps": said, "step": "plan"}

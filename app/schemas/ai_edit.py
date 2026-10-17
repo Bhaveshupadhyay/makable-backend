@@ -148,8 +148,9 @@ class Question(CamelModel):
         Field(max_length=MAX_OPTIONS),
     ] = Field(default_factory=list)
     allow_free_text: bool = True
-    # What's asked, when it's one of makable's own questions (the create agent's name for the site).
-    kind: Literal["project_name"] | None = None
+    # What's asked, when it's one of the create agent's questions: the site's name, or about the site before it's
+    # planned.
+    kind: Literal["project_name", "site_brief"] | None = None
 
 
 class ModelQuestion(CamelModel):
@@ -240,5 +241,7 @@ class AiEditAnswer(CamelModel):
 
     run_id: UUID
     answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_ANSWER)]
+    # A message about the question ("Chat about this"), not its answer: the AI replies and asks again.
+    chat: bool = False
     base_commit: CommitSha
     screenshot: Screenshot | None = None

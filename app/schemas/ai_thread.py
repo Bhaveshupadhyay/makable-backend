@@ -14,6 +14,10 @@ from app.schemas.common import CamelModel
 class AiQuestionAnswer(CamelModel):
     question: str
     answer: str
+    # A message about the question ("Chat about this"), not its answer.
+    chat: bool = False
+    # What the AI did before it asked (a creation's progress).
+    steps: list[str] = Field(default_factory=list)
 
 
 class AiTurnRead(CamelModel):
@@ -27,6 +31,8 @@ class AiTurnRead(CamelModel):
     reply: str
     # What the AI asked on the way, and what the user said.
     questions: list[AiQuestionAnswer] = Field(default_factory=list)
+    # What the AI did after the last question (a creation's progress: planning, the files it wrote...).
+    steps: list[str] = Field(default_factory=list)
     commit_sha: str | None = None
     created_at: datetime
 
@@ -43,12 +49,16 @@ class AiPausedRun(CamelModel):
     preview (the edits to try: report with `/ai/edit/{projectId}/result`)."""
 
     run_id: UUID
-    # Which agent's run: an edit's, or the site's creation (its name question; answer it with
+    # Which agent's run: an edit's, or the site's creation (its questions; answer them with
     # `/ai/create/{projectId}/answer`).
     mode: Literal["edit", "create"] = "edit"
     instruction: str
     target: str | None
     question: Question | None = None
+    # What was asked and said earlier in this run, before `question` (an answer that wasn't one, a chat about it).
+    questions: list[AiQuestionAnswer] = Field(default_factory=list)
+    # What the AI did before it asked `question` (a creation's progress).
+    steps: list[str] = Field(default_factory=list)
     preview: AiPreview | None = None
 
 

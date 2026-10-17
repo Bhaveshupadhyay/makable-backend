@@ -17,7 +17,7 @@ from app.agents.create_site import (
     create_input,
 )
 from app.agents.create_site.tools.names import suggest_name
-from app.agents.thread import RunResult, Turn
+from app.agents.thread import RunResult, Turn, UserReply
 from app.clients.model import AiKeyInvalidError
 from app.constants.ai_create import HEARTBEAT_SECONDS
 from app.constants.ai_edit import AiEditOutcome
@@ -160,7 +160,8 @@ class SiteCreateService:
         except BaseException:
             await stack.aclose()
             raise
-        return CreationEvents(self._events(user, request, body.run_id, Command(resume=body.answer), stack), stack)
+        resume: Command[Any] = Command(resume=UserReply(answer=body.answer, chat=body.chat))
+        return CreationEvents(self._events(user, request, body.run_id, resume, stack), stack)
 
     async def _events(
         self, user: UserRead, request: AiCreateRequest, run_id: UUID, graph_input: Any, stack: AsyncExitStack
@@ -268,6 +269,7 @@ class SiteCreateService:
                 outcome=result["outcome"],
                 reply=summary,
                 questions=values.get("questions", []),
+                steps=values.get("steps", []),
                 commit_sha=committed,
                 created_at=utc_now().isoformat(),
             )

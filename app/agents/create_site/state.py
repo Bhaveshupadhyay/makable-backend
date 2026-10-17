@@ -3,17 +3,19 @@
 The state is checkpointed in the site's create thread (`<projectId>:create`) and holds only small, plain values: the
 user's prompt, the site's name, the plan (paths and what each file is for), which files are written, the problems the
 checks found, and the result. Never file contents: the files the model writes live in the run's context (`CreateRun`)
-until they're committed, and a creation only pauses before it writes anything (for the site's name).
+until they're committed, and a creation only pauses before it writes anything (for the questions about the site,
+then its name).
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypedDict
+from typing import Annotated, Any, Protocol, TypedDict
 from uuid import UUID
 
 from app.agents.thread import QuestionAnswer, RunResult, SiteFiles, Turns
 from app.clients.model import ModelClient
+from app.constants.ai_create import MAX_STEPS
 from app.schemas.ai_create import AiCreateRequest
 
 
@@ -43,6 +45,12 @@ class PlannedFile(TypedDict):
     purpose: str
 
 
+def add_steps(old: list[str], new: list[str]) -> list[str]:
+    """The `steps` reducer: a node's steps are added after the ones before; an empty list clears them (a question was
+    answered, or a new run started)."""
+    return [*old, *new][-MAX_STEPS:] if new else []
+
+
 class CreateState(TypedDict, total=False):
     # The thread's finished requests, oldest first. Kept across runs.
     turns: Turns
@@ -50,10 +58,22 @@ class CreateState(TypedDict, total=False):
     run_id: str
     request: dict[str, Any]
     prompt: str
-    # The site's name; set when the site already has its repo, else asked.
+    # The questions about the site asked first, with the user's answers (and messages about them), and the one waiting
+    # for an answer (a `Question`, as the SPA gets it).
+    brief: list[QuestionAnswer]
+    brief_question: dict[str, Any] | None
+    # The site's name; set when the site already has its repo, else asked after the questions about the site, with
+    # the names the model suggested then (or one from the prompt).
     name: str
-    # Why the last name didn't work (the repo name is taken), for the next question.
-    name_problem: str
+    suggested_names: list[str]
+    # The next name question and its options, when it isn't the first one (empty: the first, with the suggested names):
+    # the model's answer to what the user said instead of a name, or that the name's repo is taken.
+    name_question: str
+    name_options: list[str]
+    # What the user answered to the name question last (read by the `read_name` node), and whether it was a message
+    # about the question ("Chat about this") rather than an answer.
+    name_reply: str
+    name_chat: bool
     name_tries: int
     # The commit the site's repo is at when the files are written (the starter's, for a new site).
     base_commit: str
@@ -69,7 +89,11 @@ class CreateState(TypedDict, total=False):
     attempt: int
     model: str
     questions: list[QuestionAnswer]
-    # Where the run goes next: "ask_name", "setup", "plan", "write", "verify", "fix", "commit" or "finish".
+    # What the run did since the last question was answered (the progress the browser was shown): the next question,
+    # or the finished turn, keeps them for the chat.
+    steps: Annotated[list[str], add_steps]
+    # Where the run goes next: "brief", "ask_brief", "ask_name", "read_name", "setup", "plan", "write", "verify", "fix",
+    # "commit" or "finish".
     step: str
     result: RunResult | None
 
@@ -113,8 +137,14 @@ def create_input(run_id: UUID, request: AiCreateRequest, *, name: str | None, ba
         "run_id": str(run_id),
         "request": request.model_dump(mode="json"),
         "prompt": request.prompt,
+        "brief": [],
+        "brief_question": None,
         "name": name or "",
-        "name_problem": "",
+        "suggested_names": [],
+        "name_question": "",
+        "name_options": [],
+        "name_reply": "",
+        "name_chat": False,
         "name_tries": 0,
         "base_commit": base_commit or "",
         "summary": "",
@@ -126,6 +156,7 @@ def create_input(run_id: UUID, request: AiCreateRequest, *, name: str | None, ba
         "attempt": 0,
         "model": "",
         "questions": [],
+        "steps": [],
         "step": "",
         "result": None,
     }

@@ -25,6 +25,8 @@ class AiCreateAnswer(CamelModel):
 
     run_id: UUID
     answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_ANSWER)]
+    # A message about the question ("Chat about this"), not its answer: the AI replies and asks again.
+    chat: bool = False
 
 
 class AiCreated(CamelModel):
