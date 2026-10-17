@@ -47,6 +47,9 @@ class DatabaseSettings(BaseSettings):
     # Transaction-mode poolers (Supabase port 6543, PgBouncer) can't keep prepared statements between
     # transactions, so asyncpg's statement cache must be off. Session mode (port 5432) doesn't need this.
     db_transaction_pooler: bool = False
+    # Connections for LangGraph's checkpoints (psycopg, separate from the SQLAlchemy pool above). Count them in the
+    # same budget: workers x (pool_size + max_overflow + checkpoint_pool_size).
+    db_checkpoint_pool_size: int = Field(default=4, ge=1)
 
     @model_validator(mode="after")
     def _database_configured(self) -> Self:
@@ -107,12 +110,10 @@ class Settings(DatabaseSettings):
     ai_api_key: SecretStr | None = None
     ai_model: str = "auto"
     ai_timeout_seconds: float = Field(default=90, gt=0)
+    # Whether makable's own model reads images (a picture of the selected element goes with AI edits then).
+    ai_accepts_images: bool = False
     # Adds what the model was given to AI edit responses. Never turn it on in production.
     ai_debug: bool = False
-
-    # The published template catalog: the same one the SPA's preview loads, so a published site is the one the
-    # user saw. Template files are only read from this URL's host.
-    template_catalog_url: str = "https://bhaveshupadhyay.github.io/makable-templates/catalog.json"
 
     @field_validator("app_url", "supabase_url")
     @classmethod

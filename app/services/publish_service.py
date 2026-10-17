@@ -10,35 +10,24 @@ from fastapi import status
 from pydantic import ValidationError
 
 from app.clients.deploy_platforms import DeployPlatformClient, PreparedProject
-from app.clients.github import GithubClient, GithubConflictError, GithubNotFoundError, GithubRepoExistsError
-from app.clients.templates import TemplateCatalogClient
+from app.clients.github import GithubClient, GithubNotFoundError
 from app.constants.publish import (
-    DEFAULT_REPO,
     DEPLOY_CLOCK_SKEW_SECONDS,
     DISPATCH_RETRY_DELAYS,
-    MANIFEST_FORMAT,
-    MANIFEST_PATH,
-    MANIFEST_VERSION,
-    MAX_CONFLICT_PATHS,
-    MAX_FILE_EDITS,
-    NEW_REPO_RETRY_DELAYS,
     PROJECT_NAME_MAX,
-    RESERVED_PATH,
-    SITE_DESCRIPTION,
     TARGET_NAMES,
     TARGET_SECRETS,
     TARGET_TOKEN_URLS,
     WORKFLOW_FILE,
     WORKFLOW_PATH,
     PublishTarget,
+    SiteKind,
 )
-from app.constants.workspace import WORKSPACE_REPO
+from app.constants.site import MANIFEST_PATH
 from app.core.database import utc_now
 from app.core.exceptions import AppError, ConflictError, NotFoundError, ServiceUnavailableError
-from app.core.security import TokenCipher, seal_for_github
-from app.repositories.github_credential import GithubCredentialRepository
-from app.schemas.github import GithubBranchHead, GithubRepo, GithubTreeChange
-from app.schemas.portfolio import Portfolio
+from app.core.security import seal_for_github
+from app.schemas.github import GithubRepo
 from app.schemas.publish import (
     DeployRequest,
     DeployStarted,
@@ -46,27 +35,20 @@ from app.schemas.publish import (
     PublishCredentials,
     PublishRequest,
     PublishResult,
+    PublishSettings,
     PublishStatus,
     PublishTargetInfo,
-    SiteManifest,
     WorkflowRun,
 )
-from app.schemas.template import TemplateEntry, TemplateFiles
+from app.schemas.site import SiteSnapshot
 from app.schemas.user import UserRead
 from app.services.publish_workflows import render_workflow
-from app.services.workspace_service import WorkspaceService, git_blob_sha
-from app.utils.portfolio_source import render_portfolio_source
+from app.services.site_service import SiteConflictError, SiteService
 
 logger = logging.getLogger(__name__)
 
 # Branch names the workflow can use as they are.
 _BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,100}")
-
-
-class PublishGithubNotConnectedError(AppError):
-    status_code = status.HTTP_401_UNAUTHORIZED
-    code = "github_reconnect"
-    message = "Connect GitHub again to publish your site."
 
 
 class PublishMissingScopeError(AppError):
@@ -83,32 +65,21 @@ class PublishInvalidError(AppError):
     message = "This site can't be published like that."
 
 
-class PublishRepoTakenError(ConflictError):
-    code = "publish_repo_taken"
-    message = "You already have a repository with that name that makable didn't create. Pick another name."
-
-
 class PublishRepoArchivedError(ConflictError):
     code = "publish_repo_archived"
-    message = "That repository is archived on GitHub. Unarchive it, or publish to a new repository."
+    message = "This site's repository is archived on GitHub. Unarchive it to publish."
 
 
 class PublishPagesPrivateError(ConflictError):
+    """The site's repo is private and GitHub Pages needs it public: the SPA asks, and sends `makePublic`."""
+
     code = "publish_pages_private"
-    message = "GitHub Pages needs a public repository. Make it public on GitHub, or pick another platform."
+    message = "GitHub Pages needs the site's repository to be public. Make it public, or pick another platform."
 
 
-class PublishChangedOnGithubError(ConflictError):
-    """Files makable manages were changed on GitHub since the last publish. `details` has the `headSha` to send
-    back as `confirmOverwrite` and the changed `paths`."""
-
-    code = "publish_changed_on_github"
-    message = "This site was changed on GitHub since it was last published. Publishing will overwrite those changes."
-
-
-class PublishRepoNotFoundError(NotFoundError):
-    code = "publish_repo_not_found"
-    message = "This site hasn't been published to that repository."
+class PublishNotPublishedError(NotFoundError):
+    code = "publish_not_published"
+    message = "This site hasn't been published yet."
 
 
 class PublishSecretsMissingError(ConflictError):
@@ -119,52 +90,38 @@ class PublishSecretsMissingError(ConflictError):
 
 
 class PublishDeployNotStartedError(ServiceUnavailableError):
-    """The site is on GitHub, but GitHub wouldn't start its deploy workflow in time. `details` has the `repoName`
-    and `actionsUrl`; running the deploy again (`POST /publish/{id}/deploy`) usually works a moment later."""
+    """The workflow is on GitHub, but GitHub wouldn't start it in time. `details` has the `actionsUrl`; running the
+    deploy again (`POST /publish/{id}/deploy`) usually works a moment later."""
 
     code = "publish_deploy_not_started"
-    message = "Your site's code is on GitHub, but GitHub didn't start the deploy. Try deploying again in a moment."
+    message = "Your site is ready on GitHub, but GitHub didn't start the deploy. Try deploying again in a moment."
 
 
 class PublishService:
-    """Publishes a site to a repo on the user's GitHub, with a workflow that deploys it to the platform they picked
-    (GitHub Pages, Vercel, Cloudflare Pages or Netlify) on every push.
-
-    The site is published as saved in the user's private `makable-workspace` repo (the browser saves, then sends
-    the saved state's SHA): its content and AI-edited files are read from there, the template comes from the
-    catalog, and the deploy workflow is written here. A publish is one commit (none if nothing changed), then makable
-    starts the deploy. The workflow has no push trigger, so changes made on GitHub only go live with a publish.
+    """Publishes a site from its repo to the platform the user picked (GitHub Pages, Vercel, Cloudflare Pages or
+    Netlify): the repo gets a deploy workflow (`.github/workflows/makable-deploy.yml`) and the manifest records where
+    the site is published, in one commit when either changes; then makable starts the deploy. The workflow has no push
+    trigger, so a change goes live only with a publish.
 
     A platform token pasted in the chat is checked, used to create the platform project, and saved as an Actions
-    secret (sealed so only GitHub can read it); makable stores nothing. Otherwise the user adds the secrets on
-    GitHub, and the workflow skips the deploy until they're there.
-
-    makable only writes to a repo whose `.makable/manifest.json` names this site, and never overwrites a managed
-    file that was changed on GitHub without the user's say-so.
+    secret (sealed so only GitHub can read it); makable stores nothing. Otherwise the user adds the secrets on GitHub,
+    and the workflow skips the deploy until they're there.
     """
 
     def __init__(
         self,
         github: GithubClient,
-        credentials: GithubCredentialRepository,
-        cipher: TokenCipher,
-        templates: TemplateCatalogClient,
+        sites: SiteService,
         platforms: DeployPlatformClient,
-        workspace: WorkspaceService,
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        retry_delays: Sequence[float] = NEW_REPO_RETRY_DELAYS,
         dispatch_delays: Sequence[float] = DISPATCH_RETRY_DELAYS,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._github = github
-        self._credentials = credentials
-        self._cipher = cipher
-        self._templates = templates
+        self._sites = sites
         self._platforms = platforms
-        self._workspace = workspace
         self._sleep = sleep
-        self._retry_delays = retry_delays
         self._dispatch_delays = dispatch_delays
         self._clock = clock
 
@@ -181,130 +138,98 @@ class PublishService:
         ]
 
     async def publish(self, user: UserRead, project_id: UUID, request: PublishRequest) -> PublishResult:
-        """Commits the site as saved with `request.state_sha` and its deploy workflow to the site repo (created on
-        first publish), then starts the deploy, even when nothing changed (it deploys what's on GitHub). With
-        `request.credentials`, first checks the token, creates the platform project and saves the token as an
-        Actions secret. Without the platform's secrets on the repo, the deploy isn't started.
+        """Commits the deploy workflow for `request.target` (and the publish settings) to the site's repo on top of
+        `request.base_commit` when they change, then starts the deploy, even when nothing changed (it deploys what's
+        on GitHub). With `request.credentials`, first checks the token, creates the platform project and saves the
+        token as an Actions secret. Without the platform's secrets on the repo, the deploy isn't started.
 
         Raises:
-            PublishInvalidError: No template picked yet, an edited file isn't a template file, or the repo or
-                branch name can't be used.
-            WorkspaceConflictError: The saved session isn't `state_sha` any more (another device saved since).
-            WorkspaceSessionNotFoundError: The site isn't saved to the workspace.
-            WorkspaceInvalidError: The saved session can't be read, or has too many AI-edited files.
-            WorkspacePartNotFoundError: A file the saved state lists is missing.
-            PublishRepoTakenError: The repo exists, but makable didn't create it for this site.
+            SiteNotFoundError / SiteNotReadyError / SiteRepoMissingError / SiteRepoChangedError: The site's repo isn't
+                one makable can publish.
+            SiteConflictError: The site isn't at `base_commit` on GitHub any more.
+            PublishPagesPrivateError: GitHub Pages was picked for a private repo, without `make_public`.
             PublishRepoArchivedError: The repo is archived.
-            PublishPagesPrivateError: GitHub Pages was picked for a private repo.
-            PublishChangedOnGithubError: Managed files changed on GitHub and the user hasn't agreed to overwrite.
-            PublishGithubNotConnectedError: No usable GitHub token.
+            PublishInvalidError: The site has neither src/main.tsx nor index.html, or its branch name can't be used.
             PublishMissingScopeError: The GitHub token can't write workflow files.
-            TemplateNotFoundError: The template isn't in the catalog.
-            TemplateUnavailableError: The catalog couldn't be read.
             PlatformTokenInvalidError: The platform refused the pasted token.
             PlatformAccountRequiredError: The Cloudflare token sees several accounts and none was picked.
             PlatformProjectTakenError: The platform project name belongs to someone else.
             PlatformError: The platform failed.
             GithubPagesUnavailableError: GitHub won't turn Pages on for the repo.
-            PublishDeployNotStartedError: The site was committed, but GitHub wouldn't start the deploy.
+            PublishDeployNotStartedError: The workflow was committed, but GitHub wouldn't start it.
             GithubError: GitHub failed.
         """
         target = request.target
         pages = target == PublishTarget.GITHUB_PAGES
-        repo_name = request.repo_name or _default_repo(user.login, target)
-        if repo_name.lower() == WORKSPACE_REPO:
-            raise PublishInvalidError(f"{WORKSPACE_REPO} keeps your chat history; publish to another repository.")
-        token = await self._token(user)
+        token, repo = await self._sites.github_repo(user, project_id)
         scopes = await self._github.get_scopes(token)
         if scopes is not None and "workflow" not in scopes:
             raise PublishMissingScopeError()
-        snapshot = await self._workspace.read_snapshot(user, project_id, request.state_sha, max_files=MAX_FILE_EDITS)
-        portfolio = snapshot.state.conversation.portfolio
-        if portfolio is None:
-            raise PublishInvalidError("Pick a template before publishing.")
-        entry = await self._templates.get_template(portfolio.template)
-        files = build_site_files(entry, await self._templates.get_files(entry), portfolio, snapshot.files)
-
-        full_name = f"{user.login}/{repo_name}"
-        repo = await self._github.get_repo(token, full_name)
-        manifest = await self._check_repo(token, repo, project_id, pages) if repo else None
-        if repo is None:
-            repo = await self._create_repo(token, repo_name, private=bool(request.private))
+        if repo.archived:
+            raise PublishRepoArchivedError()
         branch = _check_branch(repo.default_branch)
+        head = await self._sites.branch_head(token, repo)
+        if head.commit_sha != request.base_commit:
+            raise SiteConflictError(details={"commitSha": head.commit_sha})
+        snapshot = await self._sites.snapshot(token, repo, request.base_commit)
+        kind = _site_kind(snapshot)
+        if pages and repo.private and not request.make_public:
+            raise PublishPagesPrivateError()
 
+        manifest = _manifest(snapshot)
+        published = _settings(manifest)
         project_name = None
         if not pages:
-            same = manifest is not None and manifest.target == target
+            same = published is not None and published.target == target
             project_name = (
                 request.project_name
-                or (manifest.project_name if same and manifest else None)
+                or (published.project_name if same and published else None)
                 or _default_project(user.login, repo.name)
             )
         prepared = await self._prepare(target, request.credentials, project_name, branch)
-        site_url = _site_url(user.login, repo.name, target, project_name, prepared, manifest)
+        site_url = _site_url(user.login, repo.name, target, project_name, prepared, published)
 
-        files[WORKFLOW_PATH] = render_workflow(
+        workflow = render_workflow(
             target,
-            entry.kind,
+            kind,
             branch=branch,
             base_path=_pages_base_path(user.login, repo.name) if pages else "/",
             project_name=project_name,
         )
-        hashes = {path: git_blob_sha(content) for path, content in files.items()}
-        new_manifest = SiteManifest(
-            format=MANIFEST_FORMAT,
-            version=MANIFEST_VERSION,
-            project_id=project_id,
-            target=target,
-            template_id=entry.id,
-            template_version=entry.version,
-            project_name=project_name,
-            site_url=site_url,
-            files=hashes,
-        )
-        manifest_content = json.dumps(new_manifest.model_dump(mode="json", by_alias=True), indent=2) + "\n"
+        settings = PublishSettings(target=target, project_name=project_name, site_url=site_url)
+        manifest["publish"] = settings.model_dump(mode="json", by_alias=True)
+        manifest_content = json.dumps(manifest, indent=2) + "\n"
+        # makable owns these two files: they're written as makable makes them, also over edits made on GitHub. Only
+        # Publish runs the workflow; a user's own steps go in a workflow of their own.
+        changes: dict[str, str | None] = {
+            path: content
+            for path, content in ((WORKFLOW_PATH, workflow), (MANIFEST_PATH, manifest_content))
+            if snapshot.files.get(path) != content
+        }
 
-        # Before the commit, so the run its push starts can deploy straight away.
-        if pages:
-            await self._github.enable_pages_workflow(token, repo.full_name)
-        if prepared is not None:
-            await self._set_secrets(token, repo.full_name, prepared.secrets)
+        # Pages and the secrets come before the deploy starts, so its run can use them. A private repo is made public
+        # for Pages only now, once everything that could refuse the publish has passed, and private again if Pages or
+        # the commit fails. The commit is the last step that can fail, so a publish that fails has moved nothing.
+        made_public = False
+        try:
+            if pages:
+                if repo.private:
+                    repo = await self._set_private(token, project_id, repo, private=False)
+                    made_public = True
+                await self._github.enable_pages_workflow(token, repo.full_name)
+            if prepared is not None:
+                await self._set_secrets(token, repo.full_name, prepared.secrets)
 
-        # Two tries: the branch can move between reading it and committing.
-        for attempt in range(2):
-            head = await self._head(token, repo)
-            tree = await self._github.get_tree(token, repo.full_name, head.tree_sha)
-            current = await self._read_manifest(token, repo) if attempt else manifest
-            if current is not None and request.confirm_overwrite != head.commit_sha:
-                changed = [path for path, sha in current.files.items() if tree.get(path) != sha]
-                if changed:
-                    details = {"headSha": head.commit_sha, "paths": changed[:MAX_CONFLICT_PATHS]}
-                    raise PublishChangedOnGithubError(details=details)
-            changes = [
-                GithubTreeChange(path=path, content=content)
-                for path, content in files.items()
-                if tree.get(path) != hashes[path]
-            ]
-            if current is not None:
-                changes += [
-                    GithubTreeChange(path=path, content=None)
-                    for path in current.files
-                    if path not in files and path in tree
-                ]
-            if tree.get(MANIFEST_PATH) != git_blob_sha(manifest_content):
-                changes.append(GithubTreeChange(path=MANIFEST_PATH, content=manifest_content))
-            if not changes:
-                commit_sha, committed = head.commit_sha, False
-                break
-            try:
-                commit_sha = await self._github.commit_changes(
-                    token, repo.full_name, branch, head, changes, message=_commit_message(target, changes)
+            commit_sha = request.base_commit
+            if changes:
+                message = f"Publish to {TARGET_NAMES[target]}"
+                commit_sha = await self._sites.commit(
+                    token, repo, request.base_commit, changes, message, own_files=True
                 )
-                committed = True
-                break
-            except GithubConflictError:
-                if attempt == 1:
-                    raise PublishChangedOnGithubError() from None
+        except Exception:
+            if made_public:
+                await self._make_private_again(token, project_id, repo)
+            raise
 
         missing = [] if prepared else await self._missing_secrets(token, repo.full_name, target)
         deploy: DeployState = "waiting_for_secrets" if missing else "started"
@@ -315,7 +240,7 @@ class PublishService:
                 "user_id": str(user.id),
                 "project_id": str(project_id),
                 "target": target,
-                "changed": committed,
+                "changed": bool(changes),
                 "deploy": deploy,
             },
         )
@@ -325,7 +250,7 @@ class PublishService:
             repo_url=repo.html_url,
             branch=branch,
             commit_sha=commit_sha,
-            changed=committed,
+            changed=bool(changes),
             deploy=deploy,
             deploy_started_at=started_at,
             site_url=site_url,
@@ -340,23 +265,20 @@ class PublishService:
         `request.credentials`, saves the token as the platform's secrets first.
 
         Raises:
-            PublishRepoNotFoundError: The repo doesn't exist, or holds no makable site.
-            PublishRepoTakenError: The repo holds another site.
+            PublishNotPublishedError: The site hasn't been published (no workflow or publish settings).
             PublishInvalidError: Credentials were sent for GitHub Pages.
             PublishSecretsMissingError: The platform's secrets aren't all on the repo yet.
-            PublishGithubNotConnectedError: No usable GitHub token.
             PlatformTokenInvalidError: The platform refused the pasted token.
             PlatformError: The platform failed.
             PublishDeployNotStartedError: GitHub wouldn't start the deploy.
-            GithubError: GitHub failed.
+            The site's repo errors of `publish`.
         """
-        token = await self._token(user)
-        repo, manifest = await self._published(token, user, project_id, request.repo_name)
-        prepared = await self._prepare(manifest.target, request.credentials, manifest.project_name, repo.default_branch)
+        token, repo, settings = await self._published(user, project_id)
+        prepared = await self._prepare(settings.target, request.credentials, settings.project_name, repo.default_branch)
         if prepared is not None:
             await self._set_secrets(token, repo.full_name, prepared.secrets)
         else:
-            missing = await self._missing_secrets(token, repo.full_name, manifest.target)
+            missing = await self._missing_secrets(token, repo.full_name, settings.target)
             if missing:
                 raise PublishSecretsMissingError(
                     details={"missing": missing, "secretsUrl": f"{repo.html_url}/settings/secrets/actions"}
@@ -368,26 +290,32 @@ class PublishService:
             started_at=started_at,
         )
 
-    async def status(self, user: UserRead, project_id: UUID, repo_name: str, since: str | None = None) -> PublishStatus:
+    async def status(self, user: UserRead, project_id: UUID, since: str | None = None) -> PublishStatus:
         """Where a published site is deployed, and how its latest deploy run went. With `since` (a deploy's
         `startedAt`), only a run started then or later, so an earlier run of the same commit isn't taken for it.
 
         Raises:
-            PublishRepoNotFoundError: The repo doesn't exist, or holds no makable site.
-            PublishRepoTakenError: The repo holds another site.
-            PublishGithubNotConnectedError: No usable GitHub token.
-            GithubError: GitHub failed.
+            PublishNotPublishedError: The site hasn't been published.
+            The site's repo errors of `publish`.
         """
-        token = await self._token(user)
-        repo, manifest = await self._published(token, user, project_id, repo_name)
+        token, repo, settings = await self._published(user, project_id)
         run = await self._github.latest_workflow_run(
             token, repo.full_name, WORKFLOW_FILE, repo.default_branch, created_since=since
         )
         return PublishStatus(
-            target=manifest.target,
-            site_url=manifest.site_url,
+            target=settings.target,
+            site_url=settings.site_url,
             run=WorkflowRun.model_validate(run.model_dump()) if run else None,
         )
+
+    async def _published(self, user: UserRead, project_id: UUID) -> tuple[str, GithubRepo, PublishSettings]:
+        token, repo = await self._sites.github_repo(user, project_id)
+        head = await self._sites.branch_head(token, repo)
+        snapshot = await self._sites.snapshot(token, repo, head.commit_sha)
+        settings = _settings(_manifest(snapshot))
+        if settings is None or WORKFLOW_PATH not in snapshot.files:
+            raise PublishNotPublishedError()
+        return token, repo, settings
 
     async def _start_deploy(self, token: str, repo: GithubRepo, branch: str) -> str:
         """Starts the deploy workflow and returns when (UTC, to the second, less a clock-skew margin).
@@ -410,79 +338,20 @@ class PublishService:
         details = {"repoName": repo.name, "actionsUrl": f"{repo.html_url}/actions/workflows/{WORKFLOW_FILE}"}
         raise PublishDeployNotStartedError(details=details)
 
-    async def _token(self, user: UserRead) -> str:
-        credential = await self._credentials.get(user.id)
-        if credential is None:
-            raise PublishGithubNotConnectedError()
-        return self._cipher.decrypt(credential.access_token)
-
-    async def _check_repo(self, token: str, repo: GithubRepo, project_id: UUID, pages: bool) -> SiteManifest | None:
-        """The manifest of an existing repo makable may publish this site to (None: a setup that didn't finish).
-
-        Raises:
-            PublishRepoTakenError: makable didn't create the repo, or it holds another site.
-            PublishRepoArchivedError: The repo is archived.
-            PublishPagesPrivateError: GitHub Pages on a private repo.
-        """
-        manifest = await self._read_manifest(token, repo)
-        if manifest is None and not await self._unfinished_setup(token, repo):
-            raise PublishRepoTakenError()
-        if manifest is not None and manifest.project_id != project_id:
-            raise PublishRepoTakenError("That repository has another makable site. Pick another name.")
-        if repo.archived:
-            raise PublishRepoArchivedError()
-        if pages and repo.private:
-            raise PublishPagesPrivateError()
-        return manifest
-
-    async def _published(
-        self, token: str, user: UserRead, project_id: UUID, repo_name: str
-    ) -> tuple[GithubRepo, SiteManifest]:
-        repo = await self._github.get_repo(token, f"{user.login}/{repo_name}")
-        manifest = await self._read_manifest(token, repo) if repo else None
-        if repo is None or manifest is None:
-            raise PublishRepoNotFoundError()
-        if manifest.project_id != project_id:
-            raise PublishRepoTakenError("That repository has another makable site.")
-        return repo, manifest
-
-    async def _read_manifest(self, token: str, repo: GithubRepo) -> SiteManifest | None:
-        file = await self._github.get_file(token, repo.full_name, MANIFEST_PATH)
-        if file is None:
-            return None
-        try:
-            return SiteManifest.model_validate(json.loads(file.content))
-        except ValueError, ValidationError:
-            # Edited by hand into something else: not a repo makable can safely write to.
-            raise PublishRepoTakenError("That repository's makable manifest is damaged.") from None
-
-    async def _unfinished_setup(self, token: str, repo: GithubRepo) -> bool:
-        """Whether a repo without a manifest is one makable created whose first publish didn't finish (e.g. the
-        platform refused the token right after): makable's description and nothing but GitHub's README."""
-        if repo.description != SITE_DESCRIPTION:
-            return False
-        entries = await self._github.list_dir(token, repo.full_name, "")
-        return [e.name for e in entries] == ["README.md"]
-
-    async def _create_repo(self, token: str, name: str, *, private: bool) -> GithubRepo:
-        try:
-            repo = await self._github.create_repo(token, name, SITE_DESCRIPTION, private=private)
-        except GithubRepoExistsError:
-            # Created a moment ago by another tab, or GitHub only now shows a repo we couldn't see.
-            raise PublishRepoTakenError("A repository with that name was just created. Try publishing again.") from None
-        logger.info("site repo created", extra={"repo": repo.full_name})
+    async def _set_private(self, token: str, project_id: UUID, repo: GithubRepo, *, private: bool) -> GithubRepo:
+        repo = await self._github.set_private(token, repo.full_name, private)
+        self._sites.forget_repo(project_id, repo.full_name)
+        logger.info("site repo visibility changed", extra={"repo": repo.full_name, "private": private})
         return repo
 
-    async def _head(self, token: str, repo: GithubRepo) -> GithubBranchHead:
-        # A new repo can take a moment to show its first commit.
-        for delay in (*self._retry_delays, None):
-            try:
-                return await self._github.get_branch_head(token, repo.full_name, repo.default_branch)
-            except GithubNotFoundError:
-                if delay is None:
-                    raise
-                await self._sleep(delay)
-        raise AssertionError("unreachable")
+    async def _make_private_again(self, token: str, project_id: UUID, repo: GithubRepo) -> None:
+        """Makes a repo made public for a publish that then failed private again, without hiding why it failed."""
+        try:
+            await self._set_private(token, project_id, repo, private=True)
+        except Exception:
+            logger.exception(
+                "Couldn't make a site repo private again after a failed publish", extra={"repo": repo.full_name}
+            )
 
     async def _prepare(
         self, target: PublishTarget, credentials: PublishCredentials | None, project_name: str | None, branch: str
@@ -510,23 +379,34 @@ class PublishService:
         return [name for name, present in zip(names, found, strict=True) if not present]
 
 
-def build_site_files(
-    entry: TemplateEntry, template: TemplateFiles, portfolio: Portfolio, file_edits: dict[str, str]
-) -> dict[str, str | bytes]:
-    """The site's files, like the preview builds them: the template's files, the AI-edited ones over them, and the
-    content file rendered from `portfolio`. Binary files (images) are published too, though the preview skips them.
+def _site_kind(snapshot: SiteSnapshot) -> SiteKind:
+    """React (Vite) when the site has src/main.tsx, static when it has index.html only.
 
     Raises:
-        PublishInvalidError: An edited file isn't one of the template's text files, or is the content file.
+        PublishInvalidError: Neither.
     """
-    for path in file_edits:
-        if path not in template.text or path == entry.content_path or RESERVED_PATH.match(path):
-            raise PublishInvalidError(f"{path} isn't a file of the template that can be edited.")
-    # Themed React templates read their look from the content's `template` field.
-    content = portfolio.model_copy(update={"template": entry.theme}) if entry.theme else portfolio
-    files: dict[str, str | bytes] = {**template.text, **file_edits, **template.binary}
-    files[entry.content_path] = render_portfolio_source(content, entry.kind)
-    return files
+    if "src/main.tsx" in snapshot.files:
+        return "react"
+    if "index.html" in snapshot.files:
+        return "static"
+    raise PublishInvalidError("The site needs src/main.tsx or index.html to be published.")
+
+
+def _manifest(snapshot: SiteSnapshot) -> dict[str, object]:
+    """The site's manifest (the site's repo was checked to have one, naming this site)."""
+    try:
+        manifest = json.loads(snapshot.files.get(MANIFEST_PATH, "{}"))
+    except ValueError:
+        manifest = {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def _settings(manifest: dict[str, object]) -> PublishSettings | None:
+    """Where the site was last published, if it was."""
+    try:
+        return PublishSettings.model_validate(manifest["publish"])
+    except KeyError, ValidationError:
+        return None
 
 
 def _check_branch(branch: str) -> str:
@@ -535,13 +415,9 @@ def _check_branch(branch: str) -> str:
     return branch
 
 
-def _default_repo(login: str, target: PublishTarget) -> str:
-    return f"{login.lower()}.github.io" if target == PublishTarget.GITHUB_PAGES else DEFAULT_REPO
-
-
 def _default_project(login: str, repo_name: str) -> str:
     """`<login>-<repo>` as a name every platform accepts. Platform names are global, so the login keeps a common
-    repo name like `portfolio` from being taken already."""
+    repo name from being taken already."""
     slug = re.sub(r"[^a-z0-9]+", "-", f"{login}-{repo_name}".lower()).strip("-")
     return slug[:PROJECT_NAME_MAX].rstrip("-") or "makable-site"
 
@@ -560,26 +436,19 @@ def _site_url(
     target: PublishTarget,
     project_name: str | None,
     prepared: PreparedProject | None,
-    manifest: SiteManifest | None,
+    published: PublishSettings | None,
 ) -> str | None:
-    """Where the site will be: the platform's answer when it was asked, else what the last publish learned, else
-    the platform's usual address for the project."""
+    """Where the site will be: the platform's answer when it was asked, else what the last publish learned, else the
+    platform's usual address for the project."""
     if target == PublishTarget.GITHUB_PAGES:
         return f"https://{login.lower()}.github.io{_pages_base_path(login, repo_name)}"
     if prepared is not None:
         return prepared.site_url
-    if manifest is not None and manifest.target == target and manifest.project_name == project_name:
-        return manifest.site_url
+    if published is not None and published.target == target and published.project_name == project_name:
+        return published.site_url
     domains = {
         PublishTarget.VERCEL: "vercel.app",
         PublishTarget.CLOUDFLARE_PAGES: "pages.dev",
         PublishTarget.NETLIFY: "netlify.app",
     }
     return f"https://{project_name}.{domains[target]}"
-
-
-def _commit_message(target: PublishTarget, changes: list[GithubTreeChange]) -> str:
-    changed = sum(1 for c in changes if c.content is not None)
-    removed = len(changes) - changed
-    detail = f"{changed} changed" + (f", {removed} removed" if removed else "")
-    return f"Publish from makable to {TARGET_NAMES[target]} ({detail})"

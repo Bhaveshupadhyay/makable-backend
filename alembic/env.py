@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 
 from alembic import context
 from app import models  # noqa: F401  # registers every table on Base.metadata
+from app.constants.ai_edit import LANGGRAPH_SCHEMA
 from app.core.client import close_postgres_client, get_postgres_engine
 from app.core.config import DatabaseSettings
 from app.core.database import Base, UTCDateTime
@@ -29,6 +30,11 @@ def render_item(type_: str, obj: Any, autogen_context: AutogenContext) -> str | 
     if type_ == "type" and isinstance(obj, UTCDateTime):
         return "sa.DateTime(timezone=True)"
     return False
+
+
+def include_name(name: str | None, type_: str, parent_names: Any) -> bool:
+    """Leaves out LangGraph's checkpoint schema: `AsyncPostgresSaver.setup()` owns those tables, not Alembic."""
+    return not (type_ == "schema" and name == LANGGRAPH_SCHEMA)
 
 
 # other values from the config, defined by the needs of env.py,
@@ -57,6 +63,7 @@ def run_migrations_offline() -> None:
         render_as_batch=True,
         compare_type=True,
         render_item=render_item,
+        include_name=include_name,
     )
 
     with context.begin_transaction():
@@ -71,6 +78,7 @@ def do_run_migrations(connection: Connection) -> None:
         render_as_batch=True,
         compare_type=True,
         render_item=render_item,
+        include_name=include_name,
     )
 
     with context.begin_transaction():

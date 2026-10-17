@@ -1,29 +1,13 @@
-"""Publishing a site to a repo on the user's GitHub, deployed by a workflow to the platform they picked."""
+"""Publishing a site: its repo gets a deploy workflow for the platform the user picked, and makable starts it."""
 
 from typing import Annotated, Literal, Self
-from uuid import UUID
 
-from pydantic import AfterValidator, Field, SecretStr, StringConstraints, model_validator
+from pydantic import Field, SecretStr, model_validator
 
-from app.constants.publish import (
-    MAX_TOKEN_CHARS,
-    PROJECT_NAME,
-    REPO_NAME,
-    PublishTarget,
-)
+from app.constants.publish import MAX_TOKEN_CHARS, PROJECT_NAME, PublishTarget
 from app.schemas.common import CamelModel
-from app.schemas.portfolio import TemplateId
-from app.schemas.workspace import Sha
+from app.schemas.site import CommitSha
 
-
-def _repo_name(value: str) -> str:
-    # Checked with `re`: pydantic's own patterns can't look ahead.
-    if not REPO_NAME.fullmatch(value):
-        raise ValueError("must be a GitHub repository name")
-    return value
-
-
-RepoName = Annotated[str, AfterValidator(_repo_name)]
 ProjectName = Annotated[str, Field(pattern=f"^{PROJECT_NAME.pattern}$")]
 
 
@@ -37,31 +21,24 @@ class PublishCredentials(CamelModel):
 
 
 class PublishRequest(CamelModel):
-    """Publishes the site as saved in the user's `makable-workspace` repo: the browser saves first, then sends the
-    SHA of the saved state. The server reads the content and the AI-edited files from there."""
+    """Publishes the site from its repo, at `base_commit` (the SPA saves the user's edits first). The deploy workflow
+    (and the manifest's publish settings) are committed on it when they change."""
 
     target: PublishTarget
-    # The SHA of the site's saved `state.json` (what the save returned). If another device saved since, the
-    # answer is 409 `workspace_conflict`.
-    state_sha: Sha
-    # The site repo. The first publish may leave it out: `<login>.github.io` for GitHub Pages, else `portfolio`.
-    repo_name: RepoName | None = None
+    base_commit: CommitSha
     # The platform project (not for GitHub Pages). Defaults to the one published before, else `<login>-<repo>`.
     project_name: ProjectName | None = None
-    # Only for a repo makable creates. GitHub Pages needs a public repo on GitHub's free plan.
-    private: bool | None = None
     # None: the user adds the Actions secrets on GitHub themselves.
     credentials: PublishCredentials | None = None
-    # The head commit the user agreed to overwrite after a `publish_changed_on_github` conflict.
-    confirm_overwrite: Sha | None = None
+    # GitHub Pages needs a public repo on GitHub's free plan: the user agreed to make the site's repo public.
+    make_public: bool = False
 
     @model_validator(mode="after")
     def _check(self) -> Self:
-        if self.target == PublishTarget.GITHUB_PAGES:
-            if self.credentials is not None or self.project_name is not None:
-                raise ValueError("GitHub Pages takes no token or project name")
-            if self.private:
-                raise ValueError("GitHub Pages needs a public repository")
+        if self.target == PublishTarget.GITHUB_PAGES and (
+            self.credentials is not None or self.project_name is not None
+        ):
+            raise ValueError("GitHub Pages takes no token or project name")
         return self
 
 
@@ -73,9 +50,10 @@ class PublishResult(CamelModel):
     repo_full_name: str
     repo_url: str
     branch: str
-    # The commit with the site; the branch's current head when nothing changed.
+    # The commit the site is at now (the workflow's commit, when this publish made one): the SPA builds on it.
     commit_sha: str
-    # Whether this publish committed anything. Either way the site is deployed from what's on GitHub.
+    # Whether this publish committed anything (the workflow or the publish settings). Either way the site is deployed
+    # from what's on GitHub.
     changed: bool
     # `started`: makable started the deploy workflow (a push never does). `waiting_for_secrets`: it wasn't started,
     # because the secrets in `missing_secrets` aren't on the repo yet.
@@ -93,7 +71,6 @@ class PublishResult(CamelModel):
 class DeployRequest(CamelModel):
     """Runs the deploy workflow again, e.g. after the user added the secrets on GitHub."""
 
-    repo_name: RepoName
     # Set the platform's secrets from a token pasted in the chat first.
     credentials: PublishCredentials | None = None
 
@@ -129,16 +106,9 @@ class PublishTargetInfo(CamelModel):
     token_url: str | None
 
 
-class SiteManifest(CamelModel):
-    """`.makable/manifest.json` in a site repo: marks the repo as makable's and lists the files it wrote."""
+class PublishSettings(CamelModel):
+    """Where a site is published, kept in its manifest (`.makable/manifest.json`, under `publish`)."""
 
-    format: Literal["makable-site"]
-    version: Literal[1]
-    project_id: UUID
     target: PublishTarget
-    template_id: TemplateId
-    template_version: int
     project_name: str | None = None
     site_url: str | None = None
-    # Each managed file's path -> the blob SHA makable wrote.
-    files: dict[str, Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]]

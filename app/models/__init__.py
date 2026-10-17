@@ -2,6 +2,7 @@
 
 from app.models.ai_key import AiKey
 from app.models.github_credential import GithubCredential
+from app.models.site import AiEditRecord, Site
 from app.models.user import User
 
-__all__ = ["AiKey", "GithubCredential", "User"]
+__all__ = ["AiEditRecord", "AiKey", "GithubCredential", "Site", "User"]

@@ -1,7 +1,9 @@
 """The real GitHub client against a mocked transport: request shapes and status mapping."""
 
 import base64
+import io
 import json
+import tarfile
 import time
 from collections.abc import Callable
 from typing import Any
@@ -16,13 +18,13 @@ from app.clients.github import (
     GithubPagesUnavailableError,
     GithubRateLimitedError,
     GithubRepoExistsError,
-    GithubUnauthorizedError,
+    GithubRepoTooLargeError,
     HttpGithubClient,
 )
 from app.core.limits import ServiceBusyError
 from app.schemas.github import GithubBranchHead, GithubTreeChange
 
-REPO = "octocat/makable-workspace"
+REPO = "octocat/my-site"
 
 
 def client(handler: Callable[[httpx.Request], httpx.Response]) -> HttpGithubClient:
@@ -31,38 +33,6 @@ def client(handler: Callable[[httpx.Request], httpx.Response]) -> HttpGithubClie
 
 def b64(text: str) -> str:
     return base64.b64encode(text.encode()).decode()
-
-
-async def test_put_file_sends_base64_and_the_sha_and_returns_the_new_sha() -> None:
-    seen: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(200, json={"content": {"sha": "b" * 40}})
-
-    sha = await client(handler).put_file("tok", REPO, "projects/a b/session.json", "{}", message="Save", sha="a" * 40)
-
-    assert sha == "b" * 40
-    [request] = seen
-    assert request.method == "PUT"
-    assert request.url.raw_path == b"/repos/octocat/makable-workspace/contents/projects/a%20b/session.json"
-    assert request.headers["authorization"] == "Bearer tok"
-    assert json.loads(request.content) == {"message": "Save", "content": b64("{}"), "sha": "a" * 40}
-
-
-@pytest.mark.parametrize(
-    ("response", "sha", "error"),
-    [
-        (httpx.Response(409), "a" * 40, GithubConflictError),
-        (httpx.Response(422), None, GithubConflictError),
-        (httpx.Response(404), None, GithubNotFoundError),
-        (httpx.Response(401), None, GithubUnauthorizedError),
-        (httpx.Response(403, headers={"x-ratelimit-remaining": "0"}), None, GithubRateLimitedError),
-    ],
-)
-async def test_put_file_maps_errors(response: httpx.Response, sha: str | None, error: type[Exception]) -> None:
-    with pytest.raises(error):
-        await client(lambda _: response).put_file("tok", REPO, "a.json", "{}", message="m", sha=sha)
 
 
 async def test_get_file_decodes_content_and_reads_large_files_as_blobs() -> None:
@@ -93,7 +63,7 @@ async def test_create_repo_and_an_existing_name() -> None:
             return httpx.Response(422)
         repo = {
             "id": 1,
-            "name": "makable-workspace",
+            "name": "my-site",
             "full_name": REPO,
             "private": True,
             "html_url": "https://x",
@@ -102,11 +72,11 @@ async def test_create_repo_and_an_existing_name() -> None:
         return httpx.Response(201, json=repo)
 
     github = client(handler)
-    repo = await github.create_repo("tok", "makable-workspace", "desc", private=True)
+    repo = await github.create_repo("tok", "my-site", "desc", private=True)
     assert repo.private
     assert bodies[0]["private"] is True and bodies[0]["auto_init"] is True
     with pytest.raises(GithubRepoExistsError):
-        await github.create_repo("tok", "makable-workspace", "desc", private=True)
+        await github.create_repo("tok", "my-site", "desc", private=True)
 
 
 @pytest.mark.parametrize(
@@ -122,7 +92,7 @@ async def test_rate_limits_carry_githubs_wait(headers: dict[str, str], reset_in:
         headers = {**headers, "x-ratelimit-reset": str(int(time.time()) + reset_in)}
     github = client(lambda _: httpx.Response(403, headers=headers))
     with pytest.raises(GithubRateLimitedError) as limited:
-        await github.put_file("tok", REPO, "a.json", "{}", message="m", sha=None)
+        await github.get_file("tok", REPO, "a.json")
     assert abs(limited.value.retry_after - expected) <= 2
     assert limited.value.details == {"retryAfter": limited.value.retry_after}
 
@@ -169,6 +139,13 @@ async def test_a_branch_that_moved_is_a_conflict_and_the_head_is_read_in_one_req
     assert head == GithubBranchHead(commit_sha="c1", tree_sha="t1")
     with pytest.raises(GithubConflictError):
         await github.commit_changes("tok", REPO, "main", head, [], message="m")
+
+
+async def test_a_renamed_repo_is_not_there_by_its_old_name() -> None:
+    moved = {"message": "Moved Permanently", "url": "https://api.github.com/repositories/1"}
+    github = client(lambda _: httpx.Response(301, json=moved, headers={"location": moved["url"]}))
+
+    assert await github.get_repo("tok", REPO) is None
 
 
 async def test_no_free_connection_is_a_quick_busy_answer() -> None:
@@ -322,16 +299,6 @@ async def test_workflow_dispatch_and_runs() -> None:
     )
 
 
-async def test_get_blob_reads_text_by_sha() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == f"/repos/{REPO}/git/blobs/{'a' * 40}"
-        return httpx.Response(200, json={"content": b64("body {}\n"), "encoding": "base64"})
-
-    assert await client(handler).get_blob("tok", REPO, "a" * 40) == "body {}\n"
-    with pytest.raises(GithubNotFoundError):
-        await client(lambda _: httpx.Response(404)).get_blob("tok", REPO, "a" * 40)
-
-
 async def test_runs_since_a_time_and_a_workflow_github_hasnt_registered() -> None:
     seen: list[httpx.Request] = []
 
@@ -346,3 +313,95 @@ async def test_runs_since_a_time_and_a_workflow_github_hasnt_registered() -> Non
     # "Workflow does not have 'workflow_dispatch' trigger": GitHub still has the old file. Retried by the caller.
     with pytest.raises(GithubNotFoundError):
         await client(lambda _: httpx.Response(422)).dispatch_workflow("tok", REPO, "x.yml", "main")
+
+
+def tarball(
+    files: dict[str, bytes], *, top: str = "octocat-my-site-abc1234", links: dict[str, str] | None = None
+) -> bytes:
+    """A repo archive as GitHub sends it: every file under one top folder."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as archive:
+        folder = tarfile.TarInfo(top)
+        folder.type = tarfile.DIRTYPE
+        archive.addfile(folder)
+        for path, data in files.items():
+            info = tarfile.TarInfo(f"{top}/{path}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        for path, target in (links or {}).items():
+            link = tarfile.TarInfo(f"{top}/{path}")
+            link.type = tarfile.SYMTYPE
+            link.linkname = target
+            archive.addfile(link)
+    return out.getvalue()
+
+
+async def test_an_archive_is_read_through_githubs_redirect_without_the_token_on_the_other_host() -> None:
+    seen: list[httpx.Request] = []
+    files = {"src/App.tsx": b"export {}\n", "public/logo.png": b"\x89PNG\r\n\x1a\x00", "../evil": b"x"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "api.github.com":
+            return httpx.Response(
+                302, headers={"location": "https://codeload.github.com/octocat/my-site/tar.gz/abc?token=t"}
+            )
+        return httpx.Response(200, content=tarball(files, links={"link": "/etc/passwd"}))
+
+    archive = await client(handler).get_archive("tok", "octocat/my-site", "abc")
+
+    assert archive == {"src/App.tsx": b"export {}\n", "public/logo.png": b"\x89PNG\r\n\x1a\x00"}
+    assert seen[0].url.path == "/repos/octocat/my-site/tarball/abc"
+    assert seen[0].headers["authorization"] == "Bearer tok"
+    assert "authorization" not in seen[1].headers
+
+
+async def test_an_archive_past_the_limit_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.clients.github.MAX_ARCHIVE_BYTES", 100)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 1000)
+
+    with pytest.raises(GithubRepoTooLargeError):
+        await client(handler).get_archive("tok", "octocat/my-site", "main")
+
+
+async def test_a_missing_archive_is_not_found() -> None:
+    with pytest.raises(GithubNotFoundError):
+        await client(lambda _: httpx.Response(404)).get_archive("tok", "octocat/my-site", "main")
+
+
+async def test_a_commit_is_read_with_its_tree_and_parents() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/repos/octocat/my-site/git/commits/{'c' * 40}"
+        body = {"sha": "c" * 40, "tree": {"sha": "t" * 40}, "parents": [{"sha": "p" * 40}], "message": "Make it green"}
+        return httpx.Response(200, json=body)
+
+    commit = await client(handler).get_commit("tok", "octocat/my-site", "c" * 40)
+
+    assert (commit.tree_sha, commit.parents, commit.message) == ("t" * 40, ["p" * 40], "Make it green")
+
+
+async def test_a_repo_is_made_public() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        body = {
+            "id": 1,
+            "name": "my-site",
+            "full_name": REPO,
+            "private": False,
+            "html_url": f"https://github.com/{REPO}",
+            "default_branch": "main",
+        }
+        return httpx.Response(200, json=body)
+
+    repo = await client(handler).set_private("tok", REPO, False)
+
+    assert repo.private is False
+    assert (seen[0].method, seen[0].url.path, json.loads(seen[0].content)) == (
+        "PATCH",
+        f"/repos/{REPO}",
+        {"private": False},
+    )

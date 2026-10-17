@@ -1,13 +1,18 @@
 from typing import Any
 
 import pytest
+from psycopg import AsyncConnection
+from psycopg.rows import DictRow
+from psycopg_pool import AsyncConnectionPool
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.pool import NullPool
 
 from app.core.client import (
+    PooledPostgresSaver,
     close_connection,
     close_postgres_client,
     engine_options,
+    get_checkpointer,
     get_http_client,
     get_postgres_client,
     get_postgres_engine,
@@ -105,3 +110,18 @@ async def test_http_client_is_shared_and_closed_with_the_connection() -> None:
 
     assert client.is_closed
     assert get_http_client() is not client
+
+
+async def test_the_pooled_checkpointer_lets_queries_run_side_by_side() -> None:
+    pool: AsyncConnectionPool[AsyncConnection[DictRow]] = AsyncConnectionPool("", open=False)
+    saver = PooledPostgresSaver(pool)
+
+    # LangGraph's own saver holds an asyncio.Lock here: the inner query would wait for the outer one forever.
+    async with saver.lock, saver.lock:
+        pass
+
+
+def test_the_checkpointer_refuses_a_transaction_mode_pooler() -> None:
+    # Its search_path is set per connection, which a transaction-mode pooler doesn't keep.
+    with pytest.raises(RuntimeError, match="session-mode"):
+        get_checkpointer(supabase(db_port=6543, db_transaction_pooler=True))

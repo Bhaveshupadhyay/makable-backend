@@ -48,6 +48,15 @@ class GithubBranchHead(BaseModel):
     tree_sha: str
 
 
+class GithubCommit(BaseModel):
+    """A commit, its tree, and the commits it was made on (one, or none for a repo's first)."""
+
+    sha: str
+    tree_sha: str
+    parents: list[str]
+    message: str
+
+
 class GithubTreeChange(BaseModel):
     """One file in a new commit: its new text, its bytes (a binary file, e.g. an image), or None to delete it."""
 

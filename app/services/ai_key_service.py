@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import status
 
-from app.clients.ai_providers import AiProviderClient, provider_endpoint
+from app.clients.ai_providers import AiProviderClient, model_accepts_images, provider_endpoint
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_keys import KEY_HINT_CHARS, PROVIDERS, AiKeyStatus
 from app.core.database import utc_now
@@ -162,10 +162,16 @@ class AiKeyService:
         working keys."""
         options = []
         if self._default_model is not None:
-            options.append(AiModelOption(key_id=None, provider=None, model=self._default_model.name))
+            default = self._default_model
+            options.append(
+                AiModelOption(key_id=None, provider=None, model=default.name, accepts_images=default.accepts_images)
+            )
         for key in await self._keys.list_for_user(user_id):
             if key.status == AiKeyStatus.VALID:
-                options += [AiModelOption(key_id=key.id, provider=key.provider, model=m) for m in key.models]
+                options += [
+                    AiModelOption(key_id=key.id, provider=key.provider, model=m, accepts_images=model_accepts_images(m))
+                    for m in key.models
+                ]
         return options
 
     async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient:

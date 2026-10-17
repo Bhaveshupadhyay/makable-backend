@@ -1,5 +1,5 @@
-"""The deploy workflow a publish writes to `.github/workflows/makable-deploy.yml`: build the site (React templates
-with Vite, static ones as they are) and deploy it to the platform the user picked.
+"""The deploy workflow a publish writes to `.github/workflows/makable-deploy.yml`: build the site (React sites with
+Vite, static ones as they are) and deploy it to the platform the user picked.
 
 It only runs when started (`workflow_dispatch`): by makable when the user clicks Publish, or by hand from the
 Actions tab. A push doesn't deploy, so a change made on GitHub stays unpublished until the user publishes.
@@ -12,8 +12,7 @@ user added on GitHub themselves works the same as one they pasted in the chat.
 
 import json
 
-from app.constants.publish import TARGET_NAMES, TARGET_SECRETS, PublishTarget
-from app.schemas.template import TemplateKind
+from app.constants.publish import TARGET_NAMES, TARGET_SECRETS, PublishTarget, SiteKind
 
 # Pinned by major version; bump them here.
 CHECKOUT = "actions/checkout@v4"
@@ -31,7 +30,7 @@ OUT_DIR = "dist"
 
 
 def render_workflow(
-    target: PublishTarget, kind: TemplateKind, *, branch: str, base_path: str, project_name: str | None
+    target: PublishTarget, kind: SiteKind, *, branch: str, base_path: str, project_name: str | None
 ) -> str:
     """The workflow file for a site. `base_path` is where the site is served (`/`, or `/<repo>/` for a GitHub
     Pages project site); `project_name` is the platform project (None for GitHub Pages)."""

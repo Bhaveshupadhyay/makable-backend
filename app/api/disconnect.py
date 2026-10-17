@@ -34,4 +34,8 @@ async def cancel_on_disconnect[T](request: Request, work: Coroutine[Any, Any, T]
             if await request.is_disconnected():
                 raise ClientDisconnectedError()
     finally:
-        task.cancel()
+        if not task.done():
+            task.cancel()
+            # The request ends (and its DB session closes) only once the work has cleaned up: it records that it was
+            # stopped, and finishes and records a commit that had started. That's bounded by GitHub's timeouts.
+            await asyncio.wait({task})

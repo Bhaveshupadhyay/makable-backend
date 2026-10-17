@@ -95,3 +95,27 @@ class PerKeyLimit:
             full = now - self._burst * self._every
             self._buckets = {k: v for k, v in self._buckets.items() if v[1] > full}
         self._buckets[key] = (tokens - 1, now)
+
+
+class KeyLock:
+    """One at a time per key (e.g. a site's AI run). A second one gets `error` right away instead of waiting
+    behind the first. Like the other limits, it's per worker."""
+
+    def __init__(self, error: Callable[[], AppError]) -> None:
+        self._error = error
+        self._busy: set[Hashable] = set()
+
+    @asynccontextmanager
+    async def hold(self, key: Hashable) -> AsyncIterator[None]:
+        """Holds `key` while the block runs.
+
+        Raises:
+            AppError: `key` is already held (the error the lock was made with).
+        """
+        if key in self._busy:
+            raise self._error()
+        self._busy.add(key)
+        try:
+            yield
+        finally:
+            self._busy.discard(key)
