@@ -24,7 +24,8 @@ best kept as data (menus, products, services...).
 - At most {MAX_CREATE_FILES} files. Paths end in .tsx, .ts or .css. Don't list src/main.tsx.
 - List files so that each one only imports files listed before it (App.tsx last).
 - The user's answers to makable's questions (<user_answers>, if there are any) say what kind of site it is and \
-what it needs: plan that site."""
+what it needs: plan that site.
+- {_name_rule(name)}"""
 
 
 def write_prompt(
@@ -54,8 +55,8 @@ def write_prompt(
 
 {context}{css}Write {file["path"]}: {file["purpose"]}
 
-Reply with the complete file in one ``` code block and nothing else. Import only files from the plan (with the \
-names they export), react, and lucide-react icons."""
+{_name_rule(name)} Reply with the complete file in one ``` code block and nothing else. Import only files from the \
+plan (with the names they export), react, and lucide-react icons."""
 
 
 def fix_prompt(path: str, code: str, problems: list[str]) -> str:
@@ -68,6 +69,15 @@ def fix_prompt(path: str, code: str, problems: list[str]) -> str:
 {code}</file>
 
 Reply with the complete corrected file in one ``` code block and nothing else. Keep everything else as it is."""
+
+
+def _name_rule(name: str) -> str:
+    """The site's name is the user's choice: the code uses it, not a name from the description."""
+    return (
+        f"The site is called {name} (<site_name>, the name the user chose): wherever the site's name appears (the "
+        "brand in the header, the <title> in App, the footer), write it exactly as written there, as text in the "
+        "code, even if the description calls the site something else."
+    )
 
 
 def _answers(brief: list[QuestionAnswer]) -> str:

@@ -6,8 +6,12 @@ problem is a sentence for the model, which gets the file back to fix it.
 - Packages must be ones the site has (`ALLOWED_PACKAGES`), and lucide-react icons ones it exports (`lucide_icons.txt`,
   from lucide-react 1.52: version 1 has no brand icons such as Instagram).
 - `src/App.tsx` must export `App`, which the starter's `src/main.tsx` renders.
+- The site's name (what the user called it) must be the page's `<title>` in `src/App.tsx`, and be shown on the page
+  (the brand in the header). Matched ignoring case, spacing and HTML entities.
 """
 
+import html
+import json
 import posixpath
 import re
 from functools import cache
@@ -27,6 +31,8 @@ _EXPORT_DECLARED = re.compile(
 )
 _EXPORT_LIST = re.compile(r"^\s*export\s+(?:type\s+)?\{([^}]*)\}", re.MULTILINE)
 _EXPORT_DEFAULT = re.compile(r"^\s*export\s+default\b", re.MULTILINE)
+_TITLE = re.compile(r"<title\b[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
+_HEADER_FILE = re.compile(r"header|nav", re.IGNORECASE)
 _RESOLVE = ("", ".tsx", ".ts", ".jsx", ".js", ".css", "/index.tsx", "/index.ts")
 
 
@@ -36,8 +42,9 @@ def lucide_icons() -> frozenset[str]:
     return frozenset(line.strip() for line in lines if line.strip() and not line.startswith("#"))
 
 
-def check_site(files: dict[str, str], paths: list[str]) -> dict[str, list[str]]:
-    """The problems of each of `paths` (the files the model wrote), checked against all of `files`."""
+def check_site(files: dict[str, str], paths: list[str], name: str = "") -> dict[str, list[str]]:
+    """The problems of each of `paths` (the files the model wrote), checked against all of `files`; with `name`, also
+    whether the site shows its name."""
     problems: dict[str, list[str]] = {}
     for path in paths:
         found = _problems(files, path)
@@ -48,6 +55,9 @@ def check_site(files: dict[str, str], paths: list[str]) -> dict[str, list[str]]:
         problems.setdefault("src/App.tsx", []).append(
             "it must export a component named App (`export function App() { ... }`): src/main.tsx imports { App }"
         )
+    if name and app is not None:
+        for path, problem in _name_problems(files, paths, name):
+            problems.setdefault(path, []).append(problem)
     return problems
 
 
@@ -92,6 +102,39 @@ def _problems(files: dict[str, str], path: str) -> list[str]:
                 "lucide-react can be imported"
             )
     return problems
+
+
+def _name_problems(files: dict[str, str], paths: list[str], name: str) -> list[tuple[str, str]]:
+    """Whether the page's title is the site's name, and whether the page shows it (outside the title)."""
+    wanted = _plain(name)
+    app = files["src/App.tsx"]
+    problems = []
+    if not any(wanted in _plain(title) for title in _TITLE.findall(app)):
+        problems.append(
+            (
+                "src/App.tsx",
+                f"the site is called {json.dumps(name, ensure_ascii=False)}, and the page's title must have that name: "
+                f"put <title>{name}</title> inside App, exactly as written",
+            )
+        )
+    scripts = [p for p in paths if script_language(p) is not None and p in files]
+    if not any(wanted in _plain(_TITLE.sub("", files[p])) for p in scripts):
+        header = next((p for p in scripts if _HEADER_FILE.search(posixpath.basename(p))), "src/App.tsx")
+        problems.append(
+            (
+                header,
+                f"the site is called {json.dumps(name, ensure_ascii=False)}, but the page never shows that name: show "
+                "it as the site's brand in the header (and in the footer), exactly as written, as text in the code",
+            )
+        )
+    return problems
+
+
+def _plain(text: str) -> str:
+    """Text as it reads on the page, to find a name in code: entities and escaped quotes undone, spaces collapsed,
+    without case."""
+    text = html.unescape(text.replace("\\'", "'").replace('\\"', '"'))
+    return " ".join(text.split()).casefold()
 
 
 def _relative_import(

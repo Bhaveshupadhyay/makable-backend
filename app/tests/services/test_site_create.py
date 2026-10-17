@@ -2,6 +2,7 @@
 files, the checks and their fixes, the commit, and how a creation streams, stops and fails."""
 
 import asyncio
+import html
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -60,12 +61,24 @@ APP = (
 BROKEN_APP = APP.replace("import { Hero } from './components/Hero'", "import { Hero } from './components/Heroes'")
 
 
+# The site the fixtures made already (it has its repo and its name).
+MY_SITE = "My site"
+
+
+def mine(code: str) -> str:
+    """Code for the site that has its repo: it shows its name."""
+    return code.replace("Ada's Bakery", MY_SITE)
+
+
 def fenced(code: str, lang: str = "tsx") -> str:
     return f"Here is the file:\n```{lang}\n{code}```\n"
 
 
-def replies(app: str = APP) -> list[str]:
-    return [READY, PLAN, fenced(CSS, "css"), fenced(HERO), fenced(app)]
+def replies(app: str = APP, name: str = "Ada's Bakery") -> list[str]:
+    """The model's replies for a site called `name`, which its code shows (the checks ask for it), as JSX text."""
+    text = html.escape(name, quote=False)
+    named = {"hero": HERO.replace("Ada's Bakery", text), "app": app.replace("Ada's Bakery", text)}
+    return [READY, PLAN, fenced(CSS, "css"), fenced(named["hero"]), fenced(named["app"])]
 
 
 async def collect(events: AsyncIterator[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -150,12 +163,14 @@ async def test_a_site_is_created_from_a_prompt(
     assert "<user_answers>\n" not in model.calls[1][0].text
     assert '<file path="src/index.css">\n' + CSS in model.calls[3][0].text
     assert "Write src/App.tsx: the page" in model.calls[4][0].text
+    # The name the user chose goes in the code.
+    assert "The site is called Ada's Bakery (<site_name>, the name the user chose)" in model.calls[4][0].text
 
 
 async def test_a_taken_name_is_asked_again(ai_services: AiServices, github: FakeGithubClient) -> None:
     github.add_repo("ada-s-bakery", private=False, files={"index.html": "mine"})
     # The questions about the site are asked once; a typed name (not an option) is read by the model.
-    model = FakeModelClient(READY, json.dumps({"name": "Ada Buns"}), *replies()[1:])
+    model = FakeModelClient(READY, json.dumps({"name": "Ada Buns"}), *replies(name="Ada Buns")[1:])
     asked = await started(ai_services, model)
 
     first = await collect(
@@ -202,7 +217,7 @@ async def test_an_answer_that_isnt_a_name_is_answered_and_the_name_asked_again(
         "What should we call it?",
         "suggestions": ["Ada's Bakery", "Sweet Ada"],
     }
-    model = FakeModelClient(READY, json.dumps(chat), *replies()[1:])
+    model = FakeModelClient(READY, json.dumps(chat), *replies(name="Sweet Ada")[1:])
     asked = await started(ai_services, model)
 
     again = await answer_with(ai_services, model, asked["runId"], "hi, what should I call it?")
@@ -239,7 +254,7 @@ async def test_an_answer_that_isnt_a_name_is_answered_and_the_name_asked_again(
 
 
 async def test_a_name_in_a_sentence_is_taken_out_of_it(ai_services: AiServices, github: FakeGithubClient) -> None:
-    model = FakeModelClient(READY, json.dumps({"name": "Crumb & Co"}), *replies()[1:])
+    model = FakeModelClient(READY, json.dumps({"name": "Crumb & Co"}), *replies(name="Crumb & Co")[1:])
     asked = await started(ai_services, model)
 
     created = await answer_with(ai_services, model, asked["runId"], "let's call it crumb & co please")
@@ -320,7 +335,7 @@ async def test_questions_about_the_site_come_first_then_the_name_with_names_that
 ) -> None:
     look = json.dumps({"ask": {"question": "Which look do you want?", "options": ["Warm and cosy", "Clean"]}})
     ready = json.dumps({"ready": True, "names": ["Ada's Cakes", "Crumb & Co", "Ada's Cakes"]})
-    model = FakeModelClient(KIND, look, ready, *replies()[1:])
+    model = FakeModelClient(KIND, look, ready, *replies(name="Crumb & Co")[1:])
 
     kind = await started(ai_services, model)
 
@@ -422,7 +437,7 @@ async def test_at_most_three_questions_are_asked_about_the_site(
     ai_services: AiServices, github: FakeGithubClient, site: str
 ) -> None:
     # A site with its repo has its name: only the questions are asked, and no names suggested after them.
-    model = FakeModelClient(KIND, KIND, KIND, *replies()[1:])
+    model = FakeModelClient(KIND, KIND, KIND, *replies(name=MY_SITE)[1:])
     asked = result_of(
         await collect(
             await ai_services.create(FakeModelSource(model)).create(
@@ -470,7 +485,7 @@ async def test_a_message_the_model_cant_reply_to_asks_the_question_again(
 async def test_a_site_with_its_repo_is_made_again_without_a_question(
     ai_services: AiServices, github: FakeGithubClient, site: str
 ) -> None:
-    model = FakeModelClient(*replies())
+    model = FakeModelClient(*replies(name=MY_SITE))
 
     events = await collect(
         await ai_services.create(FakeModelSource(model)).create(
@@ -480,7 +495,7 @@ async def test_a_site_with_its_repo_is_made_again_without_a_question(
 
     created = result_of(events)
     assert created["status"] == "created"
-    assert github.files[REPO]["src/App.tsx"].content == APP
+    assert github.files[REPO]["src/App.tsx"].content == mine(APP)
     # The files the site had stay (the hero from the fixture is replaced: the plan has the same path).
     assert ".makable/manifest.json" in github.files[REPO]
 
@@ -488,7 +503,7 @@ async def test_a_site_with_its_repo_is_made_again_without_a_question(
 async def test_problems_the_checks_find_go_back_to_the_model(
     ai_services: AiServices, github: FakeGithubClient, site: str
 ) -> None:
-    model = FakeModelClient(*replies(app=BROKEN_APP), fenced(APP))
+    model = FakeModelClient(*replies(app=BROKEN_APP, name=MY_SITE), fenced(mine(APP)))
 
     events = await collect(
         await ai_services.create(FakeModelSource(model)).create(
@@ -499,14 +514,34 @@ async def test_problems_the_checks_find_go_back_to_the_model(
     assert ("fix", "Fixing src/App.tsx") in [(e["stage"], e["message"]) for e in events if e["type"] == "progress"]
     fix = model.calls[5][0].text
     assert 'imports "./components/Heroes", but there\'s no such file' in fix
-    assert github.files[REPO]["src/App.tsx"].content == APP
+    assert github.files[REPO]["src/App.tsx"].content == mine(APP)
+    assert "may still need fixing" not in result_of(events)["summary"]
+
+
+async def test_a_site_that_doesnt_show_its_name_goes_back_to_the_model(
+    ai_services: AiServices, github: FakeGithubClient, site: str
+) -> None:
+    # The description calls it Ada's Bakery, but the user named the site My site.
+    shown = mine(APP).replace("<Hero />", "<Hero />\n      <footer>My site</footer>")
+    model = FakeModelClient(*replies(), fenced(shown))
+
+    events = await collect(
+        await ai_services.create(FakeModelSource(model)).create(
+            USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
+        )
+    )
+
+    fix = model.calls[5][0].text
+    assert 'the site is called "My site", and the page\'s title must have that name' in fix
+    assert 'the site is called "My site", but the page never shows that name' in fix
+    assert github.files[REPO]["src/App.tsx"].content == shown
     assert "may still need fixing" not in result_of(events)["summary"]
 
 
 async def test_problems_left_after_the_fixes_are_committed_and_said(
     ai_services: AiServices, github: FakeGithubClient, site: str
 ) -> None:
-    model = FakeModelClient(*replies(app=BROKEN_APP), fenced(BROKEN_APP), fenced(BROKEN_APP))
+    model = FakeModelClient(*replies(app=BROKEN_APP, name=MY_SITE), fenced(mine(BROKEN_APP)), fenced(mine(BROKEN_APP)))
 
     events = await collect(
         await ai_services.create(FakeModelSource(model)).create(
@@ -515,12 +550,12 @@ async def test_problems_left_after_the_fixes_are_committed_and_said(
     )
 
     assert "may still need fixing" in result_of(events)["summary"]
-    assert github.files[REPO]["src/App.tsx"].content == BROKEN_APP
+    assert github.files[REPO]["src/App.tsx"].content == mine(BROKEN_APP)
 
 
 async def test_a_reply_without_a_file_is_asked_for_again(ai_services: AiServices, site: str) -> None:
     no_file = "Sure! Here are the colours: amber."
-    model = FakeModelClient(READY, PLAN, no_file, fenced(CSS, "css"), fenced(HERO), fenced(APP))
+    model = FakeModelClient(READY, PLAN, no_file, fenced(CSS, "css"), fenced(mine(HERO)), fenced(mine(APP)))
 
     events = await collect(
         await ai_services.create(FakeModelSource(model)).create(
@@ -570,7 +605,7 @@ class SlowModel:
 
 
 async def test_pings_go_out_while_the_model_writes(ai_services: AiServices, site: str) -> None:
-    model = SlowModel(*replies(), delay=0.12)
+    model = SlowModel(*replies(name=MY_SITE), delay=0.12)
 
     events = await collect(
         await ai_services.create(FakeModelSource(model)).create(
@@ -605,7 +640,7 @@ async def test_closing_the_stream_stops_the_creation(
     [record] = await records(session)
     assert record.outcome == AiEditOutcome.CANCELLED
     # The site is free again.
-    again = FakeModelClient(*replies())
+    again = FakeModelClient(*replies(name=MY_SITE))
     created = await collect(
         await ai_services.create(FakeModelSource(again)).create(
             USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
@@ -619,7 +654,7 @@ async def test_stop_during_the_commit_still_commits_and_the_chat_shows_it(
 ) -> None:
     github.commit_delay = 0.2
     # Problems are left after the fixes, so the commit's summary says so.
-    model = FakeModelClient(*replies(app=BROKEN_APP), fenced(BROKEN_APP), fenced(BROKEN_APP))
+    model = FakeModelClient(*replies(app=BROKEN_APP, name=MY_SITE), fenced(mine(BROKEN_APP)), fenced(mine(BROKEN_APP)))
     events = await ai_services.create(FakeModelSource(model)).create(
         USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
     )
@@ -660,7 +695,7 @@ async def test_another_users_site_and_a_busy_site_are_refused_before_streaming(
 
 
 async def test_events_closed_without_being_read_free_the_site(ai_services: AiServices, site: str) -> None:
-    service = ai_services.create(FakeModelSource(FakeModelClient(*replies())))
+    service = ai_services.create(FakeModelSource(FakeModelClient(*replies(name=MY_SITE))))
     events = await service.create(USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT))
 
     await events.aclose()
@@ -672,7 +707,7 @@ async def test_events_closed_without_being_read_free_the_site(ai_services: AiSer
 async def test_an_old_answer_is_superseded_and_start_over_forgets_the_creation(
     ai_services: AiServices, checkpointer: Any
 ) -> None:
-    model = FakeModelClient(*replies())
+    model = FakeModelClient(*replies(name=MY_SITE))
     first = await started(ai_services, model)
     second = await started(ai_services, model)
     service = ai_services.create(FakeModelSource(model))

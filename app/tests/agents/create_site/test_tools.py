@@ -121,6 +121,38 @@ def test_the_checks_find_what_would_break_the_preview() -> None:
     assert "syntax error" in problems["src/components/Broken.tsx"][0]
 
 
+def test_the_site_must_show_its_name_and_have_it_as_its_title() -> None:
+    header = 'export function Header() { return <header><a href="#top">My Bakery</a></header> }\n'
+    app = "export function App() { return <main><title>My Bakery</title></main> }\n"
+    files = {"src/App.tsx": app, "src/components/Header.tsx": header}
+    written = ["src/components/Header.tsx", "src/App.tsx"]
+
+    # Its case and spacing, and HTML entities, don't matter.
+    assert check_site(files, written, "my  bakery") == {}
+    assert check_site({**files, "src/App.tsx": app.replace("My Bakery", "Crumb &amp; Co")}, written, "Crumb & Co") == {
+        "src/components/Header.tsx": [
+            'the site is called "Crumb & Co", but the page never shows that name: show it as the site\'s brand in the '
+            "header (and in the footer), exactly as written, as text in the code"
+        ]
+    }
+
+    problems = check_site({**files, "src/App.tsx": app.replace("<title>My Bakery</title>", "")}, written, "My Bakery")
+    assert problems == {
+        "src/App.tsx": [
+            'the site is called "My Bakery", and the page\'s title must have that name: put <title>My Bakery</title> '
+            "inside App, exactly as written"
+        ]
+    }
+
+    # A name from the description isn't the one the user chose.
+    problems = check_site(files, written, "Sunrise")
+    assert [p.split(",")[0] for p in problems["src/App.tsx"]] == ['the site is called "Sunrise"']
+    assert "src/components/Header.tsx" in problems
+    # Without a header file, the page is told to show it.
+    assert "never shows that name" in check_site({"src/App.tsx": app}, ["src/App.tsx"], "Sunrise")["src/App.tsx"][1]
+    assert check_site(files, written) == {}
+
+
 def test_exports_and_icons() -> None:
     code = "export function A() {}\nexport const B = 1\nconst C = 2\nexport { C as D }\nexport default A\n"
     assert exported_names(code) == {"A", "B", "D", "default"}

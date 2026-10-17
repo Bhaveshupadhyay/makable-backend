@@ -18,7 +18,8 @@ colours and fonts in CSS variables on :root and use them as bg-(--accent), text-
 icons (no Instagram, Github, Facebook...): use generic icons (Mail, Phone, MapPin, Globe, Link...) or text.
 - Images: only https URLs the user gave you. Otherwise use colour, gradients, icons and typography, never broken \
 image links.
-- Set the page title with a <title> element inside App (React puts it in the head).
+- Set the page title with a <title> element inside App (React puts it in the head), with the site's name.
+- The header shows the site's name (<site_name>) as its brand, exactly as the user wrote it.
 - One page made of sections (header with navigation to the sections, hero, the content the site needs, contact, \
 footer). Anchor links to section ids, no router.
 - Responsive (mobile first), accessible (semantic elements, alt text, labels, enough contrast).
