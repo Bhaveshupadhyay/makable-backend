@@ -33,13 +33,25 @@ def script_syntax_error(code: str, language: Language) -> str | None:
 
 def locate_syntax_error(code: str, language: Language) -> tuple[str, int] | None:
     """The first syntax error in a script and its character offset, or None if it parses."""
-    encoded = code.encode()
-    node = _first_error(Parser(language).parse(encoded).root_node)
+    encoded = bytearray(code.encode())
+    parser = Parser(language)
+    while (node := _first_error(parser.parse(bytes(encoded)).root_node)) is not None and _bare_jsx_ampersand(
+        node, encoded
+    ):
+        # The grammar wants an entity after `&` in JSX text, but a bare one is fine (`<h2>Visit & Order</h2>`):
+        # esbuild, TypeScript and the preview take it as text. A letter in its place keeps the offsets.
+        encoded[node.start_byte] = ord("x")
     if node is None:
         return None
     what = f"missing {node.type}" if node.is_missing else "unexpected code"
     offset = len(encoded[: node.start_byte].decode(errors="ignore"))
     return f"syntax error (line {node.start_point.row + 1}): {what}", offset
+
+
+def _bare_jsx_ampersand(node: Node, encoded: bytearray) -> bool:
+    """The error is JSX text starting with an `&` that isn't an entity (tree-sitter's grammars reject those)."""
+    in_jsx = node.parent is not None and node.parent.type == "jsx_element"
+    return node.is_error and in_jsx and encoded[node.start_byte] == ord("&")
 
 
 def _first_error(node: Node) -> Node | None:

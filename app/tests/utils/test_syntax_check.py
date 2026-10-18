@@ -60,3 +60,24 @@ def test_script_syntax_errors_say_where() -> None:
     accented = 'const ok = 1;\nconst é = "ü";\nfoo(;\n'
     found = locate_syntax_error(accented, script_language("a.js"))  # type: ignore[arg-type]
     assert found == ("syntax error (line 3): missing )", accented.index("foo(;") + 4)
+
+
+@pytest.mark.parametrize("path", ["a.tsx", "a.jsx"])
+@pytest.mark.parametrize(
+    "text",
+    ["Visit & Order", "Lens & Light", "R&D", "A && B", "&", "5 &lt; 6 & 7", "Terms &\n  Conditions", "a & {x} & b"],
+)
+def test_a_bare_ampersand_in_jsx_text_parses(path: str, text: str) -> None:
+    # esbuild, TypeScript and the preview take it as text; tree-sitter's grammars want an entity there.
+    code = f"export const a = <p>{text}</p>\nexport const b = <>{text}</>\n"
+
+    assert locate_syntax_error(code, script_language(path)) is None  # type: ignore[arg-type]
+
+
+def test_errors_after_a_bare_ampersand_are_still_found_where_they_are() -> None:
+    code = "const a = <h2>Visit & Order</h2>\nconst b = (1;\n"
+
+    found = locate_syntax_error(code, script_language("a.tsx"))  # type: ignore[arg-type]
+
+    assert found == ("syntax error (line 2): missing )", code.index("(1;") + 2)
+    assert locate_syntax_error("const a = <h2>Visit & Order</h2\n", script_language("a.tsx")) is not None  # type: ignore[arg-type]

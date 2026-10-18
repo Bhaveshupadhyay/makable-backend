@@ -2,7 +2,6 @@
 files, the checks and their fixes, the commit, and how a creation streams, stops and fails."""
 
 import asyncio
-import html
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -75,9 +74,9 @@ def fenced(code: str, lang: str = "tsx") -> str:
 
 
 def replies(app: str = APP, name: str = "Ada's Bakery") -> list[str]:
-    """The model's replies for a site called `name`, which its code shows (the checks ask for it), as JSX text."""
-    text = html.escape(name, quote=False)
-    named = {"hero": HERO.replace("Ada's Bakery", text), "app": app.replace("Ada's Bakery", text)}
+    """The model's replies for a site called `name`, which its code shows (the checks ask for it) as written: a bare
+    `&` in JSX text is fine."""
+    named = {"hero": HERO.replace("Ada's Bakery", name), "app": app.replace("Ada's Bakery", name)}
     return [READY, PLAN, fenced(CSS, "css"), fenced(named["hero"]), fenced(named["app"])]
 
 
@@ -565,6 +564,37 @@ async def test_a_reply_without_a_file_is_asked_for_again(ai_services: AiServices
 
     assert result_of(events)["status"] == "created"
     assert "That reply was rejected: the reply has no code block" in model.calls[3][-1].text
+
+
+async def test_a_bare_ampersand_in_the_text_is_taken_as_written(ai_services: AiServices, site: str) -> None:
+    hero = mine(HERO).replace("</h1>", "</h1><h2>Visit & Order</h2>")
+    model = FakeModelClient(READY, PLAN, fenced(CSS, "css"), fenced(hero), fenced(mine(APP)))
+
+    events = await collect(
+        await ai_services.create(FakeModelSource(model)).create(
+            USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
+        )
+    )
+
+    assert result_of(events)["status"] == "created"
+    assert len(model.calls) == 5  # No file was asked for again.
+
+
+async def test_a_file_that_doesnt_parse_is_asked_for_again_with_the_line(ai_services: AiServices, site: str) -> None:
+    broken = mine(HERO).replace("</h1>", "</h1")
+    model = FakeModelClient(READY, PLAN, fenced(CSS, "css"), fenced(broken), fenced(mine(HERO)), fenced(mine(APP)))
+
+    events = await collect(
+        await ai_services.create(FakeModelSource(model)).create(
+            USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
+        )
+    )
+
+    assert result_of(events)["status"] == "created"
+    rejection = model.calls[4][-1].text
+    assert rejection.startswith("That reply was rejected: it doesn't parse: syntax error (line 4)")
+    quoted = 'in ⟦return <section id="hero"><Cake /><h1>My site</h1</section>⟧.'
+    assert f"{quoted} Reply with the complete file." in rejection
 
 
 async def test_a_creation_that_cant_be_planned_ends_with_an_error(
