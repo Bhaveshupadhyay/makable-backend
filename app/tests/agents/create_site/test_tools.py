@@ -1,11 +1,13 @@
 import pytest
 
+from app.agents.create_site.nodes.write import _line_at
 from app.agents.create_site.tools.brief import BriefReady, answered, brief_block, parse_brief_reply
 from app.agents.create_site.tools.checks import check_site, exported_names, lucide_icons
 from app.agents.create_site.tools.code import extract_code
 from app.agents.create_site.tools.names import NameChat, NameGiven, mentions, parse_name_reply, same_name, suggest_name
 from app.agents.create_site.tools.plan import parse_plan
 from app.agents.thread import QuestionAnswer
+from app.constants.ai_create import REJECTED_LINE_CHARS
 from app.schemas.ai_edit import ModelQuestion
 
 
@@ -158,3 +160,15 @@ def test_exports_and_icons() -> None:
     assert exported_names(code) == {"A", "B", "D", "default"}
     assert {"Mail", "Phone", "MapPin", "Cake", "Home"} <= lucide_icons()
     assert not {"Instagram", "Github", "Facebook"} & lucide_icons()
+
+
+def test_a_rejected_file_quotes_the_line_around_its_error() -> None:
+    assert _line_at("const a = 1\nconst b = (1;\n", 24) == "const b = (1;"
+    # At the end of the file (a missing `}`): the last line with text.
+    code = "export function A() {\n  return <p>hi</p>\n\n"
+    assert _line_at(code, len(code)) == "return <p>hi</p>"
+    # A long line is cut around the error, not after its start.
+    long = "const x = [" + ", ".join(str(i) for i in range(150)) + ", (];"
+    quoted = _line_at(long, long.index("(]"))
+    assert "(];" in quoted
+    assert len(quoted) <= REJECTED_LINE_CHARS

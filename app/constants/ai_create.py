@@ -27,6 +27,9 @@ MAX_CREATED_FILE_CHARS = 40_000
 MAX_FILE_ATTEMPTS = 2
 MAX_FIX_ROUNDS = 2
 MAX_PLAN_ATTEMPTS = 2
+# How much of the line that doesn't parse a file's rejection quotes (with the error alone, the model sends the same
+# file back).
+REJECTED_LINE_CHARS = 200
 # Files the model wrote earlier in the run are shown whole to the next ones up to this size, else as an outline.
 SHOWN_WHOLE_CHARS = 5_000
 
