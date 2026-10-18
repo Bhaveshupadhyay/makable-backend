@@ -74,6 +74,13 @@ def test_a_bare_ampersand_in_jsx_text_parses(path: str, text: str) -> None:
     assert locate_syntax_error(code, script_language(path)) is None  # type: ignore[arg-type]
 
 
+def test_a_file_full_of_bare_ampersands_parses() -> None:
+    items = "".join(f"    <li>Item {i}: R & D</li>\n" for i in range(400))
+    code = f"export const A = () => (\n  <ul>\n{items}  </ul>\n)\n"
+
+    assert locate_syntax_error(code, script_language("a.tsx")) is None  # type: ignore[arg-type]
+
+
 def test_errors_after_a_bare_ampersand_are_still_found_where_they_are() -> None:
     code = "const a = <h2>Visit & Order</h2>\nconst b = (1;\n"
 

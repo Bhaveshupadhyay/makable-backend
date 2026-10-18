@@ -2,6 +2,7 @@
 closing tag or brace) before the edit reaches the preview. They don't type-check: the preview doesn't either."""
 
 import re
+from collections.abc import Iterator
 
 import tree_sitter_javascript
 import tree_sitter_typescript
@@ -35,12 +36,17 @@ def locate_syntax_error(code: str, language: Language) -> tuple[str, int] | None
     """The first syntax error in a script and its character offset, or None if it parses."""
     encoded = bytearray(code.encode())
     parser = Parser(language)
-    while (node := _first_error(parser.parse(bytes(encoded)).root_node)) is not None and _bare_jsx_ampersand(
-        node, encoded
-    ):
+    while True:
+        root = parser.parse(bytes(encoded)).root_node
+        node = _first_error(root)
+        if node is None or not _bare_jsx_ampersand(node, encoded):
+            break
         # The grammar wants an entity after `&` in JSX text, but a bare one is fine (`<h2>Visit & Order</h2>`):
-        # esbuild, TypeScript and the preview take it as text. A letter in its place keeps the offsets.
-        encoded[node.start_byte] = ord("x")
+        # esbuild, TypeScript and the preview take it as text. A letter in its place keeps the offsets. Every one
+        # this parse found goes at once, so a file full of them is parsed a few times, not once per `&`.
+        for error in _errors(root):
+            if _bare_jsx_ampersand(error, encoded):
+                encoded[error.start_byte] = ord("x")
     if node is None:
         return None
     what = f"missing {node.type}" if node.is_missing else "unexpected code"
@@ -55,14 +61,17 @@ def _bare_jsx_ampersand(node: Node, encoded: bytearray) -> bool:
 
 
 def _first_error(node: Node) -> Node | None:
+    return next(_errors(node), None)
+
+
+def _errors(node: Node) -> Iterator[Node]:
+    """The syntax errors under a node, in order (not the ones inside an error)."""
     if node.is_error or node.is_missing:
-        return node
+        yield node
+        return
     for child in node.children:
-        if child.has_error:
-            found = _first_error(child)
-            if found is not None:
-                return found
-    return None
+        if child.has_error or child.is_missing:
+            yield from _errors(child)
 
 
 def css_braces_balanced(code: str) -> bool:

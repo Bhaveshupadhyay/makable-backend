@@ -64,8 +64,17 @@ def _checked(path: str, code: str) -> str:
     syntax = locate_syntax_error(code, language) if language is not None else None
     if syntax:
         # The line itself, so the model can see what to change (the error alone, it sends the same file back).
-        lines = code.splitlines()
-        line = code[: syntax[1]].count("\n")
-        text = lines[line].strip() if line < len(lines) else ""
-        raise ValueError(f"it doesn't parse: {syntax[0]}, in ⟦{text[:REJECTED_LINE_CHARS]}⟧")
+        raise ValueError(f"it doesn't parse: {syntax[0]}, in ⟦{_line_at(code, syntax[1])}⟧")
     return code
+
+
+def _line_at(code: str, offset: int) -> str:
+    """The line at `offset`, cut to `REJECTED_LINE_CHARS` around it. An error at the end of the file (a missing `}`)
+    quotes the last line with text."""
+    if not code[offset:].strip():
+        offset = len(code[:offset].rstrip())
+    start = code.rfind("\n", 0, offset) + 1
+    end = code.find("\n", offset)
+    line = code[start : len(code) if end == -1 else end]
+    cut = max(0, min(offset - start - REJECTED_LINE_CHARS // 2, len(line) - REJECTED_LINE_CHARS))
+    return line[cut : cut + REJECTED_LINE_CHARS].strip()

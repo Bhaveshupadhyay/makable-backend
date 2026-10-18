@@ -566,7 +566,9 @@ async def test_a_reply_without_a_file_is_asked_for_again(ai_services: AiServices
     assert "That reply was rejected: the reply has no code block" in model.calls[3][-1].text
 
 
-async def test_a_bare_ampersand_in_the_text_is_taken_as_written(ai_services: AiServices, site: str) -> None:
+async def test_a_bare_ampersand_in_the_text_is_taken_as_written(
+    ai_services: AiServices, github: FakeGithubClient, site: str
+) -> None:
     hero = mine(HERO).replace("</h1>", "</h1><h2>Visit & Order</h2>")
     model = FakeModelClient(READY, PLAN, fenced(CSS, "css"), fenced(hero), fenced(mine(APP)))
 
@@ -578,6 +580,7 @@ async def test_a_bare_ampersand_in_the_text_is_taken_as_written(ai_services: AiS
 
     assert result_of(events)["status"] == "created"
     assert len(model.calls) == 5  # No file was asked for again.
+    assert github.files[REPO]["src/components/Hero.tsx"].content == hero
 
 
 async def test_a_file_that_doesnt_parse_is_asked_for_again_with_the_line(ai_services: AiServices, site: str) -> None:
