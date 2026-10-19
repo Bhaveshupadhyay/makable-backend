@@ -14,6 +14,8 @@ from app.clients.github import GithubPagesUnavailableError
 from app.constants.publish import WORKFLOW_PATH, PublishTarget
 from app.constants.site import MANIFEST_PATH
 from app.models.site import Site
+from app.repositories.site_analytics import SqlSiteAnalyticsRepository
+from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.schemas.github import GithubWorkflowRun
 from app.schemas.publish import DeployRequest, PublishRequest
 from app.services.publish_service import (
@@ -53,6 +55,8 @@ def publisher(
         github,
         make_site_service(session, github),
         platforms,
+        SqlSiteAnalyticsRepository(session),
+        SqlAlchemyUnitOfWork(session),
         sleep=no_sleep,
         dispatch_delays=(0.1, 0.1),
         clock=lambda: NOW,
@@ -170,7 +174,15 @@ async def test_a_plain_html_site_is_deployed_as_it_is(
     github.add_repo("my-site", private=True, files={**manifest_file(PROJECT_ID), "index.html": "<h1>Hi</h1>\n"})
     session.add(Site(id=PROJECT_ID, user_id=USER.id, name="My site", repo_name="my-site"))
     await session.commit()
-    service = PublishService(github, make_site_service(session, github), platforms, sleep=no_sleep, clock=lambda: NOW)
+    service = PublishService(
+        github,
+        make_site_service(session, github),
+        platforms,
+        SqlSiteAnalyticsRepository(session),
+        SqlAlchemyUnitOfWork(session),
+        sleep=no_sleep,
+        clock=lambda: NOW,
+    )
 
     await publish(service, github, credentials=TOKEN)
 

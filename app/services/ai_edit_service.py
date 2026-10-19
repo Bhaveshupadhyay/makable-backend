@@ -14,6 +14,7 @@ from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
 from app.core.limits import KeyLock
 from app.repositories.site import AiEditRecordRepository, SiteRepository
+from app.repositories.site_analytics import SiteAnalyticsRepository
 from app.repositories.unit_of_work import UnitOfWork
 from app.schemas.ai_edit import (
     AiEditAnswer,
@@ -87,6 +88,7 @@ class AiEditService:
         checkpointer: BaseCheckpointSaver[str],
         runs: KeyLock,
         *,
+        analytics: SiteAnalyticsRepository,
         debug: bool = False,
     ) -> None:
         self._models = models
@@ -98,6 +100,7 @@ class AiEditService:
         self._graph = compile_edit_graph(checkpointer)
         self._create_graph = compile_create_graph(checkpointer)
         self._runs = runs
+        self._analytics = analytics
         self._debug = debug
 
     async def edit(self, user: UserRead, request: AiEditRequest) -> AiEditResult:
@@ -247,8 +250,8 @@ class AiEditService:
         return AiThreadRead(project_id=project_id, status="awaiting_result", turns=turns, run=run)
 
     async def start_over(self, user: UserRead, project_id: UUID) -> None:
-        """Forgets the site in makable (Start over): its chat (the checkpoints), its requests and its row. The repo on
-        the user's GitHub isn't touched. Nothing to delete is fine.
+        """Forgets the site in makable (Start over): its chat (the checkpoints), its requests, its analytics stream and
+        its row. The repo on the user's GitHub isn't touched. Nothing to delete is fine.
 
         Raises:
             SiteNotFoundError: The site is another user's.
@@ -264,6 +267,7 @@ class AiEditService:
             await self._checkpointer.adelete_thread(edit_config(project_id)["configurable"]["thread_id"])
             await self._checkpointer.adelete_thread(create_config(project_id)["configurable"]["thread_id"])
             await self._records.delete_for_site(project_id)
+            await self._analytics.delete_for_site(project_id)
             await self._sites.delete(site)
             await self._uow.commit()
             logger.info("site forgotten", extra={"user_id": str(user.id), "project_id": str(project_id)})

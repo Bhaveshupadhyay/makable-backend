@@ -4,6 +4,10 @@ Vite, static ones as they are) and deploy it to the platform the user picked.
 It only runs when started (`workflow_dispatch`): by makable when the user clicks Publish, or by hand from the
 Actions tab. A push doesn't deploy, so a change made on GitHub stays unpublished until the user publishes.
 
+With a Google Analytics stream linked to the site, the built pages get its tag (gtag.js) at the top of `<head>`. It's
+added here, not to the site's code, so only the published site sends visits (the builder's preview doesn't), and
+linking or unlinking a stream doesn't touch the user's files.
+
 Values that come from the user or GitHub (project name, branch, base path) only go into `env:` as JSON strings,
 which YAML reads as quoted scalars, and scripts read them as quoted shell variables: they can't change the
 workflow or a command. A platform's project is found or created by name in the workflow too, so a token the
@@ -12,6 +16,7 @@ user added on GitHub themselves works the same as one they pasted in the chat.
 
 import json
 
+from app.constants.analytics import MEASUREMENT_ID
 from app.constants.publish import TARGET_NAMES, TARGET_SECRETS, PublishTarget, SiteKind
 
 # Pinned by major version; bump them here.
@@ -30,13 +35,24 @@ OUT_DIR = "dist"
 
 
 def render_workflow(
-    target: PublishTarget, kind: SiteKind, *, branch: str, base_path: str, project_name: str | None
+    target: PublishTarget,
+    kind: SiteKind,
+    *,
+    branch: str,
+    base_path: str,
+    project_name: str | None,
+    measurement_id: str | None = None,
 ) -> str:
     """The workflow file for a site. `base_path` is where the site is served (`/`, or `/<repo>/` for a GitHub
-    Pages project site); `project_name` is the platform project (None for GitHub Pages)."""
+    Pages project site); `project_name` is the platform project (None for GitHub Pages); `measurement_id` is the
+    Google Analytics tag to add to the pages (None for none)."""
     env = {"BRANCH": branch, "BASE_PATH": base_path}
     if project_name is not None:
         env["PROJECT_NAME"] = project_name
+    if measurement_id is not None:
+        if not MEASUREMENT_ID.fullmatch(measurement_id):
+            raise ValueError(f"not a measurement id: {measurement_id!r}")
+        env["GA_MEASUREMENT_ID"] = measurement_id
     pages = target == PublishTarget.GITHUB_PAGES
     permissions = ["contents: read", *(["pages: write", "id-token: write"] if pages else [])]
     header = f"""\
@@ -61,6 +77,8 @@ env:
 jobs:
 """
     build = f"      - uses: {CHECKOUT}\n" + (_REACT_BUILD if kind == "react" else _STATIC_BUILD)
+    if measurement_id is not None:
+        build += _ADD_GOOGLE_TAG
     if pages:
         return header + _PAGES_JOB.format(build=build)
     return header + _check_job(TARGET_SECRETS[target]) + _DEPLOY_JOB.format(build=build) + _DEPLOY_STEPS[target]
@@ -116,6 +134,30 @@ _STATIC_BUILD = f"""\
         run: |
           mkdir {OUT_DIR}
           find . -mindepth 1 -maxdepth 1 ! -name '.*' ! -name {OUT_DIR} -exec cp -R {{}} {OUT_DIR}/ \\;
+"""
+
+# After the build, so every page is tagged (404.html too). The id is checked again before it goes into a page.
+_ADD_GOOGLE_TAG = f"""\
+      - name: Add the Google Analytics tag
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          mid = os.environ["GA_MEASUREMENT_ID"]
+          if not re.fullmatch(r"G-[A-Z0-9]{{4,20}}", mid):
+              raise SystemExit(f"Not a Google Analytics measurement id: {{mid!r}}")
+          tag = (
+              f'<script async src="https://www.googletagmanager.com/gtag/js?id={{mid}}"></script>'
+              "<script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments);}}"
+              f"gtag('js',new Date());gtag('config','{{mid}}');</script>"
+          )
+          for page in pathlib.Path("{OUT_DIR}").rglob("*.html"):
+              html = page.read_text(encoding="utf-8", errors="replace")
+              if "googletagmanager.com/gtag/js" in html:
+                  continue
+              html, found = re.subn(r"<head\\b[^>]*>", lambda m: m.group(0) + tag, html, count=1, flags=re.I)
+              page.write_text(html if found else tag + html, encoding="utf-8")
+              print(f"Tagged {{page}}")
+          PY
 """
 
 _PAGES_JOB = f"""\

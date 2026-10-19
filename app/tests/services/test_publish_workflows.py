@@ -77,3 +77,28 @@ def test_values_stay_data() -> None:
 
     assert wf["env"]["BRANCH"] == 'x"\n  evil: true'
     assert "evil" not in wf
+
+
+@pytest.mark.parametrize("target", list(PublishTarget))
+@pytest.mark.parametrize("kind", ["react", "static"])
+def test_a_linked_site_s_pages_get_the_google_tag_after_the_build(target: PublishTarget, kind: str) -> None:
+    wf = workflow(target, kind=kind, measurement_id="G-ABCD1234")
+
+    assert wf["env"]["GA_MEASUREMENT_ID"] == "G-ABCD1234"
+    names = [step.get("name") for step in wf["jobs"]["deploy"]["steps"]]
+    tag = names.index("Add the Google Analytics tag")
+    built = names.index("Serve unknown paths with the app" if kind == "react" else "Collect the site's files")
+    assert built < tag
+    script = wf["jobs"]["deploy"]["steps"][tag]["run"]
+    assert 'os.environ["GA_MEASUREMENT_ID"]' in script and 'pathlib.Path("dist").rglob("*.html")' in script
+
+
+def test_without_a_stream_there_s_no_tag() -> None:
+    wf = workflow(PublishTarget.VERCEL)
+    assert "GA_MEASUREMENT_ID" not in wf["env"]
+    assert "googletagmanager" not in steps(wf["jobs"]["deploy"])
+
+
+def test_a_measurement_id_is_checked() -> None:
+    with pytest.raises(ValueError, match="measurement id"):
+        workflow(PublishTarget.VERCEL, measurement_id='G-1"\n  evil: true')

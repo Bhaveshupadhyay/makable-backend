@@ -8,6 +8,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
+from app.constants.analytics import GOOGLE_CALLBACK_PATH
 from app.constants.api import API_V1_PREFIX
 
 POSTGRES_DRIVER = "postgresql+asyncpg"
@@ -115,6 +116,11 @@ class Settings(DatabaseSettings):
     # Adds what the model was given to AI edit responses. Never turn it on in production.
     ai_debug: bool = False
 
+    # A Google OAuth client (Web application) for connecting users' Google Analytics. Its redirect URI is
+    # `google_callback_url`. Unset or empty means analytics is off.
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+
     @field_validator("app_url", "supabase_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
@@ -125,6 +131,16 @@ class Settings(DatabaseSettings):
     def _optional_url(cls, value: str | None) -> str | None:
         # An empty `AI_BASE_URL=` in `.env` means no makable model, the same as leaving it out.
         return (value or "").rstrip("/") or None
+
+    @field_validator("google_client_id")
+    @classmethod
+    def _optional_text(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
+
+    @field_validator("google_client_secret")
+    @classmethod
+    def _optional_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        return value if value is not None and value.get_secret_value().strip() else None
 
     @field_validator("token_encryption_key")
     @classmethod
@@ -139,6 +155,12 @@ class Settings(DatabaseSettings):
     def auth_callback_url(self) -> str:
         """Where Supabase sends the browser after sign-in. Add it to Supabase's allowed redirect URLs."""
         return f"{self.app_url}{API_V1_PREFIX}/auth/github/callback"
+
+    @property
+    def google_callback_url(self) -> str:
+        """Where Google sends the browser after the user connects Analytics. Add it to the OAuth client's redirect
+        URIs."""
+        return f"{self.app_url}{GOOGLE_CALLBACK_PATH}"
 
     @property
     def secure_cookies(self) -> bool:

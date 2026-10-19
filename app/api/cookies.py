@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from fastapi import Response
 
+from app.constants.analytics import GOOGLE_STATE_COOKIE, GOOGLE_STATE_COOKIE_PATH
 from app.constants.auth import (
     ACCESS_TOKEN_COOKIE,
     ACCESS_TOKEN_COOKIE_PATH,
@@ -40,6 +41,13 @@ class AuthCookies:
 
     def clear_oauth_state(self, response: Response) -> None:
         self._clear(response, OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_PATH)
+
+    def set_google_state(self, response: Response, value: str) -> None:
+        """The Google Analytics connect step's state, sent only to its callback."""
+        self._set(response, GOOGLE_STATE_COOKIE, value, OAUTH_STATE_TTL_SECONDS, GOOGLE_STATE_COOKIE_PATH)
+
+    def clear_google_state(self, response: Response) -> None:
+        self._clear(response, GOOGLE_STATE_COOKIE, GOOGLE_STATE_COOKIE_PATH)
 
     def _set(self, response: Response, key: str, value: str, max_age: int, path: str) -> None:
         response.set_cookie(key, value, max_age=max_age, path=path, httponly=True, secure=self._secure, samesite="lax")
