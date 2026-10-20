@@ -207,6 +207,14 @@ class AnalyticsService:
         logger.info("Google Analytics connected", extra={"user_id": str(oauth.user_id)})
         return back
 
+    def return_path(self, state_cookie: str | None) -> str:
+        """The SPA path the connect in `state_cookie` started from, or `/` when the cookie doesn't check out. For a
+        callback that can't be handled now (a busy worker), so it still goes back to the page."""
+        try:
+            return self._verify_state(state_cookie).return_to
+        except GoogleConnectError:
+            return "/"
+
     async def disconnect(self, user: UserRead) -> None:
         """Ends makable's access to the user's Google account (revoked at Google when it can be) and forgets it. The
         sites keep their streams: their pages keep the tag, and reconnecting shows their reports again."""

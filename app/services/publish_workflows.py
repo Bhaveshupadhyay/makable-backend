@@ -136,7 +136,8 @@ _STATIC_BUILD = f"""\
           find . -mindepth 1 -maxdepth 1 ! -name '.*' ! -name {OUT_DIR} -exec cp -R {{}} {OUT_DIR}/ \\;
 """
 
-# After the build, so every page is tagged (404.html too). The id is checked again before it goes into a page.
+# After the build, so every page is tagged (404.html too). The id is checked again before it goes into a page. A page
+# that loads gtag.js already (the site's own tag, for another id) gets only this stream's `config`, after its own setup.
 _ADD_GOOGLE_TAG = f"""\
       - name: Add the Google Analytics tag
         run: |
@@ -145,17 +146,29 @@ _ADD_GOOGLE_TAG = f"""\
           mid = os.environ["GA_MEASUREMENT_ID"]
           if not re.fullmatch(r"G-[A-Z0-9]{{4,20}}", mid):
               raise SystemExit(f"Not a Google Analytics measurement id: {{mid!r}}")
-          tag = (
-              f'<script async src="https://www.googletagmanager.com/gtag/js?id={{mid}}"></script>'
-              "<script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments);}}"
-              f"gtag('js',new Date());gtag('config','{{mid}}');</script>"
-          )
+          loader = f'<script async src="https://www.googletagmanager.com/gtag/js?id={{mid}}"></script>'
+          setup = "<script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments);}}"
+          config = f"gtag('config','{{mid}}');</script>"
+          configured = re.compile(r"gtag\\(\\s*.config.\\s*,\\s*." + mid + r"\\b")
+          def insert(html, snippet, marks, before=False):
+              # By the first mark found (after an opening tag, before a closing one), else at the start or the end.
+              for mark in marks:
+                  put = (lambda m: snippet + m[0]) if before else (lambda m: m[0] + snippet)
+                  html, found = re.subn(mark, put, html, count=1, flags=re.I)
+                  if found:
+                      return html
+              return html + snippet if before else snippet + html
           for page in pathlib.Path("{OUT_DIR}").rglob("*.html"):
               html = page.read_text(encoding="utf-8", errors="replace")
-              if "googletagmanager.com/gtag/js" in html:
+              if configured.search(html):
                   continue
-              html, found = re.subn(r"<head\\b[^>]*>", lambda m: m.group(0) + tag, html, count=1, flags=re.I)
-              page.write_text(html if found else tag + html, encoding="utf-8")
+              if "googletagmanager.com/gtag/js" in html:
+                  html = insert(html, setup + config, [r"</head\\s*>", r"</body\\s*>"], before=True)
+              else:
+                  # A page without <head> gets it after <html> or the doctype, which has to stay first.
+                  tag = f"{{loader}}{{setup}}gtag('js',new Date());{{config}}"
+                  html = insert(html, tag, [r"<head\\b[^>]*>", r"<html\\b[^>]*>", r"<!doctype\\b[^>]*>"])
+              page.write_text(html, encoding="utf-8")
               print(f"Tagged {{page}}")
           PY
 """

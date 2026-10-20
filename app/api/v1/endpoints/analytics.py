@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 
 from app.api.dependencies import (
     AnalyticsServiceDep,
+    AnalyticsSlotsDep,
     AuthCookiesDep,
     CurrentUserDep,
     SettingsDep,
@@ -14,6 +15,7 @@ from app.api.dependencies import (
     analytics_slot,
 )
 from app.constants.analytics import GA_ID, GOOGLE_STATE_COOKIE, ReportRange
+from app.core.limits import ServiceBusyError
 from app.schemas.analytics import (
     AnalyticsReport,
     GaAccountRead,
@@ -31,8 +33,10 @@ from app.utils.return_to import with_query
 
 logger = logging.getLogger(__name__)
 
-# Requests that wait on Google hold one of the worker's slots.
+# Requests that wait on Google hold one of the worker's slots. The callback takes its own (`callback_router`), so a
+# busy worker still redirects it back to the SPA.
 router = APIRouter(tags=["analytics"], dependencies=[Depends(analytics_slot)])
+callback_router = APIRouter(tags=["analytics"])
 
 ERRORS: dict[int | str, dict[str, Any]] = {
     code: {"model": ErrorResponse}
@@ -71,7 +75,7 @@ async def connect(
     return ApiResponse(data=GoogleConnectRedirect(authorize_url=start.authorize_url))
 
 
-@router.get(
+@callback_router.get(
     "/analytics/google/callback",
     status_code=status.HTTP_302_FOUND,
     summary="Google Analytics connect callback",
@@ -81,6 +85,7 @@ async def callback(
     analytics: AnalyticsServiceDep,
     cookies: AuthCookiesDep,
     settings: SettingsDep,
+    slots: AnalyticsSlotsDep,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
@@ -88,12 +93,16 @@ async def callback(
 ) -> RedirectResponse:
     """Google sends the browser here after the consent page. Keeps the user's token and redirects back to the SPA
     with `?analytics=connected`. This is a browser navigation, so failures also redirect, with
-    `?analyticsError=<code>`, instead of returning a JSON error."""
+    `?analyticsError=<code>`, instead of returning a JSON error (`service_busy` when the worker has no slot)."""
     try:
-        return_to = await analytics.complete_connect(state_cookie=state_cookie, code=code, state=state, error=error)
+        async with slots.slot():
+            return_to = await analytics.complete_connect(state_cookie=state_cookie, code=code, state=state, error=error)
     except GoogleConnectError as err:
         logger.warning("Google Analytics connect failed", extra={"code": err.code, "error": err.message})
         location = with_query(err.return_to, analyticsError=err.code)
+    except ServiceBusyError as err:
+        logger.warning("Google Analytics connect refused: the worker is busy")
+        location = with_query(analytics.return_path(state_cookie), analyticsError=err.code)
     else:
         location = with_query(return_to, analytics="connected")
     response = RedirectResponse(settings.app_url + location, status.HTTP_302_FOUND)

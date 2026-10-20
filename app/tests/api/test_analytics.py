@@ -1,11 +1,14 @@
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.api import dependencies
 from app.api.dependencies import get_google_client
 from app.constants.analytics import GOOGLE_STATE_COOKIE, GOOGLE_STATE_COOKIE_PATH
 from app.constants.publish import WORKFLOW_PATH
+from app.core.limits import ConcurrencyLimit
 from app.tests.ai_edit_fixtures import PROJECT_ID, REPO, create_site
 from app.tests.api.test_auth import sign_in
 from app.tests.conftest import APP_URL
@@ -151,6 +154,26 @@ def test_the_callback_redirects_with_the_error(client: TestClient, google: FakeG
     google.scope = "openid email https://www.googleapis.com/auth/analytics.readonly"
     query = start_connect(client)
     assert callback(client, code="wrong", state=query["state"][0]).endswith("analyticsError=google_code_invalid")
+    assert client.get(GOOGLE).json()["data"]["connected"] is False
+
+
+def test_a_busy_worker_still_redirects_the_callback_back_to_the_page(
+    client: TestClient, google: FakeGoogleClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sign_in(client)
+    query = start_connect(client, "/analytics?tab=1")
+    monkeypatch.setattr(dependencies, "ANALYTICS_SLOTS", ConcurrencyLimit(0))
+
+    # A browser navigation: a redirect back with the error (not a JSON 503), and the state cookie is cleared.
+    busy = callback(client, code=GOOGLE_CODE, state=query["state"][0])
+    assert busy == f"{APP_URL}/analytics?tab=1&analyticsError=service_busy"
+    assert client.cookies.get(GOOGLE_STATE_COOKIE, path=GOOGLE_STATE_COOKIE_PATH) is None
+    # Without a cookie that checks out, the return path isn't trusted.
+    assert callback(client, code=GOOGLE_CODE, state="x") == f"{APP_URL}/?analyticsError=service_busy"
+    # The other routes still answer 503.
+    assert error(client.get(GOOGLE)) == (503, "service_busy")
+
+    monkeypatch.setattr(dependencies, "ANALYTICS_SLOTS", ConcurrencyLimit(1))
     assert client.get(GOOGLE).json()["data"]["connected"] is False
 
 

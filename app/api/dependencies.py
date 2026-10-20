@@ -453,3 +453,12 @@ async def analytics_list_limit(user: CurrentUserDep) -> AsyncIterator[None]:
     """
     async with ANALYTICS_LISTS.hold(user.id):
         yield
+
+
+def get_analytics_slots() -> ConcurrencyLimit:
+    """The worker's analytics slots, for the connect callback. It's a browser navigation, so it takes its slot itself
+    and redirects back when they're all taken, instead of the JSON 503 `analytics_slot` answers."""
+    return ANALYTICS_SLOTS
+
+
+AnalyticsSlotsDep = Annotated[ConcurrencyLimit, Depends(get_analytics_slots)]
