@@ -14,6 +14,7 @@ from typing import Annotated, Any, Protocol, TypedDict
 from uuid import UUID
 
 from app.agents.thread import QuestionAnswer, RunResult, SiteFiles, Turns
+from app.agents.usage import MeteredModel, Usage, UsageMeter
 from app.clients.model import ModelClient
 from app.constants.ai_create import MAX_STEPS
 from app.schemas.ai_create import AiCreateRequest
@@ -88,6 +89,8 @@ class CreateState(TypedDict, total=False):
     # Model calls made, and the model's name.
     attempt: int
     model: str
+    # What the run took so far (set by every node that calls the model), for after a pause.
+    usage: Usage | None
     questions: list[QuestionAnswer]
     # What the run did since the last question was answered (the progress the browser was shown): the next question,
     # or the finished turn, keeps them for the chat.
@@ -107,6 +110,10 @@ class CreateRun:
     site: SiteCreator
     model: ModelClient | None = None
     model_input: str = ""
+    # The run's usage (its replies are counted as they come), from what it took before a pause, and whether the chat
+    # shows it.
+    usage: UsageMeter = field(default_factory=UsageMeter)
+    show_usage: bool = False
     # The files the model wrote, by path (committed together at the end).
     files: dict[str, str] = field(default_factory=dict)
     # The commit, once it started, and the run's state then, with the summary the chat gets: it's finished even if
@@ -117,7 +124,7 @@ class CreateRun:
 
     async def model_client(self) -> ModelClient:
         if self.model is None:
-            self.model = await self.pick_model()
+            self.model = MeteredModel(await self.pick_model(), self.usage)
         return self.model
 
     async def base_files(self, commit_sha: str) -> dict[str, str]:
@@ -155,6 +162,7 @@ def create_input(run_id: UUID, request: AiCreateRequest, *, name: str | None, ba
         "fix_rounds": 0,
         "attempt": 0,
         "model": "",
+        "usage": None,
         "questions": [],
         "steps": [],
         "step": "",

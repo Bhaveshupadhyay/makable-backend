@@ -30,7 +30,7 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
     for _ in range(MAX_FILE_ATTEMPTS):
-        reply = await model.complete(messages)
+        reply = (await model.complete(messages)).text
         attempt += 1
         try:
             code = _checked(path, extract_code(reply))
@@ -50,6 +50,7 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         "written": [*state["written"], path],
         "attempt": attempt,
         "model": model.name,
+        "usage": run.usage.total(),
         "steps": said,
         "step": "write" if nxt < len(plan) else "verify",
     }

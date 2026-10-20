@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.api.dependencies import get_model_client, get_model_client_factory
-from app.clients.model import AiKeyInvalidError, ModelClient
+from app.clients.model import AiKeyInvalidError, ModelClient, ModelReply
 from app.core.client import get_postgres_client
 from app.core.config import Settings
 from app.core.security import TokenCipher
@@ -22,7 +22,7 @@ AI = "/api/v1/ai"
 class RefusingModel:
     name = "refusing"
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         raise AiKeyInvalidError()
 
 

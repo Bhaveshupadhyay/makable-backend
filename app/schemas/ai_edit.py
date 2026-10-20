@@ -8,7 +8,7 @@ preview page, so everything here is untrusted: it's length-capped and only ever 
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, Field, StringConstraints
+from pydantic import AfterValidator, Field, StringConstraints, computed_field
 
 from app.constants.ai_edit import (
     MAX_ANSWER,
@@ -172,6 +172,31 @@ class AiEditDebug(CamelModel):
     model: str
 
 
+class AiUsage(CamelModel):
+    """What a request took: its model calls, the tokens the provider counted (None: it didn't say) and the time. Only
+    sent for requests with the user's own key."""
+
+    model_calls: int
+    input_tokens: int | None
+    output_tokens: int | None
+    # How much of the output was the model's thinking, and of the input read from the provider's cache, for providers
+    # that say.
+    reasoning_tokens: int | None
+    cached_tokens: int | None
+    # What the provider charged, for those that tell (OpenRouter).
+    cost_usd: float | None
+    # Waiting for the model, and the whole request (not the time it waited for the user or the preview).
+    model_seconds: float
+    seconds: float
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_tokens(self) -> int | None:
+        if self.input_tokens is None or self.output_tokens is None:
+            return None
+        return self.input_tokens + self.output_tokens
+
+
 class AiEditApplied(CamelModel):
     """The change is committed to the site's repo. `files` are the files it changed, as they are now (None: deleted),
     which the SPA puts in its copy of the site at `commit_sha`."""
@@ -181,6 +206,7 @@ class AiEditApplied(CamelModel):
     summary: str
     commit_sha: str
     files: dict[str, str | None]
+    usage: AiUsage | None = None
     debug: AiEditDebug | None = None
 
 
@@ -190,6 +216,7 @@ class AiEditEscalated(CamelModel):
     status: Literal["escalated"] = "escalated"
     run_id: UUID
     reason: str
+    usage: AiUsage | None = None
     debug: AiEditDebug | None = None
 
 

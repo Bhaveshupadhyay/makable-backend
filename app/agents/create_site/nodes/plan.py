@@ -26,7 +26,7 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     attempt = state["attempt"]
     planned: SitePlan | None = None
     for _ in range(MAX_PLAN_ATTEMPTS):
-        reply = await model.complete(messages)
+        reply = (await model.complete(messages)).text
         attempt += 1
         try:
             planned = parse_plan(reply)
@@ -48,6 +48,7 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         "written": [],
         "attempt": attempt,
         "model": model.name,
+        "usage": run.usage.total(),
         "steps": said,
         "step": "write",
     }
