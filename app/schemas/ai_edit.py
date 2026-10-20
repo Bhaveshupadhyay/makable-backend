@@ -210,18 +210,44 @@ class AiUsage(CamelModel):
     @model_serializer(mode="wrap")
     def _with_nulls(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo) -> dict[str, Any]:
         """Every count, null when the provider didn't say, also in answers sent without their None fields
-        (`exclude_none`, which would otherwise leave the unknown counts out)."""
+        (`exclude_none`, which would otherwise leave the unknown counts out). Fields the dump's `include` or `exclude`
+        leave out stay out."""
         data: dict[str, Any] = handler(self)
+        if not info.exclude_none:
+            return data
         cls = type(self)
-        aliases = {name: f.alias for name, f in cls.model_fields.items()} | {
-            name: f.alias for name, f in cls.model_computed_fields.items()
-        }
-        return {(alias or name) if info.by_alias else name: None for name, alias in aliases.items()} | data
+        aliases = {name: f.alias for name, f in cls.model_fields.items()}
+        if not info.exclude_computed_fields:
+            aliases |= {name: f.alias for name, f in cls.model_computed_fields.items()}
+        shown: dict[str, Any] = {}
+        for name, alias in aliases.items():
+            key = (alias or name) if info.by_alias else name
+            if key in data:
+                shown[key] = data[key]
+            elif getattr(self, name) is None and _picked(name, info):
+                shown[key] = None
+        return shown
 
     @classmethod
     def __get_pydantic_json_schema__(cls, schema: CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
         # The fields' own schema, not the serializer's (a bare object).
         return handler({key: value for key, value in schema.items() if key != "serialization"})
+
+
+def _picked(name: str, info: SerializationInfo) -> bool:
+    """Whether a dump's `include` and `exclude` keep a field, as pydantic reads them: `include` keeps its keys, whatever
+    their value; `exclude` drops a key of a set, or a key whose value is True or `...` (any other value excludes only
+    inside the field)."""
+    if info.include is not None and name not in info.include:
+        return False
+    exclude = info.exclude
+    if exclude is None or name not in exclude:
+        return True
+    if not isinstance(exclude, dict):
+        return False
+    # Typed as nested selections only, but True and `...` come through as they were passed.
+    value: object = exclude[name]
+    return value is not True and value is not ...
 
 
 class AiEditApplied(CamelModel):

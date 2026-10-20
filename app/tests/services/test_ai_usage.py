@@ -13,7 +13,7 @@ from app.clients.model import ModelReply, TokenUsage
 from app.constants.ai_edit import AiEditOutcome
 from app.models.site import AiEditRecord
 from app.schemas.ai_create import AiCreateAnswer, AiCreateRequest
-from app.schemas.ai_edit import AiEditAnswer, AiEditApplied, AiEditNeedsInput
+from app.schemas.ai_edit import AiEditAnswer, AiEditApplied, AiEditNeedsInput, AiUsage
 from app.services.ai_edit_service import AiEditRejectedError
 from app.tests.ai_edit_fixtures import BASE_COMMIT, GOOD_REPLY, PROJECT_ID, USER, MakeAiEditService, confirm, confirmed
 from app.tests.ai_edit_fixtures import make_request as edit_request
@@ -151,6 +151,53 @@ async def test_a_creation_with_the_users_key_shows_what_it_took(ai_services: AiS
     assert turn.usage is not None and turn.usage.input_tokens == 500
     [record] = await records(session)
     assert (record.input_tokens, record.output_tokens, record.model_ms) == (500, 50, 7500)
+
+
+def test_the_usage_sends_only_the_fields_a_dump_picks() -> None:
+    usage = AiUsage(
+        model_calls=1,
+        input_tokens=100,
+        output_tokens=None,
+        reasoning_tokens=None,
+        cached_tokens=None,
+        cost_usd=None,
+        model_seconds=1.0,
+        seconds=2.0,
+    )
+
+    # Without None fields, the unknown counts are still there, in their order.
+    assert list(usage.model_dump(by_alias=True, exclude_none=True)) == [
+        "modelCalls",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedTokens",
+        "costUsd",
+        "modelSeconds",
+        "seconds",
+        "totalTokens",
+    ]
+    # But not the ones the dump leaves out.
+    assert usage.model_dump(include={"input_tokens"}, exclude_none=True) == {"input_tokens": 100}
+    assert usage.model_dump(include={"cost_usd": True}, exclude_none=True) == {"cost_usd": None}
+    assert "cost_usd" not in usage.model_dump(exclude={"cost_usd"}, exclude_none=True)
+    assert "cost_usd" not in usage.model_dump(exclude={"cost_usd": True}, exclude_none=True)
+    assert "total_tokens" not in usage.model_dump(exclude_none=True, exclude_computed_fields=True)
+    answer = AiEditApplied(run_id=uuid4(), summary="Done", commit_sha="c" * 40, files={}, usage=usage)
+    assert answer.model_dump(include={"usage": {"model_calls", "cost_usd"}}, exclude_none=True) == {
+        "usage": {"model_calls": 1, "cost_usd": None}
+    }
+    # A dump that keeps None fields is pydantic's own.
+    assert usage.model_dump(exclude={"seconds"}) == {
+        "model_calls": 1,
+        "input_tokens": 100,
+        "output_tokens": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "cost_usd": None,
+        "model_seconds": 1.0,
+        "total_tokens": None,
+    }
 
 
 async def test_a_creation_with_makables_model_doesnt_show_it(ai_services: AiServices) -> None:
