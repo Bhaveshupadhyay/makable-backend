@@ -5,14 +5,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.api.dependencies import get_model_client, get_model_client_factory
-from app.clients.model import AiKeyInvalidError, ModelClient, ModelReply
+from app.clients.model import AiKeyInvalidError, ModelClient, ModelReply, TokenUsage
 from app.core.client import get_postgres_client
 from app.core.config import Settings
 from app.core.security import TokenCipher
 from app.models.ai_key import AiKey
 from app.schemas.ai_key import ModelEndpoint
 from app.schemas.chat import ChatMessage
-from app.tests.ai_edit_fixtures import GOOD_REPLY, create_site, request_body
+from app.tests.ai_edit_fixtures import GOOD_REPLY, PROJECT_ID, create_site, request_body
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import VALID_AI_KEY, FakeAiProviders, FakeModelClient
 
@@ -220,6 +220,34 @@ def test_an_edit_uses_the_picked_model_with_the_users_key(client: TestClient, mo
         headers={"x-api-key": VALID_AI_KEY, "anthropic-version": "2023-06-01"},
         accepts_images=True,
     )
+
+
+def test_an_answer_sends_the_counts_the_provider_didnt_report_as_null(
+    client: TestClient, models: dict[str, Any]
+) -> None:
+    # The answers leave out their None fields; the usage's unknown counts must still be there, as null.
+    sign_in(client)
+    base = create_site(client)
+    key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
+    models["user"].replies.append(ModelReply(GOOD_REPLY, TokenUsage(1000, 200), seconds=1.5))
+    waiting = client.post(
+        "/api/v1/ai/edit", json=request_body(baseCommit=base, model={"keyId": key["id"], "model": "gpt-5"})
+    ).json()["data"]
+
+    applied = client.post(f"{AI}/edit/{PROJECT_ID}/result", json={"runId": waiting["runId"], "ok": True}).json()
+
+    usage = applied["data"]["usage"]
+    assert {k: v for k, v in usage.items() if k != "seconds"} == {
+        "modelCalls": 1,
+        "inputTokens": 1000,
+        "outputTokens": 200,
+        "totalTokens": 1200,
+        "reasoningTokens": None,
+        "cachedTokens": None,
+        "costUsd": None,
+        "modelSeconds": 1.5,
+    }
+    assert "debug" not in applied["data"]
 
 
 def test_an_edit_without_a_pick_uses_makables_model(client: TestClient, models: dict[str, Any]) -> None:

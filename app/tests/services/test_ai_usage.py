@@ -145,6 +145,8 @@ async def test_a_creation_with_the_users_key_shows_what_it_took(ai_services: AiS
     # The questions about the site (before the pause), the plan and three files.
     usage = created["usage"]
     assert (usage["modelCalls"], usage["inputTokens"], usage["outputTokens"], usage["totalTokens"]) == (5, 500, 50, 550)
+    # The stream leaves out None fields, but not the counts the provider didn't report.
+    assert (usage["reasoningTokens"], usage["cachedTokens"], usage["costUsd"]) == (None, None, None)
     [turn] = (await ai_services.edit(FakeModelSource(model)).thread(USER, NEW)).turns
     assert turn.usage is not None and turn.usage.input_tokens == 500
     [record] = await records(session)

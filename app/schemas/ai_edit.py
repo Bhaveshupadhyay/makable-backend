@@ -5,10 +5,21 @@ code itself from the site's repo at that commit and commits the change. The sele
 preview page, so everything here is untrusted: it's length-capped and only ever goes into the prompt as data.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, Field, StringConstraints, computed_field
+from pydantic import (
+    AfterValidator,
+    Field,
+    GetJsonSchemaHandler,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    computed_field,
+    model_serializer,
+)
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from app.constants.ai_edit import (
     MAX_ANSWER,
@@ -195,6 +206,22 @@ class AiUsage(CamelModel):
         if self.input_tokens is None or self.output_tokens is None:
             return None
         return self.input_tokens + self.output_tokens
+
+    @model_serializer(mode="wrap")
+    def _with_nulls(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo) -> dict[str, Any]:
+        """Every count, null when the provider didn't say, also in answers sent without their None fields
+        (`exclude_none`, which would otherwise leave the unknown counts out)."""
+        data: dict[str, Any] = handler(self)
+        cls = type(self)
+        aliases = {name: f.alias for name, f in cls.model_fields.items()} | {
+            name: f.alias for name, f in cls.model_computed_fields.items()
+        }
+        return {(alias or name) if info.by_alias else name: None for name, alias in aliases.items()} | data
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, schema: CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
+        # The fields' own schema, not the serializer's (a bare object).
+        return handler({key: value for key, value in schema.items() if key != "serialization"})
 
 
 class AiEditApplied(CamelModel):
