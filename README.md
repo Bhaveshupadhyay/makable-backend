@@ -40,6 +40,24 @@ Supabase runs the GitHub OAuth flow. The GitHub side is an **OAuth App** (not a 
    projects). The API verifies access tokens against the published keys and rejects legacy HS256 tokens.
 5. Put `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` in `.env`.
 
+### Google Analytics (optional)
+
+Users connect their own Google Analytics through makable's Google OAuth client. Without one, analytics is off.
+
+1. Google Cloud console → a project → APIs & Services → **Library**: enable the **Google Analytics Admin API** and the
+   **Google Analytics Data API**.
+2. **Google Auth Platform** (OAuth consent screen): External; app name, support email, home page, privacy policy and
+   authorized domain. Data access → add the scope `https://www.googleapis.com/auth/analytics.readonly` (plus `openid`
+   and `email`). While the app is in Testing, add yourself under Audience → Test users.
+3. Clients → **Create client** → Web application. Authorized redirect URIs:
+   `http://localhost:5173/api/v1/analytics/google/callback` (through the Vite proxy) and the production equivalent
+   (`APP_URL` + `/api/v1/analytics/google/callback`).
+4. Put `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`.
+
+`analytics.readonly` is a sensitive scope: before other people can connect, Google has to verify the app (privacy
+policy, verified domain, a demo video). Until then the consent screen warns that the app is unverified, at most 100
+users can connect, and in Testing mode refresh tokens expire after 7 days (users are asked to connect again).
+
 ## Architecture
 
 Router → Service → Repository → Database.
@@ -125,6 +143,30 @@ is one commit. `latest.json` at the root names the site saved last.
 | `GET /api/v1/workspace/sessions/{projectId}/parts/{path}` | one file of a saved session |
 
 makable never writes to a `makable-workspace` repo it didn't create (no marker file) or one that's public.
+
+## Analytics
+
+A user connects Google once (`POST /api/v1/analytics/google/connect` returns Google's consent page, read-only
+Analytics; the callback keeps the refresh token, encrypted) and picks the GA4 property and web stream each site reports
+to (`PUT /api/v1/sites/{projectId}/analytics {propertyId, streamId}`, checked with Google). The site's next publish adds
+the stream's tag (gtag.js) to every built page, in the deploy workflow, so the builder's preview never sends visits.
+`GET /api/v1/sites/{projectId}/analytics/report?range=7d|28d|90d` reads the stream's numbers from Google's Data API
+(visitors, sessions, page views and the days before to compare, day by day, top pages, sources, countries, devices,
+people on the site now), kept 10 minutes per worker.
+
+| Endpoint | |
+|---|---|
+| `GET /api/v1/analytics/google` | `{configured, connected, email}` |
+| `POST /api/v1/analytics/google/connect` | `{returnTo}` → `{authorizeUrl}`, sets the state cookie |
+| `GET /api/v1/analytics/google/callback` | Google's redirect: back to the SPA with `?analytics=connected` or `?analyticsError=<code>` |
+| `DELETE /api/v1/analytics/google` | revokes makable's access and forgets the token (sites keep their streams) |
+| `GET /api/v1/analytics/google/properties` | the user's accounts and GA4 properties |
+| `GET /api/v1/analytics/google/properties/{id}/streams` | a property's web streams |
+| `GET\|PUT\|DELETE /api/v1/sites/{projectId}/analytics` | the site's stream (`link.tagPublished`: its deploy has the tag) |
+| `GET /api/v1/sites/{projectId}/analytics/report` | the site's traffic |
+
+Errors: 409 `google_not_connected` / `google_reconnect` (Google refused the stored token, which is then forgotten),
+403 `analytics_access_denied`, 404 `analytics_not_linked`, 429 `google_rate_limited`, 503 `analytics_not_configured`.
 
 ## Request limits
 

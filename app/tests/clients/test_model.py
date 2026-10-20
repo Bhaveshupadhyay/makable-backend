@@ -6,7 +6,13 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from app.clients.model import AiKeyInvalidError, HttpModelClient, ModelRateLimitedError, ModelUnavailableError
+from app.clients.model import (
+    AiKeyInvalidError,
+    HttpModelClient,
+    ModelRateLimitedError,
+    ModelUnavailableError,
+    TokenUsage,
+)
 from app.core.limits import ServiceBusyError
 from app.schemas.ai_key import ModelEndpoint
 from app.schemas.chat import ChatMessage, ImagePart, ImageUrl, TextPart
@@ -27,7 +33,7 @@ async def test_sends_the_chat_and_returns_the_reply_text() -> None:
         seen.append(request)
         return httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]})
 
-    assert await client(handler).complete(MESSAGES) == "hello"
+    assert (await client(handler).complete(MESSAGES)).text == "hello"
     [request] = seen
     assert str(request.url) == f"{URL}/chat/completions"
     assert request.headers["authorization"] == "Bearer k"
@@ -44,7 +50,7 @@ async def test_sends_no_authorization_without_a_key() -> None:
         assert "authorization" not in request.headers
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
-    assert await client(handler, api_key=None).complete(MESSAGES) == "ok"
+    assert (await client(handler, api_key=None).complete(MESSAGES)).text == "ok"
 
 
 @pytest.mark.parametrize(
@@ -85,7 +91,7 @@ async def test_sends_the_endpoints_extra_headers() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     endpoint = ModelEndpoint(base_url=URL, api_key="k", model="m", headers={"x-api-key": "k"})
-    assert await HttpModelClient(http, endpoint, timeout_seconds=5).complete(MESSAGES) == "ok"
+    assert (await HttpModelClient(http, endpoint, timeout_seconds=5).complete(MESSAGES)).text == "ok"
 
 
 @pytest.mark.parametrize(
@@ -123,7 +129,7 @@ async def test_a_message_with_a_picture_is_sent_as_content_parts() -> None:
     model = HttpModelClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), endpoint, timeout_seconds=5)
     message = ChatMessage(role="user", content=[TextPart(text="hi"), ImagePart(image_url=ImageUrl(url="data:x"))])
 
-    assert await model.complete([message]) == "ok"
+    assert (await model.complete([message])).text == "ok"
     assert model.accepts_images
     assert seen[0]["messages"] == [
         {
@@ -131,3 +137,107 @@ async def test_a_message_with_a_picture_is_sent_as_content_parts() -> None:
             "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:x"}}],
         }
     ]
+
+
+# Each provider's `usage`, as its docs show it.
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # OpenAI: thinking is part of `completion_tokens`, cached tokens part of `prompt_tokens`.
+        (
+            {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 1024, "audio_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 192, "accepted_prediction_tokens": 0},
+            },
+            TokenUsage(input=1200, output=300, reasoning=192, cached=1024),
+        ),
+        # Anthropic's compatibility layer: the details are always empty.
+        (
+            {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70, "prompt_tokens_details": None},
+            TokenUsage(input=50, output=20),
+        ),
+        # Gemini: the thinking is in `total_tokens` only.
+        ({"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 400}, TokenUsage(100, 300, reasoning=260)),
+        # DeepSeek: its cache hits under its own name too.
+        (
+            {
+                "prompt_tokens": 16,
+                "completion_tokens": 10,
+                "total_tokens": 26,
+                "prompt_cache_hit_tokens": 6,
+                "prompt_cache_miss_tokens": 10,
+            },
+            TokenUsage(input=16, output=10, cached=6),
+        ),
+        # Groq: timings, which aren't used.
+        (
+            {"queue_time": 0.03, "prompt_tokens": 18, "completion_tokens": 556, "total_tokens": 574, "total_time": 0.4},
+            TokenUsage(input=18, output=556),
+        ),
+        # xAI: thinking counted apart from `completion_tokens`, in `total_tokens`.
+        (
+            {
+                "prompt_tokens": 30,
+                "completion_tokens": 9,
+                "total_tokens": 339,
+                "completion_tokens_details": {"reasoning_tokens": 300},
+            },
+            TokenUsage(input=30, output=309, reasoning=300),
+        ),
+        # OpenRouter: what it charged.
+        (
+            {
+                "prompt_tokens": 194,
+                "completion_tokens": 2,
+                "total_tokens": 196,
+                "cost": 0.95,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100},
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
+            TokenUsage(input=194, output=2, reasoning=0, cached=0, cost_usd=0.95),
+        ),
+    ],
+)
+async def test_reads_each_providers_usage(usage: dict[str, object], expected: TokenUsage) -> None:
+    body = {"choices": [{"message": {"content": "ok"}}], "usage": usage}
+
+    reply = await client(lambda _: httpx.Response(200, json=body)).complete(MESSAGES)
+
+    assert reply.usage == expected
+    assert reply.seconds >= 0
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {},
+        {"prompt_tokens": 5},
+        {"prompt_tokens": "5", "completion_tokens": 1},
+        {"prompt_tokens": True, "completion_tokens": 1},
+    ],
+)
+async def test_a_reply_without_usable_counts_has_no_usage(usage: object) -> None:
+    body = {"choices": [{"message": {"content": "ok"}}], "usage": usage}
+
+    reply = await client(lambda _: httpx.Response(200, json=body)).complete(MESSAGES)
+
+    assert (reply.text, reply.usage) == ("ok", None)
+
+
+async def test_odd_details_are_left_out() -> None:
+    usage = {
+        "prompt_tokens": 5,
+        "completion_tokens": 1,
+        "total_tokens": "6",
+        "prompt_tokens_details": {"cached_tokens": -1},
+        "cost": "0.1",
+    }
+    body = {"choices": [{"message": {"content": "ok"}}], "usage": usage}
+
+    reply = await client(lambda _: httpx.Response(200, json=body)).complete(MESSAGES)
+
+    assert reply.usage == TokenUsage(input=5, output=1)

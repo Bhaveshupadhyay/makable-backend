@@ -15,6 +15,7 @@ from typing import Any, NotRequired, TypedDict
 from uuid import UUID
 
 from app.agents.thread import QuestionAnswer, RunResult, SiteFiles, Turns
+from app.agents.usage import MeteredModel, Usage, UsageMeter
 from app.clients.model import ModelClient
 from app.constants.ai_edit import MAX_TARGET_LABEL
 from app.schemas.ai_edit import AiEditRequest, AiEditTarget
@@ -61,6 +62,8 @@ class EditState(TypedDict, total=False):
     # Model calls made, and the model's name (the run can end in a later request than its model calls).
     attempt: int
     model: str
+    # What the run took so far (set by `generate`), for after a pause.
+    usage: Usage | None
     # What the model asked the user, and their answers.
     questions: list[QuestionAnswer]
     # Times the preview failed on the model's edits.
@@ -80,6 +83,10 @@ class EditRun:
     pick_model: Callable[[], Awaitable[ModelClient]]
     site: SiteFiles
     model: ModelClient | None = None
+    # The run's usage (its replies are counted as they come), from what it took before a pause, and whether the chat
+    # shows it.
+    usage: UsageMeter = field(default_factory=UsageMeter)
+    show_usage: bool = False
     # The last prompt the model got (for `AI_DEBUG`).
     model_input: str = ""
     # The files the change made, as they are now (None: deleted), for the response.
@@ -93,7 +100,7 @@ class EditRun:
     async def model_client(self) -> ModelClient:
         """The model, picked on the first call: a Tier 2 rule never needs one."""
         if self.model is None:
-            self.model = await self.pick_model()
+            self.model = MeteredModel(await self.pick_model(), self.usage)
         return self.model
 
     async def files(self) -> dict[str, str]:
@@ -118,6 +125,7 @@ def run_input(run_id: UUID, request: AiEditRequest) -> EditState:
         "reply": "",
         "attempt": 0,
         "model": "",
+        "usage": None,
         "questions": [],
         "preview_rounds": 0,
         "problem": "",

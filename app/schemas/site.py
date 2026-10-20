@@ -15,6 +15,7 @@ from app.constants.site import (
     RESERVED_PATH,
     SITE_NAME_MAX,
 )
+from app.schemas.ai_edit import AiUsage
 from app.schemas.common import CamelModel
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -52,6 +53,7 @@ class AiEditRecordCreate(BaseModel):
     summary: str | None
     attempts: int
     commit_sha: str | None = None
+    usage: AiUsage | None = None
 
 
 class SiteRead(CamelModel):

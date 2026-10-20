@@ -22,7 +22,7 @@ async def read_name(state: CreateState, runtime: Runtime[CreateRun]) -> CreateSt
     question, options = name_question(state)
     picked = None if chat else next((o for o in options if same_name(o, reply)), None)
     if picked is not None:
-        return _named(picked, state["attempt"])
+        return _named(picked, {"attempt": state["attempt"]})
     run = runtime.context
     model = await run.model_client()
     said = progress("name", "Reading your answer")
@@ -31,7 +31,7 @@ async def read_name(state: CreateState, runtime: Runtime[CreateRun]) -> CreateSt
     attempt = state["attempt"]
     read: NameGiven | NameChat | None = None
     for _ in range(MAX_NAME_READ_ATTEMPTS):
-        text = await model.complete(messages)
+        text = (await model.complete(messages)).text
         attempt += 1
         try:
             read = parse_name_reply(text)
@@ -44,19 +44,21 @@ async def read_name(state: CreateState, runtime: Runtime[CreateRun]) -> CreateSt
                     content=f"That reply was rejected: {describe_problem(err)}. Reply with the corrected JSON.",
                 ),
             ]
+    used: CreateState = {"attempt": attempt, "usage": run.usage.total()}
     if read is None:
-        return _ask_again(f"Sorry, I didn't catch a name there. {NAME_QUESTION}", options, attempt, said)
+        return _ask_again(f"Sorry, I didn't catch a name there. {NAME_QUESTION}", options, used, said)
     if isinstance(read, NameChat):
-        return _ask_again(read.reply, read.suggestions, attempt, said)
+        return _ask_again(read.reply, read.suggestions, used, said)
     name = " ".join(read.name.split())[:SITE_NAME_MAX]
     if not chat and (mentions(reply, name) or any(same_name(o, name) for o in options)):
-        return {**_named(name, attempt), "steps": said}
-    return _ask_again(f'Should we call it "{name}"?', [name] if len(name) <= MAX_OPTION else [], attempt, said)
+        return {**_named(name, used), "steps": said}
+    return _ask_again(f'Should we call it "{name}"?', [name] if len(name) <= MAX_OPTION else [], used, said)
 
 
-def _named(name: str, attempt: int) -> CreateState:
-    return {"name": name, "name_question": "", "name_options": [], "attempt": attempt, "step": "setup"}
+def _named(name: str, used: CreateState) -> CreateState:
+    """`used`: the model calls made (`attempt`), and the run's usage when the model was called."""
+    return {"name": name, "name_question": "", "name_options": [], **used, "step": "setup"}
 
 
-def _ask_again(question: str, options: list[str], attempt: int, said: list[str]) -> CreateState:
-    return {"name_question": question, "name_options": options, "attempt": attempt, "steps": said, "step": "ask_name"}
+def _ask_again(question: str, options: list[str], used: CreateState, said: list[str]) -> CreateState:
+    return {"name_question": question, "name_options": options, **used, "steps": said, "step": "ask_name"}

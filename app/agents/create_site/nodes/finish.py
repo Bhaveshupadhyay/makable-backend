@@ -1,10 +1,15 @@
-from app.agents.create_site.state import CreateState
+from langgraph.runtime import Runtime
+
+from app.agents.create_site.state import CreateRun, CreateState
 from app.agents.thread import Turn
+from app.agents.usage import shown_usage
 from app.core.database import utc_now
 
 
-async def finish(state: CreateState) -> CreateState:
-    """Adds the creation to the chat."""
+async def finish(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
+    """Adds the creation to the chat, with what it took when the chat shows that."""
+    run = runtime.context
+    usage = run.usage.total()
     result = state["result"]
     if result is None:
         raise RuntimeError("the creation ended without a result")
@@ -19,4 +24,6 @@ async def finish(state: CreateState) -> CreateState:
         commit_sha=result.get("commit_sha"),
         created_at=utc_now().isoformat(),
     )
-    return {"turns": [turn]}
+    if (shown := shown_usage(usage, run.show_usage)) is not None:
+        turn["usage"] = shown
+    return {"turns": [turn], "usage": usage}

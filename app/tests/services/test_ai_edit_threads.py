@@ -12,7 +12,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.clients.model import AiKeyInvalidError, ModelUnavailableError
+from app.clients.model import AiKeyInvalidError, ModelReply, ModelUnavailableError
 from app.constants.ai_edit import MAX_HISTORY, AiEditOutcome
 from app.constants.auth import Role
 from app.models.site import AiEditRecord, Site
@@ -54,7 +54,7 @@ class BlockingModel:
     def __init__(self) -> None:
         self.called = asyncio.Event()
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         self.called.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -67,7 +67,7 @@ class FailingModel:
     def __init__(self, error: Exception) -> None:
         self.error = error
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         raise self.error
 
 

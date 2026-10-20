@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import JSON, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.constants.ai_edit import AiEditOutcome
@@ -49,5 +49,14 @@ class AiEditRecord(UUIDPrimaryKeyMixin, Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     # The commit the change made on the site's repo.
     commit_sha: Mapped[str | None] = mapped_column(String(40))
+    # The tokens the provider counted for the request's model calls (None: it didn't say, or the row is older), what it
+    # charged (OpenRouter), and the time spent waiting for the model and in all.
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer)
+    cached_tokens: Mapped[int | None] = mapped_column(Integer)
+    cost_usd: Mapped[float | None] = mapped_column(Float)
+    model_ms: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     # Rows are written once, when the request ends.
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)

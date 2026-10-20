@@ -16,9 +16,15 @@ from app.api.dependencies import (
     get_ai_provider_client,
     get_deploy_platform_client,
     get_github_client,
+    get_google_client,
     get_supabase_client,
 )
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
+from app.constants.analytics import (
+    ANALYTICS_LIST_BURST,
+    ANALYTICS_LIST_EVERY_SECONDS,
+    MAX_CONCURRENT_ANALYTICS_REQUESTS,
+)
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_CREATIONS,
@@ -35,8 +41,10 @@ from app.core.database import Base
 from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
 from app.models.site import Site
 from app.repositories.site import SqlAiEditRecordRepository, SqlSiteRepository
+from app.repositories.site_analytics import SqlSiteAnalyticsRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.services.ai_edit_service import AiEditService, AiRunInProgressError, ModelSource
+from app.services.analytics_reports import ANALYTICS_REPORTS, LIVE_VISITORS
 from app.services.site_create_service import SiteCreateService
 from app.services.site_service import VERIFIED_SITES, SiteService
 from app.services.site_snapshots import SITE_SNAPSHOTS
@@ -47,6 +55,7 @@ from app.tests.fakes import (
     FakeCredentials,
     FakeDeployPlatforms,
     FakeGithubClient,
+    FakeGoogleClient,
     FakeSupabaseClient,
 )
 from main import create_app
@@ -84,6 +93,12 @@ def reset_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The caches and the request limits are process-wide; tests mustn't see each other's."""
     VERIFIED_SITES.clear()
     SITE_SNAPSHOTS.clear()
+    ANALYTICS_REPORTS.clear()
+    LIVE_VISITORS.clear()
+    monkeypatch.setattr(dependencies, "ANALYTICS_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_ANALYTICS_REQUESTS))
+    monkeypatch.setattr(
+        dependencies, "ANALYTICS_LISTS", PerKeyLimit(burst=ANALYTICS_LIST_BURST, every=ANALYTICS_LIST_EVERY_SECONDS)
+    )
     monkeypatch.setattr(dependencies, "PUBLISH_SLOTS", ConcurrencyLimit(MAX_CONCURRENT_PUBLISH_REQUESTS))
     monkeypatch.setattr(dependencies, "PUBLISHES", PerKeyLimit(burst=PUBLISH_BURST, every=PUBLISH_EVERY_SECONDS))
     monkeypatch.setattr(
@@ -150,6 +165,7 @@ def ai_edit_service(
             SqlAlchemyUnitOfWork(session),
             checkpointer,
             runs,
+            analytics=SqlSiteAnalyticsRepository(session),
             debug=debug,
         )
 
@@ -178,6 +194,7 @@ def ai_services(session: AsyncSession, checkpointer: InMemorySaver, github: Fake
             SqlAlchemyUnitOfWork(session),
             checkpointer,
             runs,
+            analytics=SqlSiteAnalyticsRepository(session),
         )
 
     def create(model_source: ModelSource) -> SiteCreateService:
@@ -206,6 +223,11 @@ def supabase() -> FakeSupabaseClient:
 
 
 @pytest.fixture
+def google() -> FakeGoogleClient:
+    return FakeGoogleClient()
+
+
+@pytest.fixture
 def platforms() -> FakeDeployPlatforms:
     return FakeDeployPlatforms()
 
@@ -222,6 +244,7 @@ def client(
     github: FakeGithubClient,
     supabase: FakeSupabaseClient,
     platforms: FakeDeployPlatforms,
+    google: FakeGoogleClient,
 ) -> Iterator[TestClient]:
     app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
@@ -229,6 +252,7 @@ def client(
     app.dependency_overrides[get_supabase_client] = lambda: supabase
     app.dependency_overrides[get_deploy_platform_client] = lambda: platforms
     app.dependency_overrides[get_ai_provider_client] = lambda: ai_providers
+    app.dependency_overrides[get_google_client] = lambda: google
     # The SPA's origin: in dev the Vite proxy serves the API under it.
     with TestClient(app, base_url=APP_URL, follow_redirects=False) as client:
         yield client

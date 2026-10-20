@@ -19,9 +19,15 @@ from app.api.cookies import AuthCookies
 from app.clients.ai_providers import AiProviderClient, HttpAiProviderClient
 from app.clients.deploy_platforms import DeployPlatformClient, HttpDeployPlatformClient
 from app.clients.github import GithubClient, HttpGithubClient
+from app.clients.google import GoogleClient, HttpGoogleClient
 from app.clients.model import HttpModelClient, ModelClient
 from app.clients.supabase import HttpSupabaseAuthClient, SupabaseAuthClient
 from app.constants.ai_keys import KEY_CHECK_BURST, KEY_CHECK_EVERY_SECONDS
+from app.constants.analytics import (
+    ANALYTICS_LIST_BURST,
+    ANALYTICS_LIST_EVERY_SECONDS,
+    MAX_CONCURRENT_ANALYTICS_REQUESTS,
+)
 from app.constants.api import (
     MAX_CONCURRENT_AI_EDITS,
     MAX_CONCURRENT_CREATIONS,
@@ -40,6 +46,7 @@ from app.core.limits import ConcurrencyLimit, KeyLock, PerKeyLimit
 from app.core.security import PayloadSigner, TokenCipher
 from app.repositories.ai_key import AiKeyRepository, SqlAiKeyRepository
 from app.repositories.github_credential import GithubCredentialRepository, SqlGithubCredentialRepository
+from app.repositories.google_credential import GoogleCredentialRepository, SqlGoogleCredentialRepository
 from app.repositories.health import HealthRepository, SqlHealthRepository
 from app.repositories.site import (
     AiEditRecordRepository,
@@ -47,12 +54,14 @@ from app.repositories.site import (
     SqlAiEditRecordRepository,
     SqlSiteRepository,
 )
+from app.repositories.site_analytics import SiteAnalyticsRepository, SqlSiteAnalyticsRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork, UnitOfWork
 from app.repositories.user import SqlUserRepository, UserRepository
 from app.schemas.ai_key import ModelEndpoint
 from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiEditService, AiRunInProgressError
 from app.services.ai_key_service import AiKeyService, ModelClientFactory
+from app.services.analytics_service import AnalyticsService
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 from app.services.publish_service import PublishService
@@ -102,8 +111,22 @@ def get_oauth_state_signer(settings: SettingsDep) -> PayloadSigner:
     return PayloadSigner(settings.secret_key.get_secret_value(), salt="oauth-state")
 
 
+def get_google_state_signer(settings: SettingsDep) -> PayloadSigner:
+    # Its own salt: a sign-in's state can't pass for a Google connect's, or the other way round.
+    return PayloadSigner(settings.secret_key.get_secret_value(), salt="google-oauth-state")
+
+
 def get_github_client(http: HttpClientDep) -> GithubClient:
     return HttpGithubClient(http)
+
+
+def get_google_client(http: HttpClientDep, settings: SettingsDep) -> GoogleClient | None:
+    """makable's Google OAuth client, for users' Analytics. None when `GOOGLE_CLIENT_ID` or its secret isn't set."""
+    if settings.google_client_id is None or settings.google_client_secret is None:
+        return None
+    return HttpGoogleClient(
+        http, client_id=settings.google_client_id, client_secret=settings.google_client_secret.get_secret_value()
+    )
 
 
 def get_model_client(http: HttpClientDep, settings: SettingsDep) -> ModelClient | None:
@@ -164,6 +187,14 @@ def get_site_repository(session: DbSessionDep) -> SiteRepository:
 
 def get_ai_edit_record_repository(session: DbSessionDep) -> AiEditRecordRepository:
     return SqlAiEditRecordRepository(session)
+
+
+def get_google_credential_repository(session: DbSessionDep) -> GoogleCredentialRepository:
+    return SqlGoogleCredentialRepository(session)
+
+
+def get_site_analytics_repository(session: DbSessionDep) -> SiteAnalyticsRepository:
+    return SqlSiteAnalyticsRepository(session)
 
 
 def get_health_repository(session: DbSessionDep) -> HealthRepository:
@@ -227,23 +258,44 @@ def get_ai_edit_service(
     site_service: Annotated[SiteService, Depends(get_site_service)],
     sites: Annotated[SiteRepository, Depends(get_site_repository)],
     records: Annotated[AiEditRecordRepository, Depends(get_ai_edit_record_repository)],
+    analytics: Annotated[SiteAnalyticsRepository, Depends(get_site_analytics_repository)],
     uow: UnitOfWorkDep,
     checkpointer: CheckpointerDep,
     settings: SettingsDep,
 ) -> AiEditService:
-    return AiEditService(models, site_service, sites, records, uow, checkpointer, AI_RUNS, debug=settings.ai_debug)
+    return AiEditService(
+        models, site_service, sites, records, uow, checkpointer, AI_RUNS, analytics=analytics, debug=settings.ai_debug
+    )
 
 
 def get_publish_service(
     github: Annotated[GithubClient, Depends(get_github_client)],
     sites: Annotated[SiteService, Depends(get_site_service)],
     platforms: Annotated[DeployPlatformClient, Depends(get_deploy_platform_client)],
+    analytics: Annotated[SiteAnalyticsRepository, Depends(get_site_analytics_repository)],
+    uow: UnitOfWorkDep,
 ) -> PublishService:
-    return PublishService(github, sites, platforms)
+    return PublishService(github, sites, platforms, analytics, uow)
+
+
+def get_analytics_service(
+    google: Annotated[GoogleClient | None, Depends(get_google_client)],
+    credentials: Annotated[GoogleCredentialRepository, Depends(get_google_credential_repository)],
+    links: Annotated[SiteAnalyticsRepository, Depends(get_site_analytics_repository)],
+    sites: Annotated[SiteRepository, Depends(get_site_repository)],
+    cipher: Annotated[TokenCipher, Depends(get_token_cipher)],
+    state_signer: Annotated[PayloadSigner, Depends(get_google_state_signer)],
+    uow: UnitOfWorkDep,
+    settings: SettingsDep,
+) -> AnalyticsService:
+    return AnalyticsService(
+        google, credentials, links, sites, cipher, state_signer, uow, callback_url=settings.google_callback_url
+    )
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 PublishServiceDep = Annotated[PublishService, Depends(get_publish_service)]
+AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
 
 
 def get_site_create_service(
@@ -304,6 +356,8 @@ AI_KEY_CHECKS = PerKeyLimit(burst=KEY_CHECK_BURST, every=KEY_CHECK_EVERY_SECONDS
 AI_RUNS = KeyLock(AiRunInProgressError)
 SITE_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_SITE_REQUESTS)
 SITE_SAVES = PerKeyLimit(burst=SITE_SAVE_BURST, every=SITE_SAVE_EVERY_SECONDS)
+ANALYTICS_SLOTS = ConcurrencyLimit(MAX_CONCURRENT_ANALYTICS_REQUESTS)
+ANALYTICS_LISTS = PerKeyLimit(burst=ANALYTICS_LIST_BURST, every=ANALYTICS_LIST_EVERY_SECONDS)
 
 
 async def ai_edit_slot() -> AsyncIterator[None]:
@@ -378,3 +432,33 @@ async def site_save_limit(user: CurrentUserDep) -> AsyncIterator[None]:
     """
     async with SITE_SAVES.hold(user.id):
         yield
+
+
+async def analytics_slot() -> AsyncIterator[None]:
+    """A slot for an analytics request (it waits on Google), held until the response is done.
+
+    Raises:
+        ServiceBusyError: This worker has as many in progress as it allows.
+    """
+    async with ANALYTICS_SLOTS.slot():
+        yield
+
+
+async def analytics_list_limit(user: CurrentUserDep) -> AsyncIterator[None]:
+    """One property or stream list at a time per user, in bursts of at most `ANALYTICS_LIST_BURST`, then one per
+    `ANALYTICS_LIST_EVERY_SECONDS`. These aren't cached; reports are.
+
+    Raises:
+        TooManyRequestsError: The user has one in progress, or asked too often.
+    """
+    async with ANALYTICS_LISTS.hold(user.id):
+        yield
+
+
+def get_analytics_slots() -> ConcurrencyLimit:
+    """The worker's analytics slots, for the connect callback. It's a browser navigation, so it takes its slot itself
+    and redirects back when they're all taken, instead of the JSON 503 `analytics_slot` answers."""
+    return ANALYTICS_SLOTS
+
+
+AnalyticsSlotsDep = Annotated[ConcurrencyLimit, Depends(get_analytics_slots)]

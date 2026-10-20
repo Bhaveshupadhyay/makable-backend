@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import utc_now
 from app.core.exceptions import ConflictError
 from app.models.site import AiEditRecord, Site
+from app.schemas.ai_edit import AiUsage
 from app.schemas.site import AiEditRecordCreate, SiteCreate
 
 
@@ -86,7 +87,7 @@ class SqlAiEditRecordRepository:
         self._session = session
 
     async def add(self, data: AiEditRecordCreate) -> AiEditRecord:
-        record = AiEditRecord(**data.model_dump())
+        record = AiEditRecord(**data.model_dump(exclude={"usage"}), **_usage_columns(data.usage))
         self._session.add(record)
         await self._session.flush()
         return record
@@ -94,3 +95,17 @@ class SqlAiEditRecordRepository:
     async def delete_for_site(self, site_id: UUID) -> None:
         """Deletes the site's requests. Done explicitly: SQLite doesn't enforce the foreign key's cascade."""
         await self._session.execute(delete(AiEditRecord).where(AiEditRecord.site_id == site_id))
+
+
+def _usage_columns(usage: AiUsage | None) -> dict[str, int | float | None]:
+    if usage is None:
+        return {}
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "cached_tokens": usage.cached_tokens,
+        "cost_usd": usage.cost_usd,
+        "model_ms": round(usage.model_seconds * 1000),
+        "duration_ms": round(usage.seconds * 1000),
+    }

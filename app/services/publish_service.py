@@ -27,6 +27,8 @@ from app.constants.site import MANIFEST_PATH
 from app.core.database import utc_now
 from app.core.exceptions import AppError, ConflictError, NotFoundError, ServiceUnavailableError
 from app.core.security import seal_for_github
+from app.repositories.site_analytics import SiteAnalyticsRepository
+from app.repositories.unit_of_work import UnitOfWork
 from app.schemas.github import GithubRepo
 from app.schemas.publish import (
     DeployRequest,
@@ -106,6 +108,9 @@ class PublishService:
     A platform token pasted in the chat is checked, used to create the platform project, and saved as an Actions
     secret (sealed so only GitHub can read it); makable stores nothing. Otherwise the user adds the secrets on GitHub,
     and the workflow skips the deploy until they're there.
+
+    A site linked to a Google Analytics stream gets the stream's tag in its built pages (the workflow adds it), and
+    the link records that it was published.
     """
 
     def __init__(
@@ -113,6 +118,8 @@ class PublishService:
         github: GithubClient,
         sites: SiteService,
         platforms: DeployPlatformClient,
+        analytics: SiteAnalyticsRepository,
+        uow: UnitOfWork,
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         dispatch_delays: Sequence[float] = DISPATCH_RETRY_DELAYS,
@@ -121,6 +128,8 @@ class PublishService:
         self._github = github
         self._sites = sites
         self._platforms = platforms
+        self._analytics = analytics
+        self._uow = uow
         self._sleep = sleep
         self._dispatch_delays = dispatch_delays
         self._clock = clock
@@ -162,6 +171,7 @@ class PublishService:
         target = request.target
         pages = target == PublishTarget.GITHUB_PAGES
         token, repo = await self._sites.github_repo(user, project_id)
+        measurement_id = await self._measurement_id(project_id)
         scopes = await self._github.get_scopes(token)
         if scopes is not None and "workflow" not in scopes:
             raise PublishMissingScopeError()
@@ -195,6 +205,7 @@ class PublishService:
             branch=branch,
             base_path=_pages_base_path(user.login, repo.name) if pages else "/",
             project_name=project_name,
+            measurement_id=measurement_id,
         )
         settings = PublishSettings(target=target, project_name=project_name, site_url=site_url)
         manifest["publish"] = settings.model_dump(mode="json", by_alias=True)
@@ -230,6 +241,10 @@ class PublishService:
             if made_public:
                 await self._make_private_again(token, project_id, repo)
             raise
+        if measurement_id is not None:
+            # The deploy workflow on GitHub has the tag now.
+            await self._analytics.set_published(project_id, measurement_id)
+            await self._uow.commit()
 
         missing = [] if prepared else await self._missing_secrets(token, repo.full_name, target)
         deploy: DeployState = "waiting_for_secrets" if missing else "started"
@@ -307,6 +322,14 @@ class PublishService:
             site_url=settings.site_url,
             run=WorkflowRun.model_validate(run.model_dump()) if run else None,
         )
+
+    async def _measurement_id(self, project_id: UUID) -> str | None:
+        """The Google Analytics tag the site's pages get, if it's linked to a stream. Ends the transaction: the
+        publish waits on GitHub for a while."""
+        link = await self._analytics.get(project_id)
+        measurement_id = link.measurement_id if link else None
+        await self._uow.rollback()
+        return measurement_id
 
     async def _published(self, user: UserRead, project_id: UUID) -> tuple[str, GithubRepo, PublishSettings]:
         token, repo = await self._sites.github_repo(user, project_id)

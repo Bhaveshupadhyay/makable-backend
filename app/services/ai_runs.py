@@ -9,10 +9,12 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Durability, StateSnapshot
 
 from app.agents.thread import RECURSION_LIMIT, RunResult
+from app.agents.usage import Usage
 from app.constants.ai_create import CREATE_THREAD_SUFFIX
 from app.constants.ai_edit import AiEditOutcome
 from app.repositories.site import AiEditRecordRepository
 from app.repositories.unit_of_work import UnitOfWork
+from app.schemas.ai_edit import AiUsage
 from app.schemas.site import AiEditRecordCreate
 
 logger = logging.getLogger(__name__)
@@ -75,10 +77,16 @@ async def end_paused(
             outcome=AiEditOutcome.SKIPPED,
             summary="replaced or dismissed while waiting",
             attempts=values.get("attempt", 0),
+            usage=usage_read(values.get("usage")),
         )
     )
     await uow.commit()
     return True
+
+
+def usage_read(usage: Usage | None) -> AiUsage | None:
+    """A run's usage (from its state or its meter) as it's recorded and sent."""
+    return AiUsage.model_validate(usage) if usage is not None else None
 
 
 async def prune(checkpointer: BaseCheckpointSaver[str], config: Any) -> None:

@@ -20,7 +20,7 @@ async def fix(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         said += progress("fix", f"Fixing {path}", path=path)
         text = f"{CREATE_SYSTEM}\n\n{fix_prompt(path, files.get(path, ''), problems)}"
         run.model_input = text
-        reply = await model.complete([ChatMessage(role="user", content=text)])
+        reply = (await model.complete([ChatMessage(role="user", content=text)])).text
         attempt += 1
         try:
             run.files[path] = extract_code(reply)
@@ -28,4 +28,4 @@ async def fix(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
             continue
     written = [*state["written"], *(p for p in state["problems"] if p not in state["written"])]
     fixed: CreateState = {"fix_rounds": state["fix_rounds"] + 1, "attempt": attempt, "written": written}
-    return {**fixed, "steps": said, "step": "verify"}
+    return {**fixed, "usage": run.usage.total(), "steps": said, "step": "verify"}

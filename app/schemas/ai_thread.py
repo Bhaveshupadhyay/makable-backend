@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import Field
 
 from app.constants.ai_edit import AiEditOutcome
-from app.schemas.ai_edit import Question
+from app.schemas.ai_edit import AiUsage, Question
 from app.schemas.common import CamelModel
 
 
@@ -34,6 +34,8 @@ class AiTurnRead(CamelModel):
     # What the AI did after the last question (a creation's progress: planning, the files it wrote...).
     steps: list[str] = Field(default_factory=list)
     commit_sha: str | None = None
+    # What it took, for requests with the user's own key.
+    usage: AiUsage | None = None
     created_at: datetime
 
 

@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.clients.model import ModelUnavailableError
+from app.clients.model import ModelReply, ModelUnavailableError
 from app.constants.ai_edit import AiEditOutcome
 from app.models.site import AiEditRecord
 from app.schemas.ai_edit import (
@@ -229,7 +229,7 @@ async def test_a_failure_after_answering_ends_the_run(
         name = "failing"
         accepts_images = False
 
-        async def complete(self, messages: list[ChatMessage]) -> str:
+        async def complete(self, messages: list[ChatMessage]) -> ModelReply:
             raise ModelUnavailableError()
 
     with pytest.raises(ModelUnavailableError):

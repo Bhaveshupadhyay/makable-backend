@@ -9,11 +9,13 @@ from langgraph.types import Command, StateSnapshot
 from app.agents.ai_edit import EditRun, EditState, RunResult, compile_edit_graph, result_of, run_input, turn_for
 from app.agents.create_site import compile_create_graph
 from app.agents.thread import UserReply
+from app.agents.usage import Usage, UsageMeter, shown_usage
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
 from app.core.limits import KeyLock
 from app.repositories.site import AiEditRecordRepository, SiteRepository
+from app.repositories.site_analytics import SiteAnalyticsRepository
 from app.repositories.unit_of_work import UnitOfWork
 from app.schemas.ai_edit import (
     AiEditAnswer,
@@ -31,7 +33,16 @@ from app.schemas.ai_key import ModelChoice
 from app.schemas.ai_thread import AiPausedRun, AiPreview, AiThreadRead, AiTurnRead
 from app.schemas.site import AiEditRecordCreate, SiteSnapshot
 from app.schemas.user import UserRead
-from app.services.ai_runs import DURABILITY, create_config, edit_config, end_paused, pause_kind, pause_value, prune
+from app.services.ai_runs import (
+    DURABILITY,
+    create_config,
+    edit_config,
+    end_paused,
+    pause_kind,
+    pause_value,
+    prune,
+    usage_read,
+)
 from app.services.site_service import SiteAccess, SiteConflictError, SiteNotFoundError, SiteService
 from app.utils.file_edits import apply_file_edits
 
@@ -87,6 +98,7 @@ class AiEditService:
         checkpointer: BaseCheckpointSaver[str],
         runs: KeyLock,
         *,
+        analytics: SiteAnalyticsRepository,
         debug: bool = False,
     ) -> None:
         self._models = models
@@ -98,6 +110,7 @@ class AiEditService:
         self._graph = compile_edit_graph(checkpointer)
         self._create_graph = compile_create_graph(checkpointer)
         self._runs = runs
+        self._analytics = analytics
         self._debug = debug
 
     async def edit(self, user: UserRead, request: AiEditRequest) -> AiEditResult:
@@ -107,7 +120,7 @@ class AiEditService:
         run paused on a question is skipped: the new instruction replaces it.
 
         If the request is cancelled (Stop) once the commit has started, the commit still finishes and is recorded,
-        and the chat shows it.
+        and the chat shows it. What the request took (tokens, time) is recorded, and shown for the user's own key.
 
         Raises:
             SiteNotFoundError: No such site, or it's another user's.
@@ -127,7 +140,7 @@ class AiEditService:
             site = await self._site_at(user, project_id, request.base_commit)
             await self._skip_paused(user, project_id)
             run_id = uuid4()
-            return await self._invoke(user, request, site, run_id, run_input(run_id, request), resuming=False)
+            return await self._invoke(user, request, site, run_id, run_input(run_id, request), paused=None)
 
     async def answer(self, user: UserRead, project_id: UUID, body: AiEditAnswer) -> AiEditResult:
         """Continues a run paused on a question with the user's answer, on the site as it is now (`base_commit`).
@@ -146,7 +159,7 @@ class AiEditService:
             )
             reply = UserReply(answer=body.answer, chat=body.chat)
             resume: Command[Any] = Command(resume=reply, update={"base_commit": body.base_commit})
-            return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
+            return await self._invoke(user, request, site, body.run_id, resume, paused=paused.values)
 
     async def report(self, user: UserRead, project_id: UUID, body: AiEditPreviewReport) -> AiEditResult:
         """Continues a run waiting for the preview with how it went: it works, and the edits are committed; or it
@@ -165,7 +178,7 @@ class AiEditService:
             site = await self._site_at(user, project_id, base)
             request = AiEditRequest.model_validate({**paused.values["request"], "base_commit": base})
             resume: Command[Any] = Command(resume=body.model_dump(mode="json"))
-            return await self._invoke(user, request, site, body.run_id, resume, resuming=True)
+            return await self._invoke(user, request, site, body.run_id, resume, paused=paused.values)
 
     async def dismiss(self, user: UserRead, project_id: UUID) -> None:
         """Ends the run that's waiting (for the user's answer or the preview), the edit's or the creation's (Dismiss):
@@ -247,8 +260,8 @@ class AiEditService:
         return AiThreadRead(project_id=project_id, status="awaiting_result", turns=turns, run=run)
 
     async def start_over(self, user: UserRead, project_id: UUID) -> None:
-        """Forgets the site in makable (Start over): its chat (the checkpoints), its requests and its row. The repo on
-        the user's GitHub isn't touched. Nothing to delete is fine.
+        """Forgets the site in makable (Start over): its chat (the checkpoints), its requests, its analytics stream and
+        its row. The repo on the user's GitHub isn't touched. Nothing to delete is fine.
 
         Raises:
             SiteNotFoundError: The site is another user's.
@@ -264,6 +277,7 @@ class AiEditService:
             await self._checkpointer.adelete_thread(edit_config(project_id)["configurable"]["thread_id"])
             await self._checkpointer.adelete_thread(create_config(project_id)["configurable"]["thread_id"])
             await self._records.delete_for_site(project_id)
+            await self._analytics.delete_for_site(project_id)
             await self._sites.delete(site)
             await self._uow.commit()
             logger.info("site forgotten", extra={"user_id": str(user.id), "project_id": str(project_id)})
@@ -276,15 +290,24 @@ class AiEditService:
         run_id: UUID,
         graph_input: Any,
         *,
-        resuming: bool,
+        paused: dict[str, Any] | None,
     ) -> AiEditResult:
-        """Runs the graph (a new run, or a paused one resumed) and turns how it ended into the answer."""
-        run = EditRun(request, pick_model=lambda: self._models.model_for(user.id, request.model), site=site)
+        """Runs the graph (a new run, or a paused one resumed: `paused` is its state then) and turns how it ended into
+        the answer. The run's usage goes on from what it took before the pause; it's shown only for the user's own
+        key."""
+        before: Usage | None = paused.get("usage") if paused is not None else None
+        run = EditRun(
+            request,
+            pick_model=lambda: self._models.model_for(user.id, request.model),
+            site=site,
+            usage=UsageMeter(before),
+            show_usage=request.model is not None,
+        )
         config = self._config(request.project_id)
         try:
             state = await self._graph.ainvoke(graph_input, config, context=run, durability=DURABILITY)
         except asyncio.CancelledError:
-            await self._after_cancel(user, request, run, resuming=resuming)
+            await self._after_cancel(user, request, run, resuming=paused is not None)
             raise
         except AiKeyInvalidError as err:
             if request.model is not None:
@@ -353,7 +376,11 @@ class AiEditService:
         result = result_of(state)
         outcome = AiEditOutcome(result["outcome"])
         attempts = state.get("attempt", 0)
-        await self._record(user, request, run, outcome, result=result, attempts=attempts, model=state.get("model"))
+        # The run's usage as its `finish` saw it, the same as the chat's.
+        usage: Usage | None = state.get("usage")
+        await self._record(
+            user, request, run, outcome, result=result, attempts=attempts, model=state.get("model"), usage=usage
+        )
         await prune(self._checkpointer, self._config(request.project_id))
         if outcome == AiEditOutcome.REJECTED:
             problem = result.get("problem", "")
@@ -362,13 +389,15 @@ class AiEditService:
                 raise AiEditBrokePreviewError(details=details)
             raise AiEditRejectedError(details=details)
         debug = self._debug_info(run, attempts, state.get("model"))
+        shown = usage_read(shown_usage(usage, run.show_usage))
         if outcome == AiEditOutcome.ESCALATED:
-            return AiEditEscalated(run_id=run_id, reason=result.get("reason", ""), debug=debug)
+            return AiEditEscalated(run_id=run_id, reason=result.get("reason", ""), usage=shown, debug=debug)
         return AiEditApplied(
             run_id=run_id,
             summary=result.get("summary", ""),
             commit_sha=result.get("commit_sha", ""),
             files=run.changed_files,
+            usage=shown,
             debug=debug,
         )
 
@@ -395,10 +424,12 @@ class AiEditService:
         result: RunResult = {**result_of(run.committing), "commit_sha": committed}
         try:
             finished = EditState(**{**run.committing, "result": result})
-            update: dict[str, Any] = {"turns": [turn_for(finished)], "result": result, "messages": [], "reply": ""}
+            usage = run.usage.total()
+            turn = turn_for(finished, shown_usage(usage, run.show_usage))
+            update: dict[str, Any] = {"turns": [turn], "result": result, "messages": [], "reply": "", "usage": usage}
             await self._graph.aupdate_state(self._config(request.project_id), update, as_node="finish")
             await self._uow.rollback()
-            await self._record(user, request, run, AiEditOutcome.APPLIED, result=result, attempts=0)
+            await self._record(user, request, run, AiEditOutcome.APPLIED, result=result, attempts=0, usage=usage)
         except Exception:
             logger.exception("Couldn't record an AI edit committed after Stop")
 
@@ -413,9 +444,11 @@ class AiEditService:
         summary: str | None = None,
         attempts: int = 0,
         model: str | None = None,
+        usage: Usage | None = None,
     ) -> None:
         """Writes the request's row and marks the site as used. `model` is the model the run used (from its state),
-        else the one this request picked."""
+        else the one this request picked; `usage` what the run took, else what its meter counted (a run that failed
+        or was stopped)."""
         if result is not None:
             summary = result.get("summary") or result.get("reason") or result.get("problem")
         await self._records.add(
@@ -430,6 +463,7 @@ class AiEditService:
                 summary=summary,
                 attempts=attempts,
                 commit_sha=result.get("commit_sha") if result else None,
+                usage=usage_read(usage or run.usage.total()),
             )
         )
         await self._sites.touch(request.project_id)

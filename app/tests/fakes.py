@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 from datetime import timedelta
+from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -15,14 +16,26 @@ from app.clients.github import (
     GithubPagesUnavailableError,
     GithubRepoExistsError,
 )
-from app.clients.model import AiKeyInvalidError, ModelClient
+from app.clients.google import AnalyticsAccessDeniedError, AnalyticsNotFoundError, GoogleError, GoogleTokenRefusedError
+from app.clients.model import AiKeyInvalidError, ModelClient, ModelReply
 from app.clients.supabase import SupabaseRejectedError
 from app.constants.ai_keys import AiProvider
+from app.constants.analytics import GOOGLE_SCOPES
 from app.constants.publish import PublishTarget
 from app.core.database import utc_now
 from app.core.security import InvalidTokenError, TokenCipher, generate_token, pkce_challenge
 from app.models.github_credential import GithubCredential
 from app.schemas.ai_key import ModelChoice
+from app.schemas.analytics import (
+    GaAccountRead,
+    GaProperty,
+    GaPropertyRead,
+    GaReport,
+    GaRow,
+    GaStream,
+    GoogleTokens,
+    GoogleUser,
+)
 from app.schemas.auth import AccessTokenClaims
 from app.schemas.chat import ChatMessage
 from app.schemas.github import (
@@ -373,18 +386,20 @@ VALID_PLATFORM_TOKEN = "platform-token-123"
 
 
 class FakeModelClient:
-    """Answers with scripted replies, in order, and records the messages it was sent."""
+    """Answers with scripted replies, in order (a text is a reply without usage), and records the messages it was
+    sent."""
 
     name = "fake-model"
 
-    def __init__(self, *replies: str, accepts_images: bool = False) -> None:
+    def __init__(self, *replies: str | ModelReply, accepts_images: bool = False) -> None:
         self.replies = list(replies)
         self.calls: list[list[ChatMessage]] = []
         self.accepts_images = accepts_images
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         self.calls.append(list(messages))
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        return reply if isinstance(reply, ModelReply) else ModelReply(reply)
 
 
 class FakeModelSource:
@@ -416,3 +431,111 @@ class FakeAiProviders:
         if api_key != VALID_AI_KEY:
             raise AiKeyInvalidError()
         return list(self.models)
+
+
+GOOGLE_CODE = "google-code"
+GOOGLE_REFRESH_TOKEN = "1//google-refresh-token"
+GOOGLE_EMAIL = "ada@example.com"
+GA_PROPERTY_ID = "123456789"
+GA_STREAM_ID = "9876543210"
+GA_MEASUREMENT_ID = "G-TEST12345"
+
+
+class FakeGoogleClient:
+    """Stands in for Google's OAuth endpoints and the Analytics APIs. Like Google, it checks PKCE, only takes refresh
+    tokens it issued and hasn't had revoked, and only answers access tokens it issued. The user's account has one
+    property (`GA_PROPERTY_ID`) with one web stream; `denied` properties answer like Google does without access."""
+
+    def __init__(self) -> None:
+        # What the consent screen grants (the user can untick the Analytics permission).
+        self.scope = GOOGLE_SCOPES
+        self.issue_refresh_token = True
+        self.refresh_tokens = {GOOGLE_REFRESH_TOKEN}
+        self.revoked: list[str] = []
+        self.properties = {
+            GA_PROPERTY_ID: GaProperty(id=GA_PROPERTY_ID, name="Ada's Bakery", time_zone="Europe/London")
+        }
+        self.streams = {
+            GA_PROPERTY_ID: [
+                GaStream(
+                    id=GA_STREAM_ID, name="Bakery site", measurement_id=GA_MEASUREMENT_ID, url="https://ada.example"
+                )
+            ]
+        }
+        self.denied: set[str] = set()
+        # The answers to `run_reports` (default: reports with no data).
+        self.reports: list[GaReport] | None = None
+        self.live_users = 3
+        self.report_calls: list[tuple[str, list[dict[str, Any]]]] = []
+        self.realtime_calls: list[tuple[str, dict[str, Any]]] = []
+        self.refreshes = 0
+        self._challenge: str | None = None
+        self._access: set[str] = set()
+
+    def authorize_url(self, *, redirect_uri: str, state: str, code_challenge: str) -> str:
+        self._challenge = code_challenge
+        query = urlencode({"redirect_uri": redirect_uri, "state": state, "scope": GOOGLE_SCOPES})
+        return f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
+
+    async def exchange_code(self, *, code: str, code_verifier: str, redirect_uri: str) -> GoogleTokens:
+        if code != GOOGLE_CODE or pkce_challenge(code_verifier) != self._challenge:
+            raise GoogleTokenRefusedError()
+        refresh_token = GOOGLE_REFRESH_TOKEN if self.issue_refresh_token else None
+        return GoogleTokens(access_token=self._issue(), refresh_token=refresh_token, scope=self.scope)
+
+    async def refresh(self, refresh_token: str) -> GoogleTokens:
+        self.refreshes += 1
+        if refresh_token not in self.refresh_tokens:
+            raise GoogleTokenRefusedError()
+        return GoogleTokens(access_token=self._issue(), scope=self.scope)
+
+    async def revoke(self, token: str) -> None:
+        self.revoked.append(token)
+        self.refresh_tokens.discard(token)
+
+    async def get_user(self, access_token: str) -> GoogleUser:
+        self._check(access_token)
+        return GoogleUser(sub="google-sub-1", email=GOOGLE_EMAIL)
+
+    async def list_accounts(self, access_token: str) -> list[GaAccountRead]:
+        self._check(access_token)
+        properties = [GaPropertyRead(id=p.id, name=p.name) for p in self.properties.values()]
+        return [GaAccountRead(id="555", name="Ada", properties=properties)]
+
+    async def get_property(self, access_token: str, property_id: str) -> GaProperty:
+        self._check(access_token, property_id)
+        return self.properties[property_id]
+
+    async def list_streams(self, access_token: str, property_id: str) -> list[GaStream]:
+        self._check(access_token, property_id)
+        return list(self.streams.get(property_id, []))
+
+    async def get_stream(self, access_token: str, property_id: str, stream_id: str) -> GaStream:
+        self._check(access_token, property_id)
+        for stream in self.streams.get(property_id, []):
+            if stream.id == stream_id:
+                return stream
+        raise AnalyticsNotFoundError()
+
+    async def run_reports(self, access_token: str, property_id: str, requests: list[dict[str, Any]]) -> list[GaReport]:
+        self._check(access_token, property_id)
+        self.report_calls.append((property_id, requests))
+        return list(self.reports) if self.reports is not None else [GaReport(rows=[]) for _ in requests]
+
+    async def run_realtime_report(self, access_token: str, property_id: str, request: dict[str, Any]) -> GaReport:
+        self._check(access_token, property_id)
+        self.realtime_calls.append((property_id, request))
+        return GaReport(rows=[GaRow(dimensions=[], metrics=[str(self.live_users)])])
+
+    def _issue(self) -> str:
+        token = generate_token()
+        self._access.add(token)
+        return token
+
+    def _check(self, access_token: str, property_id: str | None = None) -> None:
+        if access_token not in self._access:
+            raise GoogleError()
+        if property_id is not None and property_id in self.denied:
+            raise AnalyticsAccessDeniedError()
+        if property_id is not None and property_id not in self.properties:
+            raise AnalyticsNotFoundError()

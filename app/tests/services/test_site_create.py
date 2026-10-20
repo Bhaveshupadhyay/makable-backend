@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.create_site.nodes.ask_name import NAME_QUESTION
+from app.clients.model import ModelReply
 from app.constants.ai_edit import AiEditOutcome
 from app.models.site import AiEditRecord
 from app.schemas.ai_create import AiCreateAnswer, AiCreateRequest
@@ -629,12 +630,12 @@ class SlowModel:
         self.delay = delay
         self.blocked = asyncio.Event()
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         await asyncio.sleep(self.delay)
         if not self.replies:
             self.blocked.set()
             await asyncio.Event().wait()
-        return self.replies.pop(0)
+        return ModelReply(self.replies.pop(0))
 
 
 async def test_pings_go_out_while_the_model_writes(ai_services: AiServices, site: str) -> None:
