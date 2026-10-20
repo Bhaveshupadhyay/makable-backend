@@ -27,8 +27,12 @@ async def brief(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     text = brief_prompt(state["prompt"], state["name"], state["brief"], done)
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
+
+    def used() -> CreateState:
+        return {"attempt": attempt, "model": model.name, "usage": run.usage.total()}
+
     for _ in range(MAX_BRIEF_ATTEMPTS):
-        reply = await model.complete(messages)
+        reply = (await model.complete(messages)).text
         attempt += 1
         try:
             read = parse_brief_reply(reply)
@@ -44,15 +48,14 @@ async def brief(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         if not isinstance(read, ModelQuestion):
             names = list(dict.fromkeys(read.names))
             ready: CreateState = {"brief_question": None, "suggested_names": names, "step": "ask_name"}
-            return {**ready, "attempt": attempt, "model": model.name, "steps": said}
+            return {**ready, **used(), "steps": said}
         if done < MAX_BRIEF_QUESTIONS:
             question = read.ask.model_copy(update={"allow_free_text": True, "kind": "site_brief"})
             asking = question.model_dump(mode="json", by_alias=True)
-            update: CreateState = {"brief_question": asking, "attempt": attempt, "model": model.name}
-            return {**update, "steps": said, "step": "ask_brief"}
+            return {"brief_question": asking, **used(), "steps": said, "step": "ask_brief"}
         break  # A question past the limit: the questions are over anyway.
     else:
         if state["brief"] and state["brief"][-1].get("chat") and state["brief_question"]:
             # The user's message is left unanswered: the question it was about is asked again as it was.
-            return {"attempt": attempt, "model": model.name, "steps": said, "step": "ask_brief"}
-    return {"brief_question": None, "attempt": attempt, "model": model.name, "steps": said, "step": "ask_name"}
+            return {**used(), "steps": said, "step": "ask_brief"}
+    return {"brief_question": None, **used(), "steps": said, "step": "ask_name"}

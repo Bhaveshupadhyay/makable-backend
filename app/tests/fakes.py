@@ -17,7 +17,7 @@ from app.clients.github import (
     GithubRepoExistsError,
 )
 from app.clients.google import AnalyticsAccessDeniedError, AnalyticsNotFoundError, GoogleError, GoogleTokenRefusedError
-from app.clients.model import AiKeyInvalidError, ModelClient
+from app.clients.model import AiKeyInvalidError, ModelClient, ModelReply
 from app.clients.supabase import SupabaseRejectedError
 from app.constants.ai_keys import AiProvider
 from app.constants.analytics import GOOGLE_SCOPES
@@ -386,18 +386,20 @@ VALID_PLATFORM_TOKEN = "platform-token-123"
 
 
 class FakeModelClient:
-    """Answers with scripted replies, in order, and records the messages it was sent."""
+    """Answers with scripted replies, in order (a text is a reply without usage), and records the messages it was
+    sent."""
 
     name = "fake-model"
 
-    def __init__(self, *replies: str, accepts_images: bool = False) -> None:
+    def __init__(self, *replies: str | ModelReply, accepts_images: bool = False) -> None:
         self.replies = list(replies)
         self.calls: list[list[ChatMessage]] = []
         self.accepts_images = accepts_images
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
         self.calls.append(list(messages))
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        return reply if isinstance(reply, ModelReply) else ModelReply(reply)
 
 
 class FakeModelSource:

@@ -4,6 +4,7 @@ agent's `<projectId>:create`), and the chat shows both."""
 
 from typing import Annotated, NotRequired, Protocol, TypedDict
 
+from app.agents.usage import Usage
 from app.constants.ai_edit import MAX_TURNS
 from app.schemas.site import SiteSnapshot
 
@@ -55,6 +56,8 @@ class Turn(TypedDict):
     # What the AI did after the last question (the create agent's progress), shown above the reply.
     steps: NotRequired[list[str]]
     commit_sha: str | None
+    # What the run took (tokens, time), when it's shown: for runs with the user's own key.
+    usage: NotRequired[Usage]
     created_at: str
 
 

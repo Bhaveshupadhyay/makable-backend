@@ -18,6 +18,7 @@ from app.agents.create_site import (
 )
 from app.agents.create_site.tools.names import suggest_name
 from app.agents.thread import RunResult, Turn, UserReply
+from app.agents.usage import Usage, UsageMeter, shown_usage
 from app.clients.model import AiKeyInvalidError
 from app.constants.ai_create import HEARTBEAT_SECONDS
 from app.constants.ai_edit import AiEditOutcome
@@ -31,7 +32,7 @@ from app.schemas.ai_edit import AiEditNeedsInput, Question
 from app.schemas.site import AiEditRecordCreate
 from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiRunSupersededError, ModelSource
-from app.services.ai_runs import DURABILITY, create_config, end_paused, pause_value, prune
+from app.services.ai_runs import DURABILITY, create_config, end_paused, pause_value, prune, usage_read
 from app.services.site_service import SiteNotFoundError, SiteService
 
 logger = logging.getLogger(__name__)
@@ -136,7 +137,7 @@ class SiteCreateService:
         except BaseException:
             await stack.aclose()
             raise
-        return CreationEvents(self._events(user, request, run_id, graph_input, stack), stack)
+        return CreationEvents(self._events(user, request, run_id, graph_input, stack, before=None), stack)
 
     async def answer(self, user: UserRead, project_id: UUID, body: AiCreateAnswer) -> CreationEvents:
         """Continues the creation that asked (the site's name) with the user's answer.
@@ -156,22 +157,33 @@ class SiteCreateService:
             if pause_value(snapshot) is None or snapshot.values.get("run_id") != str(body.run_id):
                 raise AiRunSupersededError()
             request = AiCreateRequest.model_validate(snapshot.values["request"])
+            before: Usage | None = snapshot.values.get("usage")
             await self._uow.rollback()
         except BaseException:
             await stack.aclose()
             raise
         resume: Command[Any] = Command(resume=UserReply(answer=body.answer, chat=body.chat))
-        return CreationEvents(self._events(user, request, body.run_id, resume, stack), stack)
+        return CreationEvents(self._events(user, request, body.run_id, resume, stack, before=before), stack)
 
     async def _events(
-        self, user: UserRead, request: AiCreateRequest, run_id: UUID, graph_input: Any, stack: AsyncExitStack
+        self,
+        user: UserRead,
+        request: AiCreateRequest,
+        run_id: UUID,
+        graph_input: Any,
+        stack: AsyncExitStack,
+        *,
+        before: Usage | None,
     ) -> AsyncGenerator[Event]:
         """Runs the graph and streams what it says. The run is a task of its own, so pings can go out while the model
-        writes; it's cancelled when the stream is (the request closed)."""
+        writes; it's cancelled when the stream is (the request closed). Its usage goes on from what it took before a
+        pause (`before`); it's shown only for the user's own key."""
         run = CreateRun(
             request,
             pick_model=lambda: self._models.model_for(user.id, request.model),
             site=self._site_service.creator(user, request.project_id),
+            usage=UsageMeter(before),
+            show_usage=request.model is not None,
         )
         queue: asyncio.Queue[Event] = asyncio.Queue()
 
@@ -230,10 +242,18 @@ class SiteCreateService:
         if state.get("__interrupt__"):
             return AiEditNeedsInput(run_id=run_id, question=Question.model_validate(state["__interrupt__"][0].value))
         result: RunResult = state["result"]
-        await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=state, run=run)
+        # The run's usage as its `finish` saw it, the same as the chat's.
+        usage: Usage | None = state.get("usage")
+        await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=state, run=run, usage=usage)
         await prune(self._checkpointer, create_config(request.project_id))
         site = await self._site_service.read(user, request.project_id)
-        return AiCreated(run_id=run_id, summary=result.get("summary", ""), commit_sha=result["commit_sha"], site=site)
+        return AiCreated(
+            run_id=run_id,
+            summary=result.get("summary", ""),
+            commit_sha=result["commit_sha"],
+            site=site,
+            usage=usage_read(shown_usage(usage, run.show_usage)),
+        )
 
     async def _failed(self, user: UserRead, request: AiCreateRequest, run: CreateRun, err: Exception) -> None:
         if isinstance(err, AiKeyInvalidError) and request.model is not None:
@@ -273,10 +293,13 @@ class SiteCreateService:
                 commit_sha=committed,
                 created_at=utc_now().isoformat(),
             )
-            update = {"turns": [turn], "result": result}
+            usage = run.usage.total()
+            if (shown := shown_usage(usage, run.show_usage)) is not None:
+                turn["usage"] = shown
+            update = {"turns": [turn], "result": result, "usage": usage}
             await self._graph.aupdate_state(create_config(request.project_id), update, as_node="finish")
             await self._uow.rollback()
-            await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=values, run=run)
+            await self._record(user, request, AiEditOutcome.APPLIED, result=result, state=values, run=run, usage=usage)
         except Exception:
             logger.exception("Couldn't record a creation committed after Stop")
 
@@ -290,7 +313,10 @@ class SiteCreateService:
         result: RunResult | None = None,
         state: dict[str, Any] | None = None,
         summary: str | None = None,
+        usage: Usage | None = None,
     ) -> None:
+        """Writes the creation's row. `usage` is what the run took, else what its meter counted (a run that failed or
+        was stopped)."""
         if result is not None:
             summary = result.get("summary")
         model = (state or {}).get("model") or (run.model.name if run.model else None)
@@ -306,6 +332,7 @@ class SiteCreateService:
                 summary=summary,
                 attempts=(state or {}).get("attempt", 0),
                 commit_sha=result.get("commit_sha") if result else None,
+                usage=usage_read(usage or run.usage.total()),
             )
         )
         await self._sites.touch(request.project_id)

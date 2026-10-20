@@ -2,7 +2,9 @@
 the user's own key."""
 
 import logging
-from typing import Protocol
+import time
+from dataclasses import dataclass
+from typing import Protocol, TypeGuard
 
 import httpx
 from fastapi import status
@@ -62,6 +64,28 @@ def _retry_after(res: httpx.Response) -> int:
         return 20
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    """The tokens a reply took, as the provider counted them. `output` includes the model's thinking; `reasoning` is
+    how much of it was thinking and `cached` how much of `input` came from the provider's cache, when the provider
+    says. `cost_usd` is what the provider charged, from those that tell (OpenRouter)."""
+
+    input: int
+    output: int
+    reasoning: int | None = None
+    cached: int | None = None
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class ModelReply:
+    text: str
+    # None when the provider didn't say how many tokens the reply took.
+    usage: TokenUsage | None = None
+    # How long the call took.
+    seconds: float = 0.0
+
+
 class ModelClient(Protocol):
     @property
     def name(self) -> str: ...
@@ -69,7 +93,7 @@ class ModelClient(Protocol):
     @property
     def accepts_images(self) -> bool: ...
 
-    async def complete(self, messages: list[ChatMessage]) -> str: ...
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply: ...
 
 
 class HttpModelClient:
@@ -93,8 +117,8 @@ class HttpModelClient:
     def accepts_images(self) -> bool:
         return self._accepts_images
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
-        """Returns the reply's text.
+    async def complete(self, messages: list[ChatMessage]) -> ModelReply:
+        """Returns the reply's text, the tokens it took and how long it took.
 
         Raises:
             AiKeyInvalidError: The provider refused the key.
@@ -107,6 +131,7 @@ class HttpModelClient:
             "temperature": 0.2,
             "stream": False,
         }
+        started = time.perf_counter()
         try:
             res = await self._http.post(
                 self._url,
@@ -128,7 +153,7 @@ class HttpModelClient:
         if res.is_error or content is None:
             logger.warning("model call failed", extra={"status": res.status_code, "error": _error_message(data)})
             raise ModelUnavailableError()
-        return content
+        return ModelReply(content, _usage(data), round(time.perf_counter() - started, 3))
 
 
 def _content(data: object) -> str | None:
@@ -136,6 +161,37 @@ def _content(data: object) -> str | None:
         case {"choices": [{"message": {"content": str(content)}}, *_]}:
             return content
     return None
+
+
+def _usage(data: object) -> TokenUsage | None:
+    """The reply's `usage`, which every provider sends in OpenAI's shape, each with its own extras. Thinking that a
+    provider counts in `total_tokens` but not in `completion_tokens` (Gemini) is added to the output, as thinking."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    prompt, completion, total = usage.get("prompt_tokens"), usage.get("completion_tokens"), usage.get("total_tokens")
+    if not _is_count(prompt) or not _is_count(completion):
+        return None
+    hidden = max(0, total - prompt - completion) if _is_count(total) else 0
+    reasoning = _count(usage.get("completion_tokens_details"), "reasoning_tokens")
+    if hidden:
+        reasoning = max(reasoning or 0, hidden)
+    cached = _count(usage.get("prompt_tokens_details"), "cached_tokens")
+    if cached is None:
+        cached = _count(usage, "prompt_cache_hit_tokens")  # DeepSeek's own name
+    # OpenRouter's, in its credits (dollars).
+    cost = usage.get("cost")
+    cost_usd = float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0 else None
+    return TokenUsage(prompt, completion + hidden, reasoning, cached, cost_usd)
+
+
+def _is_count(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _count(details: object, key: str) -> int | None:
+    value = details.get(key) if isinstance(details, dict) else None
+    return value if _is_count(value) else None
 
 
 def _error_message(data: object) -> str | None:
