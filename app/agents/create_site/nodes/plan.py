@@ -1,3 +1,5 @@
+import logging
+
 from langgraph.runtime import Runtime
 
 from app.agents.ai_edit.tools.answer import describe_problem
@@ -9,13 +11,15 @@ from app.agents.create_site.tools.plan import SitePlan, parse_plan
 from app.constants.ai_create import MAX_PLAN_ATTEMPTS
 from app.schemas.chat import ChatMessage
 
+logger = logging.getLogger(__name__)
+
 
 async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     """Asks the model which files the site needs (a rejected plan goes back once with what was wrong). The stylesheet
     is written first and App.tsx last, so every file can see what it imports.
 
     Raises:
-        CreateFailedError: No valid plan in the tries.
+        CreateFailedError: No valid plan in the tries (with why the last one was rejected).
     """
     run = runtime.context
     model = await run.model_client()
@@ -25,6 +29,7 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
     planned: SitePlan | None = None
+    problem = ""
     for _ in range(MAX_PLAN_ATTEMPTS):
         reply = await model.complete(messages)
         attempt += 1
@@ -33,12 +38,13 @@ async def plan(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
             break
         except ValueError as err:
             problem = describe_problem(err)
+            logger.info("site plan rejected", extra={"attempt": attempt, "problem": problem[:300]})
             messages += [
                 ChatMessage(role="assistant", content=reply),
                 ChatMessage(role="user", content=f"That plan was rejected: {problem}. Reply with the corrected JSON."),
             ]
     if planned is None:
-        raise CreateFailedError("the model couldn't plan the site")
+        raise CreateFailedError(f"the model couldn't plan the site: {problem}")
     files = sorted(planned.files, key=lambda f: (f.path != "src/index.css", f.path == "src/App.tsx"))
     plan_files = [PlannedFile(path=f.path, purpose=f.purpose) for f in files]
     return {

@@ -12,6 +12,9 @@ _JAVASCRIPT = Language(tree_sitter_javascript.language())  # includes JSX
 _TYPESCRIPT = Language(tree_sitter_typescript.language_typescript())
 _TSX = Language(tree_sitter_typescript.language_tsx())
 
+# What comes before JSX text, and nowhere else: an `&` right after one of these is in the text.
+_BEFORE_JSX_TEXT = frozenset({"jsx_text", "jsx_opening_element"})
+
 _CSS_NOISE = re.compile(r"/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", re.DOTALL)
 
 
@@ -39,14 +42,13 @@ def locate_syntax_error(code: str, language: Language) -> tuple[str, int] | None
     while True:
         root = parser.parse(bytes(encoded)).root_node
         node = _first_error(root)
-        if node is None or not _bare_jsx_ampersand(node, encoded):
+        if node is None or next(_bare_jsx_ampersands(node, encoded), None) is None:
             break
         # The grammar wants an entity after `&` in JSX text, but a bare one is fine (`<h2>Visit & Order</h2>`):
         # esbuild, TypeScript and the preview take it as text. A letter in its place keeps the offsets. Every one
         # this parse found goes at once, so a file full of them is parsed a few times, not once per `&`.
-        for error in _errors(root):
-            if _bare_jsx_ampersand(error, encoded):
-                encoded[error.start_byte] = ord("x")
+        for offset in list(_bare_jsx_ampersands(root, encoded)):
+            encoded[offset] = ord("x")
     if node is None:
         return None
     what = f"missing {node.type}" if node.is_missing else "unexpected code"
@@ -54,10 +56,21 @@ def locate_syntax_error(code: str, language: Language) -> tuple[str, int] | None
     return f"syntax error (line {node.start_point.row + 1}): {what}", offset
 
 
-def _bare_jsx_ampersand(node: Node, encoded: bytearray) -> bool:
-    """The error is JSX text starting with an `&` that isn't an entity (tree-sitter's grammars reject those)."""
-    in_jsx = node.parent is not None and node.parent.type == "jsx_element"
-    return node.is_error and in_jsx and encoded[node.start_byte] == ord("&")
+def _bare_jsx_ampersands(node: Node, encoded: bytearray) -> Iterator[int]:
+    """The offsets of the `&`s that aren't entities in JSX text under a node (tree-sitter's grammars reject those).
+
+    Each is in an error, also one inside another: an error in an element that starts with it (`Visit & Order`), or
+    one right after text or an opening tag, when the grammar gave up on the element (`<p>Bread & cakes & tea</p>`
+    makes the whole `<p>Bread &` an error) or on the statement around it."""
+    if node.is_error:
+        if node.parent is not None and node.parent.type == "jsx_element" and encoded[node.start_byte] == ord("&"):
+            yield node.start_byte
+        for child in node.children:
+            if child.type == "&" and child.prev_sibling is not None and child.prev_sibling.type in _BEFORE_JSX_TEXT:
+                yield child.start_byte
+    for child in node.children:
+        if child.has_error:
+            yield from _bare_jsx_ampersands(child, encoded)
 
 
 def _first_error(node: Node) -> Node | None:

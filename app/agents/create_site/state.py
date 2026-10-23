@@ -28,7 +28,8 @@ class NameTakenError(Exception):
 
 
 class CreateFailedError(Exception):
-    """The model couldn't plan the site, or write one of its files, in its tries."""
+    """The model couldn't plan the site, or write one of its files, in its tries. The message says which, and why its
+    last reply was rejected."""
 
 
 class SiteCreator(SiteFiles, Protocol):

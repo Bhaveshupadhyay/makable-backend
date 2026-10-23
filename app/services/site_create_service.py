@@ -238,8 +238,20 @@ class SiteCreateService:
     async def _failed(self, user: UserRead, request: AiCreateRequest, run: CreateRun, err: Exception) -> None:
         if isinstance(err, AiKeyInvalidError) and request.model is not None:
             await self._models.key_refused(user.id, request.model.key_id)
-        code = _error_body(err)["code"]
-        await self._record_quietly(user, request, AiEditOutcome.FAILED, summary=code, run=run)
+        summary = _error_body(err)["code"]
+        if isinstance(err, CreateFailedError):
+            # Why the model's last reply was rejected, which the user's message doesn't say: kept with the request.
+            summary = f"{summary}: {err}"
+            logger.warning(
+                "site creation failed",
+                extra={
+                    "user_id": str(user.id),
+                    "project_id": str(request.project_id),
+                    "model": run.model.name if run.model else None,
+                    "reason": str(err),
+                },
+            )
+        await self._record_quietly(user, request, AiEditOutcome.FAILED, summary=summary, run=run)
 
     async def _stopped(
         self, user: UserRead, request: AiCreateRequest, run: CreateRun, run_id: UUID, task: asyncio.Future[Any]

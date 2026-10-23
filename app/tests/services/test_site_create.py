@@ -3,6 +3,7 @@ files, the checks and their fixes, the commit, and how a creation streams, stops
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
@@ -615,7 +616,43 @@ async def test_a_creation_that_cant_be_planned_ends_with_an_error(
     assert error["error"]["code"] == "ai_create_failed"
     assert github.commits == []
     [record] = await records(session)
-    assert (record.outcome, record.summary) == (AiEditOutcome.FAILED, "ai_create_failed")
+    why = "files: List should have at least 1 item after validation, not 0"
+    assert (record.outcome, record.summary) == (
+        AiEditOutcome.FAILED,
+        f"ai_create_failed: the model couldn't plan the site: {why}",
+    )
+
+
+async def test_a_file_the_model_cant_write_says_why_in_the_record_and_the_log(
+    ai_services: AiServices,
+    github: FakeGithubClient,
+    session: AsyncSession,
+    site: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    broken = fenced(mine(HERO).replace("</h1>", "</h1"))
+    model = FakeModelClient(READY, PLAN, fenced(CSS, "css"), broken, broken)
+
+    events = await collect(
+        await ai_services.create(FakeModelSource(model)).create(
+            USER, AiCreateRequest(project_id=PROJECT_ID, prompt=PROMPT)
+        )
+    )
+
+    [error] = [e for e in events if e["type"] == "error"]
+    assert error["error"]["code"] == "ai_create_failed"
+    assert github.commits == []
+    # The chat's message is the same whatever went wrong; the record and the log say what.
+    line = '⟦return <section id="hero"><Cake /><h1>My site</h1</section>⟧'
+    why = f"it doesn't parse: syntax error (line 4): missing >, in {line}"
+    reason = f"the model couldn't write src/components/Hero.tsx: {why}"
+    [record] = await records(session)
+    assert (record.outcome, record.summary) == (AiEditOutcome.FAILED, f"ai_create_failed: {reason}")
+    rejected = [r for r in caplog.records if r.getMessage() == "site file rejected"]
+    assert [(r.__dict__["path"], r.__dict__["problem"]) for r in rejected] == [("src/components/Hero.tsx", why)] * 2
+    [failed] = [r for r in caplog.records if r.getMessage() == "site creation failed"]
+    assert (failed.levelname, failed.__dict__["reason"], failed.__dict__["model"]) == ("WARNING", reason, model.name)
 
 
 class SlowModel:
