@@ -1,3 +1,5 @@
+import logging
+
 from langgraph.runtime import Runtime
 
 from app.agents.create_site.nodes.progress import progress
@@ -9,13 +11,15 @@ from app.constants.ai_create import MAX_CREATED_FILE_CHARS, MAX_FILE_ATTEMPTS, R
 from app.schemas.chat import ChatMessage
 from app.utils.syntax_check import locate_syntax_error, script_language
 
+logger = logging.getLogger(__name__)
+
 
 async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     """Writes the plan's next file (one per step, so the browser hears about each). The file is kept in the run's
     context, not the state, until the commit. A reply without a usable file is asked for again once.
 
     Raises:
-        CreateFailedError: The model didn't write the file in its tries.
+        CreateFailedError: The model didn't write the file in its tries (with why the last reply was rejected).
     """
     run = runtime.context
     model = await run.model_client()
@@ -29,12 +33,15 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
     run.model_input = text
     messages = [ChatMessage(role="user", content=text)]
     attempt = state["attempt"]
+    problem = ""
     for _ in range(MAX_FILE_ATTEMPTS):
         reply = await model.complete(messages)
         attempt += 1
         try:
             code = _checked(path, extract_code(reply))
         except ValueError as err:
+            problem = str(err)
+            logger.info("site file rejected", extra={"path": path, "attempt": attempt, "problem": problem[:300]})
             messages += [
                 ChatMessage(role="assistant", content=reply),
                 ChatMessage(role="user", content=f"That reply was rejected: {err}. Reply with the complete file."),
@@ -43,7 +50,7 @@ async def write(state: CreateState, runtime: Runtime[CreateRun]) -> CreateState:
         run.files[path] = code
         break
     else:
-        raise CreateFailedError(f"the model couldn't write {path}")
+        raise CreateFailedError(f"the model couldn't write {path}: {problem}")
     nxt = index + 1
     return {
         "index": nxt,
