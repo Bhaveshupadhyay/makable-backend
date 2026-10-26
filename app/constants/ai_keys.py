@@ -94,6 +94,11 @@ MAX_ENABLED_MODELS = 20
 # provider can refuse one model, e.g. a preview the key has no access to, and accept the key's others).
 MAX_MODEL_FALLBACKS = 5
 KEY_REFUSALS = 2
+# A request stops switching once its failed model calls took this long. A model that hangs costs a call's whole
+# timeout (`AI_TIMEOUT_SECONDS`), and an edit isn't streamed: the proxy in front of the API closes it after 300 s. So
+# switching adds at most this and one call's timeout to a request (190 s with the default 90 s timeout), and one
+# model that hung can still hand over.
+MAX_FALLBACK_SECONDS = 100
 # The last characters of a key that are shown back, so the user can tell keys apart.
 KEY_HINT_CHARS = 4
 MAX_API_KEY_LENGTH = 500

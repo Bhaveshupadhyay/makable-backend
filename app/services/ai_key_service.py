@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import status
@@ -7,7 +8,7 @@ from fastapi import status
 from app.clients.ai_providers import AiProviderClient, model_accepts_images, provider_endpoint
 from app.clients.fallback_model import FallbackModelClient, ModelCandidate, ModelSwitch
 from app.clients.model import AiKeyInvalidError, ModelClient
-from app.constants.ai_keys import KEY_HINT_CHARS, PROVIDERS, AiKeyStatus
+from app.constants.ai_keys import KEY_HINT_CHARS, PROVIDERS, AiKeyStatus, AiProvider
 from app.core.database import utc_now
 from app.core.exceptions import AppError, NotFoundError
 from app.core.security import TokenCipher
@@ -182,7 +183,8 @@ class AiKeyService:
         the models the request switches to if it stops answering (`FallbackModelClient`; `on_switch` hears of each
         switch): the key's other enabled models, then those of the user's other working keys. makable's own model has
         none, and isn't one of them: the user's keys aren't spent on a request they didn't pick them for, and their
-        code isn't sent to a provider they didn't add.
+        code isn't sent to a provider they didn't add. A fallback is built (its key decrypted) only if the request
+        switches to it.
 
         It also ends the request's database transaction: the model can take a minute to answer, and the request
         mustn't hold a pooled connection all that time.
@@ -197,7 +199,7 @@ class AiKeyService:
             if choice is None:
                 if self._default_model is None:
                     raise AiModelRequiredError()
-                return FallbackModelClient([ModelCandidate(self._default_model)])
+                return FallbackModelClient(self._default_model)
             keys = await self._keys.list_for_user(user_id)
             key = next((k for k in keys if k.id == choice.key_id), None)
             if key is None:
@@ -208,23 +210,26 @@ class AiKeyService:
                 raise AiModelNotEnabledError()
             others = [k for k in keys if k.id != key.id and k.status == AiKeyStatus.VALID]
             picks = [
-                (key, choice.model),
                 *((key, model) for model in key.models if model != choice.model),
                 *((other, model) for other in others for model in other.models),
             ]
-            api_keys = {k.id: self._cipher.decrypt(k.api_key) for k in (key, *others)}
-            candidates = [
-                ModelCandidate(self._model_client(provider_endpoint(k.provider, api_keys[k.id], model)), k.id)
-                for k, model in picks
-            ]
-            return FallbackModelClient(candidates, on_switch=on_switch)
+            fallbacks = [ModelCandidate(self._connect(k.provider, k.api_key, model), k.id) for k, model in picks]
+            pick = self._connect(key.provider, key.api_key, choice.model)()
+            return FallbackModelClient(pick, key_id=key.id, fallbacks=fallbacks, on_switch=on_switch)
         finally:
             await self._uow.rollback()
 
-    async def key_refused(self, user_id: UUID, key_id: UUID) -> None:
-        """Marks a key invalid after the provider refused it during a request, so the menu stops offering it."""
+    def _connect(self, provider: AiProvider, ciphertext: str, model: str) -> Callable[[], ModelClient]:
+        """Builds the client for a model with the user's key, decrypting it, when it's called. It takes the key's
+        values, not the row, which the request's session expires when its transaction ends."""
+        return lambda: self._model_client(provider_endpoint(provider, self._cipher.decrypt(ciphertext), model))
+
+    async def key_refused(self, user_id: UUID, key_id: UUID, *, since: datetime) -> None:
+        """Marks a key invalid after the provider refused it during a request that read it at `since`, so the menu
+        stops offering it. A key checked or replaced since then is left as it is: the refusal was for what it was
+        before."""
         key = await self._keys.get(user_id, key_id)
-        if key is None:
+        if key is None or key.checked_at > since:
             return
         await self._keys.set_status(key, AiKeyStatusUpdate(status=AiKeyStatus.INVALID, checked_at=utc_now()))
         await self._uow.commit()

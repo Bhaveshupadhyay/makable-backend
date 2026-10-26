@@ -3,6 +3,7 @@ run waits for, ending one that's paused, and the model a run picked."""
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from app.clients.fallback_model import FallbackModel, ModelSwitch
 from app.clients.model import ModelClient
 from app.constants.ai_create import CREATE_THREAD_SUFFIX
 from app.constants.ai_edit import AiEditOutcome
+from app.core.database import utc_now
 from app.repositories.site import AiEditRecordRepository
 from app.repositories.unit_of_work import UnitOfWork
 from app.schemas.ai_edit import AiModelSwitch
@@ -98,13 +100,15 @@ async def prune(checkpointer: BaseCheckpointSaver[str], config: Any) -> None:
 
 class PickedModel:
     """A run's model, kept once the run picks it (a Tier 2 rule never does), for after the run: the models it switched
-    from, and the user's keys the providers refused."""
+    from, and the user's keys the providers refused (and when the run read them)."""
 
     def __init__(self, pick: Callable[[], Awaitable[FallbackModel]]) -> None:
         self._pick = pick
         self._model: FallbackModel | None = None
+        self.picked_at: datetime | None = None
 
     async def pick(self) -> ModelClient:
+        self.picked_at = utc_now()
         self._model = await self._pick()
         return self._model
 

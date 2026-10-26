@@ -2,7 +2,7 @@ import asyncio
 import base64
 import hashlib
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -408,12 +408,17 @@ class FakeModelSource:
     async def model_for(
         self, user_id: UUID, choice: ModelChoice | None, *, on_switch: Callable[[ModelSwitch], None] | None = None
     ) -> FallbackModelClient:
-        picked = ModelCandidate(self.model, choice.key_id if choice is not None else None)
-        fallbacks = [ModelCandidate(model, fake_key_id(i)) for i, model in enumerate(self.fallbacks)]
-        return FallbackModelClient([picked, *fallbacks], on_switch=on_switch)
+        fallbacks = [ModelCandidate(connect_to(model), fake_key_id(i)) for i, model in enumerate(self.fallbacks)]
+        key_id = choice.key_id if choice is not None else None
+        return FallbackModelClient(self.model, key_id=key_id, fallbacks=fallbacks, on_switch=on_switch)
 
-    async def key_refused(self, user_id: UUID, key_id: UUID) -> None:
+    async def key_refused(self, user_id: UUID, key_id: UUID, *, since: datetime) -> None:
         self.refused.append(key_id)
+
+
+def connect_to(model: ModelClient) -> Callable[[], ModelClient]:
+    """A fallback's `connect` for a model that's built already."""
+    return lambda: model
 
 
 VALID_AI_KEY = "sk-test-valid-1234"

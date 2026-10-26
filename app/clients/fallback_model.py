@@ -2,6 +2,7 @@
 an error, is rate limited or refuses the key), the next of their models takes over, and the run says so."""
 
 import logging
+import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from typing import Protocol
 from uuid import UUID
 
 from app.clients.model import AiKeyInvalidError, ModelClient, ModelRateLimitedError, ModelUnavailableError
-from app.constants.ai_keys import KEY_REFUSALS, MAX_MODEL_FALLBACKS
+from app.constants.ai_keys import KEY_REFUSALS, MAX_FALLBACK_SECONDS, MAX_MODEL_FALLBACKS
 from app.core.exceptions import AppError
 from app.schemas.chat import ChatMessage
 
@@ -41,9 +42,12 @@ class ModelSwitch:
 
 @dataclass(frozen=True)
 class ModelCandidate:
-    client: ModelClient
-    # The user's key it's called with (None: makable's own model). Refusals are counted per key.
-    key_id: UUID | None = None
+    """A model a run can switch to. It's built when the run gets to it, so a fallback's key is only decrypted if the
+    run needs it."""
+
+    connect: Callable[[], ModelClient]
+    # The user's key it's called with. Refusals are counted per key.
+    key_id: UUID
 
 
 class FallbackModel(ModelClient, Protocol):
@@ -55,35 +59,45 @@ class FallbackModel(ModelClient, Protocol):
 
 
 class FallbackModelClient:
-    """Answers with the first candidate (the user's pick) and switches to the next when it fails, at most
-    `max_switches` times. A run keeps the model that answered last and never goes back to one that failed. A key that
-    refused `KEY_REFUSALS` of its models is skipped (it's the key, not the model); the keys refused and never answered
-    with are `refused_keys`, for the service to mark invalid. When no candidate is left, the pick's error is raised."""
+    """Answers with `model` (the user's pick, on `key_id`; None: makable's own) and switches to the next of
+    `fallbacks` when it fails, at most `max_switches` times, and not once the run's failed calls took
+    `max_failed_seconds`. A run keeps the model that answered last and never goes back to one that failed. A key that
+    refused `KEY_REFUSALS` of its models is skipped (it's the key, not the model), and so is a fallback that can't be
+    built; the keys refused and never answered with are `refused_keys`, for the service to mark invalid. When no
+    switch is left, the first error of the call is raised (the pick's, unless the run had switched before)."""
 
     def __init__(
         self,
-        candidates: Sequence[ModelCandidate],
+        model: ModelClient,
         *,
+        key_id: UUID | None = None,
+        fallbacks: Sequence[ModelCandidate] = (),
         max_switches: int = MAX_MODEL_FALLBACKS,
+        max_failed_seconds: float = MAX_FALLBACK_SECONDS,
         on_switch: Callable[[ModelSwitch], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not candidates:
-            raise ValueError("a model needs at least one candidate")
-        self._candidates = list(candidates)
+        self._model = model
+        self._key_id = key_id
+        self._fallbacks = list(fallbacks)
         self._max_switches = max_switches
+        self._max_failed_seconds = max_failed_seconds
         self._on_switch = on_switch
-        self._index = 0
+        self._clock = clock
+        # The first fallback not tried yet.
+        self._next = 0
+        self._failed_seconds = 0.0
         self._switches: list[ModelSwitch] = []
         self._refusals: Counter[UUID | None] = Counter()
         self._answered: set[UUID | None] = set()
 
     @property
     def name(self) -> str:
-        return self._candidates[self._index].client.name
+        return self._model.name
 
     @property
     def accepts_images(self) -> bool:
-        return self._candidates[self._index].client.accepts_images
+        return self._model.accepts_images
 
     @property
     def switches(self) -> list[ModelSwitch]:
@@ -98,28 +112,44 @@ class FallbackModelClient:
         messages without them.
 
         Raises:
-            AiKeyInvalidError, ModelRateLimitedError, ModelUnavailableError: The model, and every one switched to,
-                failed. The first one's error is raised.
+            AiKeyInvalidError, ModelRateLimitedError, ModelUnavailableError: The model failed, and so did every one it
+                switched to (or no switch was left).
         """
         first: AppError | None = None
         while True:
-            candidate = self._candidates[self._index]
-            model = candidate.client
+            model, key_id = self._model, self._key_id
+            started = self._clock()
             try:
                 reply = await model.complete(messages if model.accepts_images else _without_images(messages))
             except FALLBACK_ERRORS as err:
                 failed: AppError = err
             else:
-                self._answered.add(candidate.key_id)
+                self._answered.add(key_id)
                 return reply
+            self._failed_seconds += self._clock() - started
             first = first or failed
             if isinstance(failed, AiKeyInvalidError):
-                self._refusals[candidate.key_id] += 1
-            following = self._following()
-            if following is None:
+                self._refusals[key_id] += 1
+            if not self._switch_from(model, failed):
                 raise first
-            self._index = following
-            switch = ModelSwitch(failed=model.name, reason=failed.code, model=self.name)
+
+    def _switch_from(self, failed: ModelClient, error: AppError) -> bool:
+        """Moves on to the next fallback, if a switch is left: one whose key hasn't refused too often, and that can
+        be built."""
+        if len(self._switches) >= self._max_switches or self._failed_seconds >= self._max_failed_seconds:
+            return False
+        while self._next < len(self._fallbacks):
+            candidate = self._fallbacks[self._next]
+            self._next += 1
+            if self._refusals[candidate.key_id] >= KEY_REFUSALS:
+                continue
+            try:
+                model = candidate.connect()
+            except Exception:
+                logger.exception("Couldn't set up a fallback AI model")
+                continue
+            self._model, self._key_id = model, candidate.key_id
+            switch = ModelSwitch(failed=failed.name, reason=error.code, model=model.name)
             self._switches.append(switch)
             logger.warning(
                 "AI model failed, switching to the next",
@@ -127,15 +157,8 @@ class FallbackModelClient:
             )
             if self._on_switch is not None:
                 self._on_switch(switch)
-
-    def _following(self) -> int | None:
-        """The next candidate to switch to, if switches are left: one whose key hasn't been refused too often."""
-        if len(self._switches) >= self._max_switches:
-            return None
-        for index in range(self._index + 1, len(self._candidates)):
-            if self._refusals[self._candidates[index].key_id] < KEY_REFUSALS:
-                return index
-        return None
+            return True
+        return False
 
 
 def _without_images(messages: list[ChatMessage]) -> list[ChatMessage]:

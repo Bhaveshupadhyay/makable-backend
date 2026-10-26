@@ -240,9 +240,12 @@ class SiteCreateService:
     async def _mark_refused(self, user: UserRead, picked: PickedModel) -> None:
         """Marks the keys the providers refused during a run invalid, so the menu stops offering them. A failure is
         logged: the creation doesn't depend on it."""
+        since = picked.picked_at
+        if since is None:
+            return
         for key_id in picked.refused_keys:
             try:
-                await self._models.key_refused(user.id, key_id)
+                await self._models.key_refused(user.id, key_id, since=since)
             except Exception:
                 logger.exception("Couldn't mark a refused AI key invalid")
                 await self._uow.rollback()

@@ -1,5 +1,6 @@
 """The model a run uses: the user's pick, and the models it switches to when the one answering fails."""
 
+import time
 from collections.abc import Callable
 from uuid import UUID
 
@@ -9,7 +10,7 @@ from app.clients.fallback_model import FallbackModelClient, ModelCandidate, Mode
 from app.clients.model import AiKeyInvalidError, ModelRateLimitedError, ModelUnavailableError
 from app.core.limits import ServiceBusyError
 from app.schemas.chat import ChatMessage, ImagePart, ImageUrl, TextPart
-from app.tests.fakes import FakeModelClient
+from app.tests.fakes import FakeModelClient, connect_to
 
 MESSAGES = [ChatMessage(role="user", content="hi")]
 KEY = UUID(int=1)
@@ -17,14 +18,40 @@ OTHER_KEY = UUID(int=2)
 
 
 def fallback(
-    *models: FakeModelClient,
+    pick: FakeModelClient,
+    *fallbacks: FakeModelClient,
     keys: list[UUID] | None = None,
     max_switches: int = 5,
+    max_failed_seconds: float = 100,
     on_switch: Callable[[ModelSwitch], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> FallbackModelClient:
-    """The models as candidates, on `keys` (all on `KEY` if not given)."""
-    candidates = [ModelCandidate(model, key) for model, key in zip(models, keys or [KEY] * len(models), strict=True)]
-    return FallbackModelClient(candidates, max_switches=max_switches, on_switch=on_switch)
+    """The pick and its fallbacks, on `keys` (all on `KEY` if not given)."""
+    pick_key, *fallback_keys = keys or [KEY] * (1 + len(fallbacks))
+    candidates = [ModelCandidate(connect_to(m), key) for m, key in zip(fallbacks, fallback_keys, strict=True)]
+    return FallbackModelClient(
+        pick,
+        key_id=pick_key,
+        fallbacks=candidates,
+        max_switches=max_switches,
+        max_failed_seconds=max_failed_seconds,
+        on_switch=on_switch,
+        clock=clock,
+    )
+
+
+class SlowFailure(FakeModelClient):
+    """Fails with `ModelUnavailableError` after `seconds` on `clock` (a model that times out)."""
+
+    def __init__(self, clock: list[float], seconds: float, name: str) -> None:
+        super().__init__(name=name)
+        self.clock = clock
+        self.seconds = seconds
+
+    async def complete(self, messages: list[ChatMessage]) -> str:
+        self.calls.append(list(messages))
+        self.clock[0] += self.seconds
+        raise ModelUnavailableError()
 
 
 async def test_the_pick_answers_when_it_works() -> None:
@@ -124,6 +151,47 @@ async def test_a_model_that_reads_text_only_gets_the_messages_without_their_pict
     assert text_only.calls == [[ChatMessage(role="user", content="make it blue")]]
 
 
-def test_a_model_needs_a_candidate() -> None:
-    with pytest.raises(ValueError, match="candidate"):
-        FallbackModelClient([])
+async def test_it_stops_switching_once_failed_calls_took_too_long() -> None:
+    # Two models that time out: the first hands over, the second (past the budget) gives up.
+    now = [0.0]
+    first, second = SlowFailure(now, 90, "first"), SlowFailure(now, 90, "second")
+    third = FakeModelClient("never", name="third")
+    model = fallback(first, second, third, max_failed_seconds=100, clock=lambda: now[0])
+
+    with pytest.raises(ModelUnavailableError):
+        await model.complete(MESSAGES)
+
+    assert (len(first.calls), len(second.calls), third.calls) == (1, 1, [])
+    assert [s.model for s in model.switches] == ["second"]
+
+
+async def test_fast_failures_dont_use_up_the_time() -> None:
+    now = [0.0]
+    failing = [SlowFailure(now, 1, f"m{i}") for i in range(3)]
+    model = fallback(*failing, FakeModelClient("hi"), max_failed_seconds=100, clock=lambda: now[0])
+
+    assert await model.complete(MESSAGES) == "hi"
+    assert len(model.switches) == 3
+
+
+async def test_fallbacks_are_built_only_when_switched_to_and_one_that_cant_be_is_skipped() -> None:
+    built: list[str] = []
+
+    def broken() -> FakeModelClient:
+        built.append("broken")
+        raise ValueError("the key can't be decrypted")
+
+    def working() -> FakeModelClient:
+        built.append("working")
+        return FakeModelClient("hi", name="working")
+
+    pick = FakeModelClient("first", ModelUnavailableError(), name="pick")
+    model = FallbackModelClient(
+        pick, key_id=KEY, fallbacks=[ModelCandidate(broken, OTHER_KEY), ModelCandidate(working, OTHER_KEY)]
+    )
+
+    assert await model.complete(MESSAGES) == "first"
+    assert built == []
+    assert await model.complete(MESSAGES) == "hi"
+    assert built == ["broken", "working"]
+    assert [s.model for s in model.switches] == ["working"]

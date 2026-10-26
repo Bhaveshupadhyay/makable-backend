@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -81,7 +82,7 @@ class ModelSource(Protocol):
         self, user_id: UUID, choice: ModelChoice | None, *, on_switch: Callable[[ModelSwitch], None] | None = None
     ) -> FallbackModel: ...
 
-    async def key_refused(self, user_id: UUID, key_id: UUID) -> None: ...
+    async def key_refused(self, user_id: UUID, key_id: UUID, *, since: datetime) -> None: ...
 
 
 class AiEditService:
@@ -331,9 +332,12 @@ class AiEditService:
     async def _mark_refused(self, user: UserRead, picked: PickedModel) -> None:
         """Marks the keys the providers refused during a run invalid, so the menu stops offering them. A failure is
         logged: the run's answer doesn't depend on it."""
+        since = picked.picked_at
+        if since is None:
+            return
         for key_id in picked.refused_keys:
             try:
-                await self._models.key_refused(user.id, key_id)
+                await self._models.key_refused(user.id, key_id, since=since)
             except Exception:
                 logger.exception("Couldn't mark a refused AI key invalid")
                 await self._uow.rollback()
