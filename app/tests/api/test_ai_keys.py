@@ -5,25 +5,17 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.api.dependencies import get_model_client, get_model_client_factory
-from app.clients.model import AiKeyInvalidError, ModelClient
+from app.clients.model import AiKeyInvalidError, ModelClient, ModelUnavailableError
 from app.core.client import get_postgres_client
 from app.core.config import Settings
 from app.core.security import TokenCipher
 from app.models.ai_key import AiKey
 from app.schemas.ai_key import ModelEndpoint
-from app.schemas.chat import ChatMessage
 from app.tests.ai_edit_fixtures import GOOD_REPLY, create_site, request_body
 from app.tests.api.test_auth import sign_in
 from app.tests.fakes import VALID_AI_KEY, FakeAiProviders, FakeModelClient
 
 AI = "/api/v1/ai"
-
-
-class RefusingModel:
-    name = "refusing"
-
-    async def complete(self, messages: list[ChatMessage]) -> str:
-        raise AiKeyInvalidError()
 
 
 @pytest.fixture
@@ -248,7 +240,7 @@ def test_a_key_refused_during_an_edit_is_marked_invalid(client: TestClient, mode
     sign_in(client)
     base = create_site(client)
     key = add_key(client, models=["gpt-5"]).json()["data"]["key"]
-    models["user"] = RefusingModel()
+    models["user"] = FakeModelClient(AiKeyInvalidError())
     pick = {"keyId": key["id"], "model": "gpt-5"}
 
     res = client.post("/api/v1/ai/edit", json=request_body(baseCommit=base, model=pick))
@@ -276,3 +268,83 @@ def test_without_makables_model_the_menu_has_only_the_users_and_an_edit_must_pic
     assert client.get(f"{AI}/models").json()["data"] == [
         {"keyId": key["id"], "provider": "openai", "model": "gpt-5", "acceptsImages": True}
     ]
+
+
+@pytest.fixture
+def clients_by_model(client: TestClient, models: dict[str, Any]) -> dict[tuple[str, str], FakeModelClient]:
+    """The client the factory builds for each (base URL, model); other endpoints get `models["user"]`."""
+    clients: dict[tuple[str, str], FakeModelClient] = {}
+
+    def factory(endpoint: ModelEndpoint) -> ModelClient:
+        models["endpoints"].append(endpoint)
+        model: ModelClient = clients.get((endpoint.base_url, endpoint.model), models["user"])
+        return model
+
+    client.app.dependency_overrides[get_model_client_factory] = lambda: factory  # type: ignore[attr-defined]
+    return clients
+
+
+OPENAI_URL = "https://api.openai.com/v1"
+ANTHROPIC_URL = "https://api.anthropic.com/v1"
+
+
+def test_an_edit_switches_to_the_keys_next_model_when_the_picked_one_fails(
+    client: TestClient, models: dict[str, Any], clients_by_model: dict[tuple[str, str], FakeModelClient]
+) -> None:
+    sign_in(client)
+    base = create_site(client)
+    key = add_key(client, models=["gpt-5", "o4-mini"]).json()["data"]["key"]
+    clients_by_model[(OPENAI_URL, "gpt-5")] = FakeModelClient(ModelUnavailableError(), name="gpt-5")
+    clients_by_model[(OPENAI_URL, "o4-mini")] = FakeModelClient(GOOD_REPLY, name="o4-mini")
+
+    res = client.post(
+        "/api/v1/ai/edit", json=request_body(baseCommit=base, model={"keyId": key["id"], "model": "gpt-5"})
+    )
+
+    assert res.status_code == 200
+    assert res.json()["data"]["modelSwitches"] == [
+        {
+            "failed": "gpt-5",
+            "reason": "ai_unavailable",
+            "model": "o4-mini",
+            "message": "gpt-5 isn't answering, so o4-mini is taking over.",
+        }
+    ]
+    assert models["default"].calls == []
+    assert client.get(f"{AI}/keys").json()["data"][0]["status"] == "valid"
+
+
+def test_an_edit_goes_on_with_the_users_other_key_and_marks_the_refused_one(
+    client: TestClient, models: dict[str, Any], clients_by_model: dict[tuple[str, str], FakeModelClient]
+) -> None:
+    sign_in(client)
+    base = create_site(client)
+    refused = add_key(client, models=["gpt-5"]).json()["data"]["key"]
+    other = add_key(client, provider="anthropic", models=["o4-mini"]).json()["data"]["key"]
+    clients_by_model[(OPENAI_URL, "gpt-5")] = FakeModelClient(AiKeyInvalidError(), name="gpt-5")
+    answering = clients_by_model[(ANTHROPIC_URL, "o4-mini")] = FakeModelClient(GOOD_REPLY, name="o4-mini")
+
+    res = client.post(
+        "/api/v1/ai/edit", json=request_body(baseCommit=base, model={"keyId": refused["id"], "model": "gpt-5"})
+    )
+
+    assert res.status_code == 200
+    assert [s["reason"] for s in res.json()["data"]["modelSwitches"]] == ["ai_key_invalid"]
+    assert len(answering.calls) == 1
+    assert models["default"].calls == []
+    statuses = {k["id"]: k["status"] for k in client.get(f"{AI}/keys").json()["data"]}
+    assert statuses == {refused["id"]: "invalid", other["id"]: "valid"}
+
+
+def test_an_edit_with_makables_model_doesnt_switch_to_the_users(
+    client: TestClient, models: dict[str, Any], clients_by_model: dict[tuple[str, str], FakeModelClient]
+) -> None:
+    sign_in(client)
+    base = create_site(client)
+    add_key(client, models=["gpt-5"])
+    models["default"] = FakeModelClient(ModelUnavailableError())
+
+    res = client.post("/api/v1/ai/edit", json=request_body(baseCommit=base))
+
+    assert (res.status_code, res.json()["error"]["code"]) == (502, "ai_unavailable")
+    assert models["endpoints"] == []

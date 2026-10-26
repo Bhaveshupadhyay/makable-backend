@@ -89,6 +89,11 @@ TEXT_ONLY_MODEL = re.compile(
 MAX_LISTED_MODELS = 500
 # Models a key can show in the chat's model menu.
 MAX_ENABLED_MODELS = 20
+# Times an AI request switches to another of the user's models when the one answering fails (the picked key's other
+# enabled models first, then their other keys'), and refusals that make a key skipped for the rest of the request (a
+# provider can refuse one model, e.g. a preview the key has no access to, and accept the key's others).
+MAX_MODEL_FALLBACKS = 5
+KEY_REFUSALS = 2
 # The last characters of a key that are shown back, so the user can tell keys apart.
 KEY_HINT_CHARS = 4
 MAX_API_KEY_LENGTH = 500

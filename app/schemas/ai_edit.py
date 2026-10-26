@@ -172,6 +172,16 @@ class AiEditDebug(CamelModel):
     model: str
 
 
+class AiModelSwitch(CamelModel):
+    """The model answering the request failed (`reason`: its error's code, e.g. `ai_unavailable`) and `model`, another
+    of the user's, took over. `message` says so, for the chat."""
+
+    failed: str
+    reason: str
+    model: str
+    message: str
+
+
 class AiEditApplied(CamelModel):
     """The change is committed to the site's repo. `files` are the files it changed, as they are now (None: deleted),
     which the SPA puts in its copy of the site at `commit_sha`."""
@@ -181,6 +191,7 @@ class AiEditApplied(CamelModel):
     summary: str
     commit_sha: str
     files: dict[str, str | None]
+    model_switches: list[AiModelSwitch] | None = None
     debug: AiEditDebug | None = None
 
 
@@ -190,6 +201,7 @@ class AiEditEscalated(CamelModel):
     status: Literal["escalated"] = "escalated"
     run_id: UUID
     reason: str
+    model_switches: list[AiModelSwitch] | None = None
     debug: AiEditDebug | None = None
 
 
@@ -200,6 +212,7 @@ class AiEditNeedsInput(CamelModel):
     status: Literal["needs_input"] = "needs_input"
     run_id: UUID
     question: Question
+    model_switches: list[AiModelSwitch] | None = None
     debug: AiEditDebug | None = None
 
 
@@ -211,6 +224,7 @@ class AiEditAwaitingResult(CamelModel):
     run_id: UUID
     summary: str
     files: dict[str, str | None]
+    model_switches: list[AiModelSwitch] | None = None
     debug: AiEditDebug | None = None
 
 

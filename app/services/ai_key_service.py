@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import status
 
 from app.clients.ai_providers import AiProviderClient, model_accepts_images, provider_endpoint
+from app.clients.fallback_model import FallbackModelClient, ModelCandidate, ModelSwitch
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_keys import KEY_HINT_CHARS, PROVIDERS, AiKeyStatus
 from app.core.database import utc_now
@@ -174,8 +175,14 @@ class AiKeyService:
                 ]
         return options
 
-    async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient:
-        """The model to answer a request: the user's pick, or makable's own model when there's none.
+    async def model_for(
+        self, user_id: UUID, choice: ModelChoice | None, *, on_switch: Callable[[ModelSwitch], None] | None = None
+    ) -> FallbackModelClient:
+        """The model to answer a request: the user's pick, or makable's own model when there's none. A pick comes with
+        the models the request switches to if it stops answering (`FallbackModelClient`; `on_switch` hears of each
+        switch): the key's other enabled models, then those of the user's other working keys. makable's own model has
+        none, and isn't one of them: the user's keys aren't spent on a request they didn't pick them for, and their
+        code isn't sent to a provider they didn't add.
 
         It also ends the request's database transaction: the model can take a minute to answer, and the request
         mustn't hold a pooled connection all that time.
@@ -190,14 +197,27 @@ class AiKeyService:
             if choice is None:
                 if self._default_model is None:
                     raise AiModelRequiredError()
-                return self._default_model
-            key = await self._get(user_id, choice.key_id)
+                return FallbackModelClient([ModelCandidate(self._default_model)])
+            keys = await self._keys.list_for_user(user_id)
+            key = next((k for k in keys if k.id == choice.key_id), None)
+            if key is None:
+                raise AiKeyNotFoundError()
             if key.status == AiKeyStatus.INVALID:
                 raise AiKeyInvalidError()
             if choice.model not in key.models:
                 raise AiModelNotEnabledError()
-            endpoint = provider_endpoint(key.provider, self._cipher.decrypt(key.api_key), choice.model)
-            return self._model_client(endpoint)
+            others = [k for k in keys if k.id != key.id and k.status == AiKeyStatus.VALID]
+            picks = [
+                (key, choice.model),
+                *((key, model) for model in key.models if model != choice.model),
+                *((other, model) for other in others for model in other.models),
+            ]
+            api_keys = {k.id: self._cipher.decrypt(k.api_key) for k in (key, *others)}
+            candidates = [
+                ModelCandidate(self._model_client(provider_endpoint(k.provider, api_keys[k.id], model)), k.id)
+                for k, model in picks
+            ]
+            return FallbackModelClient(candidates, on_switch=on_switch)
         finally:
             await self._uow.rollback()
 

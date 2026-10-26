@@ -1,7 +1,8 @@
 """What the AI services share about running agents: each agent's thread for a site, how a run is saved, what a paused
-run waits for, and ending one that's paused."""
+run waits for, ending one that's paused, and the model a run picked."""
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -9,10 +10,13 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Durability, StateSnapshot
 
 from app.agents.thread import RECURSION_LIMIT, RunResult
+from app.clients.fallback_model import FallbackModel, ModelSwitch
+from app.clients.model import ModelClient
 from app.constants.ai_create import CREATE_THREAD_SUFFIX
 from app.constants.ai_edit import AiEditOutcome
 from app.repositories.site import AiEditRecordRepository
 from app.repositories.unit_of_work import UnitOfWork
+from app.schemas.ai_edit import AiModelSwitch
 from app.schemas.site import AiEditRecordCreate
 
 logger = logging.getLogger(__name__)
@@ -90,3 +94,29 @@ async def prune(checkpointer: BaseCheckpointSaver[str], config: Any) -> None:
     except Exception:
         # Best effort: the next run prunes again.
         logger.warning("Couldn't prune an AI thread's checkpoints", exc_info=True)
+
+
+class PickedModel:
+    """A run's model, kept once the run picks it (a Tier 2 rule never does), for after the run: the models it switched
+    from, and the user's keys the providers refused."""
+
+    def __init__(self, pick: Callable[[], Awaitable[FallbackModel]]) -> None:
+        self._pick = pick
+        self._model: FallbackModel | None = None
+
+    async def pick(self) -> ModelClient:
+        self._model = await self._pick()
+        return self._model
+
+    @property
+    def switches(self) -> list[ModelSwitch]:
+        return self._model.switches if self._model is not None else []
+
+    @property
+    def refused_keys(self) -> list[UUID]:
+        return self._model.refused_keys if self._model is not None else []
+
+
+def switches_read(switches: list[ModelSwitch]) -> list[AiModelSwitch] | None:
+    """The models a run switched from, as they're sent (None: it didn't switch)."""
+    return [AiModelSwitch(failed=s.failed, reason=s.reason, model=s.model, message=s.message) for s in switches] or None
