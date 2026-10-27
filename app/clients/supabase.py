@@ -1,5 +1,6 @@
 """Supabase Auth client: OAuth sign-in with PKCE, session refresh and sign-out, and access token checks."""
 
+import math
 import time
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -131,7 +132,9 @@ class HttpSupabaseAuthClient:
     async def _signing_key(self, kid: str) -> jwt.PyJWK:
         url = f"{self._auth_url}/.well-known/jwks.json"
         now = time.monotonic()
-        fetched_at, keys = _jwks_cache.get(url, (0.0, {}))
+        # Never fetched is older than any TTL. Not 0: monotonic time counts from the machine's boot, so it can be
+        # under a minute (a fresh CI runner, a server just restarted), and no fetch would be due.
+        fetched_at, keys = _jwks_cache.get(url, (-math.inf, {}))
         age = now - fetched_at
         if age > JWKS_TTL_SECONDS or (kid not in keys and age > JWKS_MIN_REFETCH_SECONDS):
             keys = await self._fetch_jwks(url)
