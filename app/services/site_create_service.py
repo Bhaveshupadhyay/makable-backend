@@ -18,7 +18,7 @@ from app.agents.create_site import (
 )
 from app.agents.create_site.tools.names import suggest_name
 from app.agents.thread import RunResult, Turn, UserReply
-from app.clients.model import AiKeyInvalidError
+from app.clients.fallback_model import ModelSwitch
 from app.constants.ai_create import HEARTBEAT_SECONDS
 from app.constants.ai_edit import AiEditOutcome
 from app.core.database import utc_now
@@ -31,7 +31,16 @@ from app.schemas.ai_edit import AiEditNeedsInput, Question
 from app.schemas.site import AiEditRecordCreate
 from app.schemas.user import UserRead
 from app.services.ai_edit_service import AiRunSupersededError, ModelSource
-from app.services.ai_runs import DURABILITY, create_config, end_paused, pause_value, prune
+from app.services.ai_runs import (
+    DURABILITY,
+    PickedModel,
+    create_config,
+    end_paused,
+    failure_summary,
+    pause_value,
+    prune,
+    switches_read,
+)
 from app.services.site_service import SiteNotFoundError, SiteService
 
 logger = logging.getLogger(__name__)
@@ -167,13 +176,16 @@ class SiteCreateService:
         self, user: UserRead, request: AiCreateRequest, run_id: UUID, graph_input: Any, stack: AsyncExitStack
     ) -> AsyncGenerator[Event]:
         """Runs the graph and streams what it says. The run is a task of its own, so pings can go out while the model
-        writes; it's cancelled when the stream is (the request closed)."""
-        run = CreateRun(
-            request,
-            pick_model=lambda: self._models.model_for(user.id, request.model),
-            site=self._site_service.creator(user, request.project_id),
-        )
+        writes; it's cancelled when the stream is (the request closed). When the user's model stops answering and
+        another of theirs takes over, the stream says so; keys the providers refused are marked invalid, however it
+        ends."""
         queue: asyncio.Queue[Event] = asyncio.Queue()
+
+        def announce(switch: ModelSwitch) -> None:
+            queue.put_nowait({"type": "progress", "stage": "model", "message": switch.message})
+
+        picked = PickedModel(lambda: self._models.model_for(user.id, request.model, on_switch=announce))
+        run = CreateRun(request, pick_model=picked.pick, site=self._site_service.creator(user, request.project_id))
 
         async def drive() -> dict[str, Any]:
             final: dict[str, Any] = {}
@@ -217,12 +229,27 @@ class SiteCreateService:
                 return
             with anyio.CancelScope(shield=True):
                 result = await self._result(user, request, run, run_id, state)
+            result.model_switches = switches_read(picked.switches)
             yield {"type": "result", "data": result.model_dump(mode="json", by_alias=True, exclude_none=True)}
         finally:
             with anyio.CancelScope(shield=True):
                 if not finished:
                     await self._stopped(user, request, run, run_id, task)
+                await self._mark_refused(user, picked)
                 await stack.aclose()
+
+    async def _mark_refused(self, user: UserRead, picked: PickedModel) -> None:
+        """Marks the keys the providers refused during a run invalid, so the menu stops offering them. A failure is
+        logged: the creation doesn't depend on it."""
+        since = picked.picked_at
+        if since is None:
+            return
+        for key_id in picked.refused_keys:
+            try:
+                await self._models.key_refused(user.id, key_id, since=since)
+            except Exception:
+                logger.exception("Couldn't mark a refused AI key invalid")
+                await self._uow.rollback()
 
     async def _result(
         self, user: UserRead, request: AiCreateRequest, run: CreateRun, run_id: UUID, state: dict[str, Any]
@@ -236,9 +263,7 @@ class SiteCreateService:
         return AiCreated(run_id=run_id, summary=result.get("summary", ""), commit_sha=result["commit_sha"], site=site)
 
     async def _failed(self, user: UserRead, request: AiCreateRequest, run: CreateRun, err: Exception) -> None:
-        if isinstance(err, AiKeyInvalidError) and request.model is not None:
-            await self._models.key_refused(user.id, request.model.key_id)
-        summary = _error_body(err)["code"]
+        summary = failure_summary(_error_body(err)["code"], err)
         if isinstance(err, CreateFailedError):
             # Why the model's last reply was rejected, which the user's message doesn't say: kept with the request.
             summary = f"{summary}: {err}"
