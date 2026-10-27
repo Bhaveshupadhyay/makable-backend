@@ -2,6 +2,8 @@
 the user's own key."""
 
 import logging
+import re
+from collections.abc import Sequence
 from typing import Protocol
 
 import httpx
@@ -15,8 +17,15 @@ from app.schemas.chat import ChatMessage
 
 logger = logging.getLogger(__name__)
 
-# How much of a provider's error message is logged and shown to the user.
+# How much of a provider's error message is logged, shown to the user and kept with the request.
 MAX_PROVIDER_MESSAGE_CHARS = 400
+# Credentials a provider's message could echo, taken out of it: keys as providers write them (OpenAI, Anthropic,
+# OpenRouter and DeepSeek `sk-`, Groq `gsk_`, xAI `xai-`, Gemini `AIza`), bearer tokens, and keys in URLs.
+_KEY_LIKE = re.compile(r"\b(?:sk|gsk|xai)[-_][\w*.-]{8,}|\bAIza[\w-]{20,}|\bBearer\s+[^\s\"',]+", re.IGNORECASE)
+_KEY_PARAM = re.compile(r"([?&](?:key|api_key|access_token)=)[^&\s\"']+", re.IGNORECASE)
+REDACTED = "[redacted]"
+# Shorter header values aren't taken out of messages (they'd match ordinary words).
+MIN_CREDENTIAL_CHARS = 8
 
 
 class ModelUnavailableError(ExternalServiceError):
@@ -138,7 +147,7 @@ class HttpModelClient:
             data = None
         content = _content(data)
         if res.is_error or content is None:
-            said = _error_message(data)
+            said = _error_message(data, _sent_credentials(res))
             logger.warning("model call failed", extra={"status": res.status_code, "model": self._model, "error": said})
             message = None
             if self._provider is not None:
@@ -169,12 +178,16 @@ def _content(data: object) -> str | None:
     return None
 
 
-def _error_message(data: object) -> str | None:
-    """The provider's error message, on one line and cut to `MAX_PROVIDER_MESSAGE_CHARS`."""
+def _error_message(data: object, credentials: Sequence[str] = ()) -> str | None:
+    """The provider's error message, on one line, without `credentials` (what the request sent) or anything shaped
+    like one, and cut to `MAX_PROVIDER_MESSAGE_CHARS`. It's logged, shown to the user and kept with the request."""
     match data:
         # Gemini's OpenAI-compatible API wraps the error in a list.
         case {"error": {"message": str(message)}} | [{"error": {"message": str(message)}}, *_]:
             message = " ".join(message.split())
+            for credential in credentials:
+                message = message.replace(credential, REDACTED)
+            message = _KEY_PARAM.sub(rf"\1{REDACTED}", _KEY_LIKE.sub(REDACTED, message))
             if len(message) > MAX_PROVIDER_MESSAGE_CHARS:
                 message = message[: MAX_PROVIDER_MESSAGE_CHARS - 1].rstrip() + "…"
             return message or None
@@ -183,9 +196,19 @@ def _error_message(data: object) -> str | None:
 
 def _provider_said(res: httpx.Response) -> str | None:
     try:
-        return _error_message(res.json())
+        return _error_message(res.json(), _sent_credentials(res))
     except ValueError:
         return None
+
+
+def _sent_credentials(res: httpx.Response) -> list[str]:
+    """The key the request was sent with (as a bearer token, or Anthropic's `x-api-key`), whatever its shape."""
+    try:
+        headers = res.request.headers
+    except RuntimeError:  # A response that wasn't sent by a client: nothing was.
+        return []
+    sent = [headers.get("authorization", "").removeprefix("Bearer ").strip(), headers.get("x-api-key", "").strip()]
+    return [value for value in sent if len(value) >= MIN_CREDENTIAL_CHARS]
 
 
 def _provider_failed(provider: str, model: str, status_code: int, said: str | None) -> str:

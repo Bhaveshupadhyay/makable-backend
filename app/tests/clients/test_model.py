@@ -219,3 +219,26 @@ async def test_makables_own_model_keeps_the_general_messages() -> None:
     with pytest.raises(ModelRateLimitedError) as rate_limited:
         await client(lambda _: limited).complete(MESSAGES)
     assert rate_limited.value.message == ModelRateLimitedError.message
+
+
+@pytest.mark.parametrize("status_code", [400, 429])
+async def test_credentials_a_provider_echoes_are_taken_out_of_its_message(status_code: int) -> None:
+    # The request's own key, whatever its shape (Mistral's have no prefix), and anything shaped like a key.
+    key = "Zq7mN2pL9xR4tY6w"
+    said = (
+        f"Key {key} can't use this model. Also seen: sk-proj-AbC123dEf456, AIzaSyD1234567890abcdefghij, "
+        "Bearer eyJhbGciOi.x.y, https://example.com/v1?key=secret123&alt=json"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"message": said}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    endpoint = ModelEndpoint(base_url=URL, api_key=key, model="m", provider="Mistral")
+    with pytest.raises((ModelUnavailableError, ModelRateLimitedError)) as err:
+        await HttpModelClient(http, endpoint, timeout_seconds=5).complete(MESSAGES)
+
+    assert err.value.message == (
+        "Your AI provider (Mistral) returned an error for m: Key [redacted] can't use this model. Also seen: "
+        "[redacted], [redacted], [redacted], https://example.com/v1?key=[redacted]&alt=json"
+    )
