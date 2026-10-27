@@ -65,9 +65,13 @@ PROVIDERS: dict[AiProvider, ProviderSpec] = {
 
 # Model ids as providers write them, e.g. `gpt-4.1-mini`, `models/gemini-2.5-flash`, `meta-llama/llama-3.3-70b:free`.
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
-# Models in a provider's list that can't chat (embeddings, speech, images...). Left out of what the user picks from.
+# Models in a provider's list that can't chat (embeddings, speech, images, music...), or that its chat completions API
+# refuses: Gemini's Interactions API models (antigravity, deep research), its Live API (WebSocket) models and computer
+# use, and OpenAI's codex models (Responses API only; OpenRouter's `openai/...codex` work, so only a bare id is
+# matched). Left out of what the user picks from, and of the chat's menu for keys that turned them on before.
 NOT_CHAT_MODEL = re.compile(
-    r"embed|whisper|tts|transcri|dall-e|image|audio|realtime|moderation|rerank|guard|sora|veo|imagen|aqa|babbage|davinci",
+    r"embed|whisper|tts|transcri|dall-e|image|audio|realtime|moderation|rerank|guard|sora|veo|imagen|aqa|babbage|davinci"
+    r"|lyria|banana|antigravity|deep-research|computer-use|\blive\b|streaming|^[^/]*codex",
     re.IGNORECASE,
 )
 # Model ids of models that read images (the selected element's picture goes with AI edits to them). A model not

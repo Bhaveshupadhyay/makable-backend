@@ -15,6 +15,9 @@ from app.schemas.chat import ChatMessage
 
 logger = logging.getLogger(__name__)
 
+# How much of a provider's error message is logged and shown to the user.
+MAX_PROVIDER_MESSAGE_CHARS = 400
+
 
 class ModelUnavailableError(ExternalServiceError):
     code = "ai_unavailable"
@@ -36,12 +39,14 @@ class ModelRateLimitedError(AppError):
     code = "ai_rate_limited"
     message = "The AI provider is rate limiting this key. Try again in a moment."
 
-    def __init__(self, retry_after: int) -> None:
-        super().__init__(details={"retryAfter": retry_after}, headers={"Retry-After": str(retry_after)})
+    def __init__(self, retry_after: int, message: str | None = None) -> None:
+        super().__init__(message, details={"retryAfter": retry_after}, headers={"Retry-After": str(retry_after)})
 
 
-def raise_for_provider_status(res: httpx.Response) -> None:
-    """Turns a provider's refusal of the key, or its rate limit, into a domain error.
+def raise_for_provider_status(res: httpx.Response, *, provider: str | None = None, model: str = "") -> None:
+    """Turns a provider's refusal of the key, or its rate limit, into a domain error. With `provider` (the user's own
+    provider), the rate limit is told in the provider's words: a 429 is also how OpenAI and Gemini say the account has
+    no credit or quota left, which waiting doesn't fix.
 
     Raises:
         AiKeyInvalidError: 401 or 403, or a 400 about the API key (Gemini's answer to a bad key).
@@ -52,7 +57,10 @@ def raise_for_provider_status(res: httpx.Response) -> None:
     if res.status_code == status.HTTP_400_BAD_REQUEST and "api key" in res.text.lower():
         raise AiKeyInvalidError()
     if res.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-        raise ModelRateLimitedError(_retry_after(res))
+        said = _provider_said(res)
+        logger.warning("AI provider rate limited", extra={"model": model or None, "error": said})
+        message = _provider_failed(provider, model, res.status_code, said) if provider is not None else None
+        raise ModelRateLimitedError(_retry_after(res), message)
 
 
 def _retry_after(res: httpx.Response) -> int:
@@ -82,6 +90,7 @@ class HttpModelClient:
         if endpoint.api_key:
             self._headers["Authorization"] = f"Bearer {endpoint.api_key}"
         self._model = endpoint.model
+        self._provider = endpoint.provider
         self._accepts_images = endpoint.accepts_images
         self._timeout = timeout_seconds
 
@@ -95,6 +104,9 @@ class HttpModelClient:
 
     async def complete(self, messages: list[ChatMessage]) -> str:
         """Returns the reply's text.
+
+        A user's own provider's failures are told with its name, and in its own words when it answered with an error:
+        what to do about them (add credit, pick another model, wait) is between the user and their provider.
 
         Raises:
             AiKeyInvalidError: The provider refused the key.
@@ -117,18 +129,37 @@ class HttpModelClient:
         except httpx.PoolTimeout as err:
             raise ServiceBusyError() from err
         except httpx.HTTPError as err:
-            logger.warning("model unreachable", extra={"url": self._url, "error": repr(err)})
-            raise ModelUnavailableError() from err
-        raise_for_provider_status(res)
+            logger.warning("model unreachable", extra={"url": self._url, "model": self._model, "error": repr(err)})
+            raise ModelUnavailableError(self._unreachable(err)) from err
+        raise_for_provider_status(res, provider=self._provider, model=self._model)
         try:
             data = res.json()
         except ValueError:
             data = None
         content = _content(data)
         if res.is_error or content is None:
-            logger.warning("model call failed", extra={"status": res.status_code, "error": _error_message(data)})
-            raise ModelUnavailableError()
+            said = _error_message(data)
+            logger.warning("model call failed", extra={"status": res.status_code, "model": self._model, "error": said})
+            message = None
+            if self._provider is not None:
+                message = (
+                    _provider_failed(self._provider, self._model, res.status_code, said)
+                    if res.is_error
+                    else f"Your AI provider ({self._provider}) sent an empty reply from {self._model}."
+                )
+            raise ModelUnavailableError(message)
         return content
+
+    def _unreachable(self, err: httpx.HTTPError) -> str | None:
+        """What the user is told when their provider didn't answer; None (the default message) for makable's own."""
+        if self._provider is None:
+            return None
+        if isinstance(err, httpx.TimeoutException):
+            return (
+                f"{self._model} at your AI provider ({self._provider}) didn't answer within {self._timeout:g} seconds."
+                " Try again, or pick another model."
+            )
+        return f"makable couldn't reach your AI provider ({self._provider}). Try again in a moment."
 
 
 def _content(data: object) -> str | None:
@@ -139,8 +170,25 @@ def _content(data: object) -> str | None:
 
 
 def _error_message(data: object) -> str | None:
+    """The provider's error message, on one line and cut to `MAX_PROVIDER_MESSAGE_CHARS`."""
     match data:
         # Gemini's OpenAI-compatible API wraps the error in a list.
         case {"error": {"message": str(message)}} | [{"error": {"message": str(message)}}, *_]:
-            return message[:500]
+            message = " ".join(message.split())
+            if len(message) > MAX_PROVIDER_MESSAGE_CHARS:
+                message = message[: MAX_PROVIDER_MESSAGE_CHARS - 1].rstrip() + "…"
+            return message or None
     return None
+
+
+def _provider_said(res: httpx.Response) -> str | None:
+    try:
+        return _error_message(res.json())
+    except ValueError:
+        return None
+
+
+def _provider_failed(provider: str, model: str, status_code: int, said: str | None) -> str:
+    if said is None:
+        return f"Your AI provider ({provider}) returned an error for {model} (HTTP {status_code})."
+    return f"Your AI provider ({provider}) returned an error for {model}: {said}"

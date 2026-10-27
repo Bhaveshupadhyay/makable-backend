@@ -40,6 +40,7 @@ from app.services.ai_runs import (
     create_config,
     edit_config,
     end_paused,
+    failure_summary,
     pause_kind,
     pause_value,
     prune,
@@ -309,7 +310,7 @@ class AiEditService:
         except Exception as err:
             code = err.code if isinstance(err, AppError) else type(err).__name__
             # A resumed run that fails ends too: the answer was saved with it, so its question doesn't come back.
-            await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=code)
+            await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=failure_summary(code, err))
             raise
         finally:
             await self._mark_refused(user, picked)

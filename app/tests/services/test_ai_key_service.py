@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 
+import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,7 +13,7 @@ from app.core.security import TokenCipher
 from app.repositories.ai_key import SqlAiKeyRepository
 from app.repositories.unit_of_work import SqlAlchemyUnitOfWork
 from app.schemas.ai_key import AiKeyCreate, ModelChoice, ModelEndpoint
-from app.services.ai_key_service import AiKeyService
+from app.services.ai_key_service import AiKeyService, AiModelNotEnabledError
 from app.tests.ai_edit_fixtures import USER
 from app.tests.fakes import VALID_AI_KEY, FakeAiProviders, FakeModelClient
 
@@ -67,3 +68,24 @@ async def test_a_refused_key_is_marked_invalid_unless_it_was_checked_since(sessi
 
     await service.key_refused(USER.id, key_id, since=utc_now())
     assert (await service.list_keys(USER.id))[0].status == AiKeyStatus.INVALID
+
+
+async def test_models_turned_on_before_they_were_hidden_arent_offered_or_used(session: AsyncSession) -> None:
+    built: list[str] = []
+    service = key_service(session, built)
+    added = await service.add_key(USER.id, new_key(AiProvider.GEMINI, ["gpt-5"]))
+    # Turned on when the provider's list still offered it.
+    row = await SqlAiKeyRepository(session).get(USER.id, added.key.id)
+    assert row is not None
+    row.models = ["antigravity-preview-05-2026", "gpt-5"]
+    await session.commit()
+
+    assert [o.model for o in await service.model_options(USER.id)] == ["gpt-5"]
+    assert (await service.list_keys(USER.id))[0].models == ["gpt-5"]
+    with pytest.raises(AiModelNotEnabledError):
+        await service.model_for(USER.id, ModelChoice(key_id=added.key.id, model="antigravity-preview-05-2026"))
+
+    model = await service.model_for(USER.id, ModelChoice(key_id=added.key.id, model="gpt-5"))
+    assert await model.complete([]) == "hi"
+    # Nothing to fall back to: the hidden model isn't one.
+    assert built == ["gpt-5"]

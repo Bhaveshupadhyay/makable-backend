@@ -11,7 +11,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Durability, StateSnapshot
 
 from app.agents.thread import RECURSION_LIMIT, RunResult
-from app.clients.fallback_model import FallbackModel, ModelSwitch
+from app.clients.fallback_model import FALLBACK_ERRORS, FallbackModel, ModelSwitch
 from app.clients.model import ModelClient
 from app.constants.ai_create import CREATE_THREAD_SUFFIX
 from app.constants.ai_edit import AiEditOutcome
@@ -124,3 +124,11 @@ class PickedModel:
 def switches_read(switches: list[ModelSwitch]) -> list[AiModelSwitch] | None:
     """The models a run switched from, as they're sent (None: it didn't switch)."""
     return [AiModelSwitch(failed=s.failed, reason=s.reason, model=s.model, message=s.message) for s in switches] or None
+
+
+def failure_summary(code: str, err: BaseException) -> str:
+    """What a failed request's record says: its error's code, and what a user's provider said when it failed the
+    request (the error's message, when it isn't the default one), so the record says why."""
+    if isinstance(err, FALLBACK_ERRORS) and err.message != type(err).message:
+        return f"{code}: {err.message}"
+    return code

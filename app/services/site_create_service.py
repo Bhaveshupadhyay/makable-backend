@@ -36,6 +36,7 @@ from app.services.ai_runs import (
     PickedModel,
     create_config,
     end_paused,
+    failure_summary,
     pause_value,
     prune,
     switches_read,
@@ -262,7 +263,7 @@ class SiteCreateService:
         return AiCreated(run_id=run_id, summary=result.get("summary", ""), commit_sha=result["commit_sha"], site=site)
 
     async def _failed(self, user: UserRead, request: AiCreateRequest, run: CreateRun, err: Exception) -> None:
-        summary = _error_body(err)["code"]
+        summary = failure_summary(_error_body(err)["code"], err)
         if isinstance(err, CreateFailedError):
             # Why the model's last reply was rejected, which the user's message doesn't say: kept with the request.
             summary = f"{summary}: {err}"

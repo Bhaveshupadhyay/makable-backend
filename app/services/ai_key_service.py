@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import status
 
-from app.clients.ai_providers import AiProviderClient, model_accepts_images, provider_endpoint
+from app.clients.ai_providers import AiProviderClient, is_chat_model, model_accepts_images, provider_endpoint
 from app.clients.fallback_model import FallbackModelClient, ModelCandidate, ModelSwitch
 from app.clients.model import AiKeyInvalidError, ModelClient
 from app.constants.ai_keys import KEY_HINT_CHARS, PROVIDERS, AiKeyStatus, AiProvider
@@ -78,7 +78,7 @@ class AiKeyService:
         return [AiProviderRead(id=p, name=spec.name, keys_url=spec.keys_url) for p, spec in PROVIDERS.items()]
 
     async def list_keys(self, user_id: UUID) -> list[AiKeyRead]:
-        return [AiKeyRead.model_validate(k) for k in await self._keys.list_for_user(user_id)]
+        return [_read(k) for k in await self._keys.list_for_user(user_id)]
 
     async def add_key(self, user_id: UUID, data: AiKeyCreate) -> AiKeyChecked:
         """Checks the key with the provider and keeps it, replacing the user's key for that provider. Only models
@@ -109,7 +109,7 @@ class AiKeyService:
                 models=[m for m in wanted if m in usable],
             )
         )
-        result = AiKeyChecked(key=AiKeyRead.model_validate(key), available_models=available)
+        result = AiKeyChecked(key=_read(key), available_models=available)
         await self._uow.commit()
         return result
 
@@ -120,7 +120,7 @@ class AiKeyService:
             AiKeyNotFoundError: The user has no such key.
         """
         key = await self._get(user_id, key_id)
-        result = AiKeyRead.model_validate(await self._keys.set_models(key, data.models))
+        result = _read(await self._keys.set_models(key, data.models))
         await self._uow.commit()
         return result
 
@@ -146,7 +146,7 @@ class AiKeyService:
             usable = set(available)
             key = await self._keys.set_models(key, [m for m in key.models if m in usable])
         key = await self._keys.set_status(key, AiKeyStatusUpdate(status=key_status, checked_at=utc_now()))
-        result = AiKeyChecked(key=AiKeyRead.model_validate(key), available_models=available)
+        result = AiKeyChecked(key=_read(key), available_models=available)
         await self._uow.commit()
         return result
 
@@ -172,7 +172,7 @@ class AiKeyService:
             if key.status == AiKeyStatus.VALID:
                 options += [
                     AiModelOption(key_id=key.id, provider=key.provider, model=m, accepts_images=model_accepts_images(m))
-                    for m in key.models
+                    for m in _chat_models(key)
                 ]
         return options
 
@@ -206,12 +206,12 @@ class AiKeyService:
                 raise AiKeyNotFoundError()
             if key.status == AiKeyStatus.INVALID:
                 raise AiKeyInvalidError()
-            if choice.model not in key.models:
+            if choice.model not in _chat_models(key):
                 raise AiModelNotEnabledError()
             others = [k for k in keys if k.id != key.id and k.status == AiKeyStatus.VALID]
             picks = [
-                *((key, model) for model in key.models if model != choice.model),
-                *((other, model) for other in others for model in other.models),
+                *((key, model) for model in _chat_models(key) if model != choice.model),
+                *((other, model) for other in others for model in _chat_models(other)),
             ]
             fallbacks = [ModelCandidate(self._connect(k.provider, k.api_key, model), k.id) for k, model in picks]
             pick = self._connect(key.provider, key.api_key, choice.model)()
@@ -240,3 +240,13 @@ class AiKeyService:
         if key is None:
             raise AiKeyNotFoundError()
         return key
+
+
+def _read(key: AiKey) -> AiKeyRead:
+    return AiKeyRead.model_validate(key).model_copy(update={"models": _chat_models(key)})
+
+
+def _chat_models(key: AiKey) -> list[str]:
+    """The key's enabled models that can chat: one turned on before `NOT_CHAT_MODEL` knew it isn't offered or used.
+    The key's next check drops it from the list."""
+    return [m for m in key.models if is_chat_model(m)]

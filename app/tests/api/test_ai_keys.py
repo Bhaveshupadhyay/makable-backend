@@ -209,6 +209,7 @@ def test_an_edit_uses_the_picked_model_with_the_users_key(client: TestClient, mo
         base_url="https://api.anthropic.com/v1",
         api_key=VALID_AI_KEY,
         model="gpt-5",
+        provider="Anthropic",
         headers={"x-api-key": VALID_AI_KEY, "anthropic-version": "2023-06-01"},
         accepts_images=True,
     )

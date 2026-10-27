@@ -5,7 +5,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from app.clients.ai_providers import AiProviderError, HttpAiProviderClient, model_accepts_images
+from app.clients.ai_providers import AiProviderError, HttpAiProviderClient, model_accepts_images, provider_endpoint
 from app.clients.model import AiKeyInvalidError, ModelRateLimitedError
 from app.constants.ai_keys import AiProvider
 
@@ -124,3 +124,35 @@ async def test_an_unreachable_provider_is_a_provider_error() -> None:
 
     with pytest.raises(AiProviderError):
         await client(handler).list_models(AiProvider.MISTRAL, "key")
+
+
+async def test_models_their_chat_api_refuses_arent_listed() -> None:
+    listed = models(
+        "models/gemini-3.5-flash",
+        "models/antigravity-preview-05-2026",
+        "models/deep-research-max-preview-04-2026",
+        "models/gemini-2.5-computer-use-preview-10-2025",
+        "models/gemini-3.8-live",
+        "models/gemini-3.1-flash-live-preview",
+        "models/gemini-robotics-er-2-streaming-preview",
+        "models/lyria-3.5",
+        "models/nano-banana-pro-preview",
+        "gpt-5.3-codex",
+        "gpt-live-1",
+        "gpt-5",
+    )
+    result = await client(lambda _: listed).list_models(AiProvider.GEMINI, "key")
+    assert result == ["gemini-3.5-flash", "gpt-5"]
+
+
+async def test_openrouter_keeps_codex_models_it_serves_through_chat() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/key"):
+            return httpx.Response(200, json={"data": {}})
+        return models("openai/gpt-5-codex", "openai/gpt-5")
+
+    assert await client(handler).list_models(AiProvider.OPENROUTER, "sk-or") == ["openai/gpt-5", "openai/gpt-5-codex"]
+
+
+def test_a_users_model_is_called_with_its_providers_name() -> None:
+    assert provider_endpoint(AiProvider.GEMINI, "key", "gemini-3.5-flash").provider == "Google Gemini"

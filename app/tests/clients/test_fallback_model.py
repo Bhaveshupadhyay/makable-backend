@@ -66,7 +66,7 @@ async def test_the_pick_answers_when_it_works() -> None:
     "error", [ModelUnavailableError(), ModelRateLimitedError(30), AiKeyInvalidError()], ids=lambda e: e.code
 )
 async def test_a_failing_model_switches_to_the_next_and_the_run_keeps_it(error: Exception) -> None:
-    pick = FakeModelClient(error, name="gemini-antigravity")
+    pick = FakeModelClient(error, name="gemini-3.8-flash")
     other = FakeModelClient("first", "second", name="gemini-2.5-flash")
     heard: list[ModelSwitch] = []
     model = fallback(pick, other, on_switch=heard.append)
@@ -76,7 +76,7 @@ async def test_a_failing_model_switches_to_the_next_and_the_run_keeps_it(error: 
     assert await model.complete(MESSAGES) == "second"
     assert len(pick.calls) == 1
     assert model.name == "gemini-2.5-flash"
-    switch = ModelSwitch(failed="gemini-antigravity", reason=getattr(error, "code", ""), model="gemini-2.5-flash")
+    switch = ModelSwitch(failed="gemini-3.8-flash", reason=getattr(error, "code", ""), model="gemini-2.5-flash")
     assert model.switches == heard == [switch]
 
 

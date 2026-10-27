@@ -17,7 +17,7 @@ from app.tests.fakes import FakeModelClient, FakeModelSource
 from app.tests.services.test_site_create import NEW, PROMPT, collect, replies, result_of
 
 PICKED_KEY = UUID("11111111-2222-4333-8444-555555555555")
-PICK = {"keyId": str(PICKED_KEY), "model": "gemini-antigravity"}
+PICK = {"keyId": str(PICKED_KEY), "model": "gemini-3.8-flash"}
 
 
 async def records(session: AsyncSession) -> list[AiEditRecord]:
@@ -28,7 +28,7 @@ async def records(session: AsyncSession) -> list[AiEditRecord]:
 async def test_an_edit_goes_on_with_the_next_model_and_says_so(
     ai_edit_service: MakeAiEditService, session: AsyncSession
 ) -> None:
-    picked = FakeModelClient(ModelUnavailableError(), name="gemini-antigravity")
+    picked = FakeModelClient(ModelUnavailableError(), name="gemini-3.8-flash")
     service = ai_edit_service(FakeModelSource(picked, FakeModelClient(GOOD_REPLY, name="gemini-2.5-flash")))
 
     waiting = await service.edit(USER, make_request(model=PICK))
@@ -36,10 +36,10 @@ async def test_an_edit_goes_on_with_the_next_model_and_says_so(
     assert isinstance(waiting, AiEditAwaitingResult)
     assert waiting.model_switches == [
         AiModelSwitch(
-            failed="gemini-antigravity",
+            failed="gemini-3.8-flash",
             reason="ai_unavailable",
             model="gemini-2.5-flash",
-            message="gemini-antigravity isn't answering, so gemini-2.5-flash is taking over.",
+            message="gemini-3.8-flash isn't answering, so gemini-2.5-flash is taking over.",
         )
     ]
     applied = await confirm(service, waiting)
@@ -77,6 +77,31 @@ async def test_when_every_model_fails_the_picks_error_is_raised_and_recorded(
     assert err.value is picked
     [record] = await records(session)
     assert (record.outcome, record.summary) == (AiEditOutcome.FAILED, "ai_rate_limited")
+
+
+async def test_what_a_users_provider_said_is_kept_with_the_failed_request(
+    ai_edit_service: MakeAiEditService, session: AsyncSession
+) -> None:
+    said = "Your AI provider (OpenAI) returned an error for gpt-5: You have no credits remaining."
+    source = FakeModelSource(FakeModelClient(ModelRateLimitedError(30, said)))
+
+    with pytest.raises(ModelRateLimitedError):
+        await ai_edit_service(source).edit(USER, make_request(model=PICK))
+
+    [record] = await records(session)
+    assert record.summary == f"ai_rate_limited: {said}"
+
+
+async def test_a_failed_creation_keeps_what_the_provider_said(ai_services: AiServices, session: AsyncSession) -> None:
+    said = "Your AI provider (Google Gemini) returned an error for gemini-3.8-flash: This model is busy."
+    source = FakeModelSource(FakeModelClient(ModelUnavailableError(said)))
+    request = AiCreateRequest.model_validate({"projectId": str(NEW), "prompt": PROMPT, "model": PICK})
+
+    events = await collect(await ai_services.create(source).create(USER, request))
+
+    assert events[-1] == {"type": "error", "error": {"code": "ai_unavailable", "message": said, "details": None}}
+    [record] = await records(session)
+    assert record.summary == f"ai_unavailable: {said}"
 
 
 async def test_a_creation_tells_the_browser_when_it_switches(ai_services: AiServices) -> None:
