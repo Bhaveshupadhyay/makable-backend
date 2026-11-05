@@ -2,6 +2,7 @@
 
 from app.agents.create_site.state import PlannedFile
 from app.agents.create_site.tools.brief import brief_block
+from app.agents.create_site.tools.checks import exported_names
 from app.agents.create_site.tools.outline import outline
 from app.agents.thread import QuestionAnswer
 from app.constants.ai_create import MAX_CREATE_FILES, WRITTEN_SHOWN_CHARS
@@ -88,7 +89,8 @@ def _answers(brief: list[QuestionAnswer]) -> str:
 
 def _written(written: dict[str, str]) -> str:
     """The files written earlier, in the order they were written: whole while they fit in `WRITTEN_SHOWN_CHARS` in all,
-    the others as their outline (what the next files need to use them right). Empty before the first file."""
+    the others as their outline (what the next files need to use them right) and the names they export, which stay
+    there when the outline is cut. Empty before the first file."""
     left = WRITTEN_SHOWN_CHARS
     shown: list[str] = []
     outlined = False
@@ -98,7 +100,9 @@ def _written(written: dict[str, str]) -> str:
             shown.append(f'<file path="{path}">\n{code}</file>')
         else:
             outlined = True
-            shown.append(f'<file path="{path}" outline="true">\n{outline(path, code)}\n</file>')
+            exports = ", ".join(sorted(exported_names(code)))
+            names = f' exports="{exports}"' if exports else ""
+            shown.append(f'<file path="{path}" outline="true"{names}>\n{outline(path, code)}\n</file>')
     if not shown:
         return ""
     note = (

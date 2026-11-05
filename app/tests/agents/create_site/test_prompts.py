@@ -41,7 +41,7 @@ def test_a_file_past_what_fits_is_shown_as_its_outline(monkeypatch: pytest.Monke
 
     # data.ts doesn't fit, so it's outlined; Schedule.tsx, written after it, still fits whole.
     assert (
-        '<file path="src/data.ts" outline="true">\n'
+        '<file path="src/data.ts" outline="true" exports="classes">\n'
         "export const classes = [{ title: 'WOD', coach: 'Ada' }, /* …199 more */]\n"
         "</file>"
     ) in prompt

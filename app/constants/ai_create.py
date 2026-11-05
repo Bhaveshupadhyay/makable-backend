@@ -32,10 +32,12 @@ MAX_PLAN_ATTEMPTS = 2
 REJECTED_LINE_CHARS = 200
 # Files the model wrote earlier in the run are shown whole to the next ones, in the order they were written, while
 # they fit in this many characters in all (about 20K tokens: most sites fit); the others as an outline (their types,
-# components' props and each list's first item: `tools/outline.py`), at most `MAX_OUTLINE_CHARS` each, with an
-# object's first `OUTLINE_OBJECT_KEYS` keys and values cut after `OUTLINE_VALUE_CHARS`.
+# components' props and each list's first item: `tools/outline.py`), at most `MAX_OUTLINE_CHARS` each, each of its
+# declarations cut after `MAX_OUTLINE_ENTRY_CHARS` (one long type doesn't push out the rest), with an object's first
+# `OUTLINE_OBJECT_KEYS` keys and values cut after `OUTLINE_VALUE_CHARS`.
 WRITTEN_SHOWN_CHARS = 80_000
 MAX_OUTLINE_CHARS = 4_000
+MAX_OUTLINE_ENTRY_CHARS = 1_000
 OUTLINE_OBJECT_KEYS = 20
 OUTLINE_VALUE_CHARS = 80
 

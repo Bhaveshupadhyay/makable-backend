@@ -8,7 +8,12 @@ from app.agents.create_site.tools.names import NameChat, NameGiven, mentions, pa
 from app.agents.create_site.tools.outline import outline
 from app.agents.create_site.tools.plan import parse_plan
 from app.agents.thread import QuestionAnswer
-from app.constants.ai_create import MAX_OUTLINE_CHARS, OUTLINE_VALUE_CHARS, REJECTED_LINE_CHARS
+from app.constants.ai_create import (
+    MAX_OUTLINE_CHARS,
+    MAX_OUTLINE_ENTRY_CHARS,
+    OUTLINE_VALUE_CHARS,
+    REJECTED_LINE_CHARS,
+)
 from app.schemas.ai_edit import ModelQuestion
 
 
@@ -225,16 +230,33 @@ def test_an_outline_has_the_props_of_the_components_not_their_markup() -> None:
 
 
 def test_an_outline_of_a_stylesheet_has_its_selectors_and_custom_properties() -> None:
-    css = '@import "tailwindcss";\n\n:root {\n  --accent: #dc2626;\n  color: red;\n}\n\n.btn:hover {\n  color: blue;\n}'
+    css = (
+        '@import "tailwindcss";\n\n:root {\n  --accent: #dc2626;\n  color: red;\n}\n\n.btn:hover {\n  color: blue;\n}\n'
+        "@media (min-width: 640px) {\n  .card {\n    padding: 2rem;\n  }\n}"
+    )
 
-    assert outline("src/index.css", css) == '@import "tailwindcss";\n:root {\n  --accent: #dc2626;\n.btn:hover {'
+    assert outline("src/index.css", css) == (
+        '@import "tailwindcss";\n:root {\n  --accent: #dc2626;\n.btn:hover {\n@media (min-width: 640px) {\n  .card {'
+    )
 
 
-def test_a_long_outline_is_cut_at_a_line() -> None:
+def test_a_long_outline_keeps_what_fits_and_counts_the_rest() -> None:
     types = "".join(f"export interface T{i} {{ field: string }}\n" for i in range(400))
 
     lines = outline("src/types.ts", types).split("\n")
 
     assert sum(len(line) + 1 for line in lines[:-1]) <= MAX_OUTLINE_CHARS
     assert lines[-2].startswith("export interface T")
-    assert lines[-1] == f"⟪cut: {400 - (len(lines) - 1)} more lines⟫"
+    assert lines[-1] == f"⟪cut: {400 - (len(lines) - 1)} more declarations⟫"
+
+
+def test_a_long_type_is_cut_without_pushing_out_what_comes_after_it() -> None:
+    fields = "".join(f"  field{i}: string\n" for i in range(400))
+    code = f"interface BigProps {{\n{fields}}}\nexport function Big({{ field0 }}: BigProps) {{\n  return <p />\n}}\n"
+
+    shown = outline("src/components/Big.tsx", code)
+
+    head, _, rest = shown.partition("⟪cut: ")
+    assert head.startswith("interface BigProps {\n  field0: string\n")
+    assert len(head) <= MAX_OUTLINE_ENTRY_CHARS
+    assert rest.endswith("more characters⟫\nexport function Big({ field0 }: BigProps) { … }")

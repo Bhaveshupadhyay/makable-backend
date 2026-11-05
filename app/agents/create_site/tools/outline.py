@@ -5,7 +5,12 @@ import re
 
 from tree_sitter import Node, Parser
 
-from app.constants.ai_create import MAX_OUTLINE_CHARS, OUTLINE_OBJECT_KEYS, OUTLINE_VALUE_CHARS
+from app.constants.ai_create import (
+    MAX_OUTLINE_CHARS,
+    MAX_OUTLINE_ENTRY_CHARS,
+    OUTLINE_OBJECT_KEYS,
+    OUTLINE_VALUE_CHARS,
+)
 from app.utils.syntax_check import script_language
 
 # Shown whole, exported or not: they're the shapes other files use (a component's props are usually a local interface).
@@ -16,13 +21,13 @@ _VARIABLES = frozenset({"lexical_declaration", "variable_declaration"})
 _FUNCTION_VALUES = frozenset({"arrow_function", "function_expression", "function", "generator_function"})
 _BLOCKS = frozenset({"statement_block", "class_body"})
 _STRINGS = frozenset({"string", "template_string"})
-# A stylesheet's imports, at-rules and selectors, and its custom properties (`--accent: #dc2626;`), which the
-# components use in classes like `bg-(--accent)`.
-_CSS_OUTLINE = re.compile(r"^\s*(?:@[\w-]+|--[\w-]+\s*:)|^[^\s{}][^{}]*\{")
+# A stylesheet's imports, at-rules and selectors (also the ones nested in `@media`), and its custom properties
+# (`--accent: #dc2626;`), which the components use in classes like `bg-(--accent)`.
+_CSS_OUTLINE = re.compile(r"^\s*(?:@[\w-]+|--[\w-]+\s*:|[^\s{}][^{}]*\{)")
 
 
 def outline(path: str, code: str) -> str:
-    """The outline of a script or a stylesheet, cut after `MAX_OUTLINE_CHARS` (at a line).
+    """The outline of a script or a stylesheet, at most about `MAX_OUTLINE_CHARS`.
 
     A script's: its types whole, its exported functions, components and classes as their signatures (`{ … }` for the
     body), and its exported data with each list's first item (`/* …N more */` for the rest) and long values cut.
@@ -31,20 +36,41 @@ def outline(path: str, code: str) -> str:
     language = script_language(path)
     if language is None:
         lines = [line.rstrip() for line in code.split("\n") if _CSS_OUTLINE.search(line)]
-    else:
-        lines = _script_outline(Parser(language).parse(code.encode()).root_node)
+        return _fit(lines, "lines")
+    return _fit(_script_outline(Parser(language).parse(code.encode()).root_node), "declarations")
+
+
+def _fit(entries: list[str], noun: str) -> str:
+    """The entries that fit in `MAX_OUTLINE_CHARS`, in order, each cut after `MAX_OUTLINE_ENTRY_CHARS` first, so a
+    long one doesn't push out what comes after it. The ones that don't fit are counted at the end."""
     kept: list[str] = []
-    size = 0
-    for index, line in enumerate(lines):
-        size += len(line) + 1
-        if size > MAX_OUTLINE_CHARS:
-            kept.append(f"⟪cut: {len(lines) - index} more lines⟫")
-            break
-        kept.append(line)
+    left = MAX_OUTLINE_CHARS
+    dropped = 0
+    for entry in map(_shorten, entries):
+        if len(entry) + 1 > left:
+            dropped += 1
+            continue
+        left -= len(entry) + 1
+        kept.append(entry)
+    if dropped:
+        kept.append(f"⟪cut: {dropped} more {noun}⟫")
     return "\n".join(kept)
 
 
+def _shorten(entry: str) -> str:
+    """An entry cut after `MAX_OUTLINE_ENTRY_CHARS`, at a line when it has several (a long interface keeps its first
+    fields)."""
+    if len(entry) <= MAX_OUTLINE_ENTRY_CHARS:
+        return entry
+    head = entry[:MAX_OUTLINE_ENTRY_CHARS]
+    if "\n" in head:
+        head = head[: head.rindex("\n")]
+    marker = f"⟪cut: {len(entry) - len(head)} more characters⟫"
+    return f"{head}\n{marker}" if "\n" in entry else f"{head} {marker}"
+
+
 def _script_outline(root: Node) -> list[str]:
+    """A script's outline, one entry per declaration (a type can take several lines)."""
     exported = _exported_by_name(root)
     lines: list[str] = []
     for node in root.named_children:
@@ -76,6 +102,7 @@ def _exported_by_name(root: Node) -> set[str]:
 
 
 def _export(node: Node) -> list[str]:
+    """An `export` statement: its declaration's outline, `export default <value>;`, or the statement on one line."""
     prefix = "export default " if any(child.type == "default" for child in node.children) else "export "
     for child in node.named_children:
         if child.type in _TYPES | _FUNCTIONS | _CLASSES | _VARIABLES:
@@ -86,6 +113,8 @@ def _export(node: Node) -> list[str]:
 
 
 def _declaration(node: Node, prefix: str) -> list[str]:
+    """A declaration after `prefix` (`export `, `export default ` or nothing): a type whole, a function or class as its
+    signature, and one entry per variable it declares."""
     if node.type in _TYPES:
         return [prefix + _text(node)]
     if node.type in _VARIABLES:
@@ -95,6 +124,7 @@ def _declaration(node: Node, prefix: str) -> list[str]:
 
 
 def _declared_names(node: Node) -> set[str]:
+    """The names a top-level function, class or variable declaration declares (none for other statements)."""
     if node.type in _FUNCTIONS | _CLASSES:
         name = node.child_by_field_name("name")
         return {_text(name)} if name is not None else set()
