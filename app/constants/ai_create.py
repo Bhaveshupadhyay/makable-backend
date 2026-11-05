@@ -30,8 +30,14 @@ MAX_PLAN_ATTEMPTS = 2
 # How much of the line that doesn't parse a file's rejection quotes (with the error alone, the model sends the same
 # file back).
 REJECTED_LINE_CHARS = 200
-# Files the model wrote earlier in the run are shown whole to the next ones up to this size, else as an outline.
-SHOWN_WHOLE_CHARS = 5_000
+# Files the model wrote earlier in the run are shown whole to the next ones, in the order they were written, while
+# they fit in this many characters in all (about 20K tokens: most sites fit); the others as an outline (their types,
+# components' props and each list's first item: `tools/outline.py`), at most `MAX_OUTLINE_CHARS` each, with an
+# object's first `OUTLINE_OBJECT_KEYS` keys and values cut after `OUTLINE_VALUE_CHARS`.
+WRITTEN_SHOWN_CHARS = 80_000
+MAX_OUTLINE_CHARS = 4_000
+OUTLINE_OBJECT_KEYS = 20
+OUTLINE_VALUE_CHARS = 80
 
 # npm packages the site may import: what the starter's package.json has (the preview fetches each from a CDN).
 ALLOWED_PACKAGES = frozenset({"react", "react-dom", "react-dom/client", "react/jsx-runtime", "lucide-react"})

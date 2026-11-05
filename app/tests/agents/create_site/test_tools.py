@@ -5,9 +5,10 @@ from app.agents.create_site.tools.brief import BriefReady, answered, brief_block
 from app.agents.create_site.tools.checks import check_site, exported_names, lucide_icons
 from app.agents.create_site.tools.code import extract_code
 from app.agents.create_site.tools.names import NameChat, NameGiven, mentions, parse_name_reply, same_name, suggest_name
+from app.agents.create_site.tools.outline import outline
 from app.agents.create_site.tools.plan import parse_plan
 from app.agents.thread import QuestionAnswer
-from app.constants.ai_create import REJECTED_LINE_CHARS
+from app.constants.ai_create import MAX_OUTLINE_CHARS, OUTLINE_VALUE_CHARS, REJECTED_LINE_CHARS
 from app.schemas.ai_edit import ModelQuestion
 
 
@@ -172,3 +173,68 @@ def test_a_rejected_file_quotes_the_line_around_its_error() -> None:
     quoted = _line_at(long, long.index("(]"))
     assert "(];" in quoted
     assert len(quoted) <= REJECTED_LINE_CHARS
+
+
+def test_an_outline_has_the_shape_of_the_data() -> None:
+    data = (
+        "export interface Day { day: string; classes: Item[] }\n"
+        "interface Item { title: string; coach: string }\n"
+        "export const schedule: Day[] = [\n"
+        "  { day: 'Monday', classes: [{ title: 'WOD', coach: 'Ada' }, { title: 'Lift', coach: 'Bo' }] },\n"
+        "  { day: 'Tuesday', classes: [] },\n"
+        "];\n"
+        f"export const coaches = [{{ name: 'Ada', bio: '{'x' * 200}' }}];\n"
+        "export const levels = ['easy', 'hard'] as const;\n"
+    )
+
+    assert outline("src/data.ts", data) == (
+        "export interface Day { day: string; classes: Item[] }\n"
+        "interface Item { title: string; coach: string }\n"
+        "export const schedule: Day[] = [{ day: 'Monday', classes: [{ title: 'WOD', coach: 'Ada' }, /* …1 more */] }, "
+        "/* …1 more */]\n"
+        # A long string is cut, keeping its quote.
+        f"export const coaches = [{{ name: 'Ada', bio: '{'x' * (OUTLINE_VALUE_CHARS - 3)}…' }}]\n"
+        "export const levels = ['easy', /* …1 more */] as const"
+    )
+
+
+def test_an_outline_has_the_props_of_the_components_not_their_markup() -> None:
+    component = (
+        "import { useState } from 'react'\n"
+        "interface ScheduleProps {\n  isOpen: boolean\n  onClose: () => void\n}\n"
+        "const days = ['mon', 'tue']\n"
+        "export function Schedule({ isOpen, onClose }: ScheduleProps) {\n"
+        "  const [day, setDay] = useState('mon')\n"
+        "  return <section>{days.map((d) => <p key={d}>{d}</p>)}</section>\n"
+        "}\n"
+        "const Badge = ({ label }: { label: string }) => <span>{label}</span>\n"
+        "export default Badge\n"
+        "export const Card = memo(({ name }: { name: string }) => <p>{name}</p>)\n"
+        "export { Card as Tile }\n"
+    )
+
+    # The local props interface and Badge (exported further down) are there; the imports and `days` aren't.
+    assert outline("src/components/Schedule.tsx", component) == (
+        "interface ScheduleProps {\n  isOpen: boolean\n  onClose: () => void\n}\n"
+        "export function Schedule({ isOpen, onClose }: ScheduleProps) { … }\n"
+        "const Badge = ({ label }: { label: string }) => …\n"
+        "export default Badge;\n"
+        "export const Card = memo(({ name }: { name: string }) => …)\n"
+        "export { Card as Tile }"
+    )
+
+
+def test_an_outline_of_a_stylesheet_has_its_selectors_and_custom_properties() -> None:
+    css = '@import "tailwindcss";\n\n:root {\n  --accent: #dc2626;\n  color: red;\n}\n\n.btn:hover {\n  color: blue;\n}'
+
+    assert outline("src/index.css", css) == '@import "tailwindcss";\n:root {\n  --accent: #dc2626;\n.btn:hover {'
+
+
+def test_a_long_outline_is_cut_at_a_line() -> None:
+    types = "".join(f"export interface T{i} {{ field: string }}\n" for i in range(400))
+
+    lines = outline("src/types.ts", types).split("\n")
+
+    assert sum(len(line) + 1 for line in lines[:-1]) <= MAX_OUTLINE_CHARS
+    assert lines[-2].startswith("export interface T")
+    assert lines[-1] == f"⟪cut: {400 - (len(lines) - 1)} more lines⟫"
