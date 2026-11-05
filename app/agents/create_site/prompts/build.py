@@ -3,8 +3,9 @@
 from app.agents.create_site.state import PlannedFile
 from app.agents.create_site.tools.brief import brief_block
 from app.agents.create_site.tools.checks import exported_names
+from app.agents.create_site.tools.outline import outline
 from app.agents.thread import QuestionAnswer
-from app.constants.ai_create import MAX_CREATE_FILES, SHOWN_WHOLE_CHARS
+from app.constants.ai_create import MAX_CREATE_FILES, WRITTEN_SHOWN_CHARS
 
 
 def plan_prompt(prompt: str, name: str, brief: list[QuestionAnswer]) -> str:
@@ -38,8 +39,7 @@ def write_prompt(
     base: dict[str, str],
 ) -> str:
     planned = "\n".join(f"- {f['path']}: {f['purpose']}" for f in plan)
-    shown = "\n\n".join(_show(path, code) for path, code in written.items())
-    context = f"<files_written>\n{shown}\n</files_written>\n\n" if shown else ""
+    context = _written(written)
     css = (
         "" if "src/index.css" in written else f'<file path="src/index.css">\n{base.get("src/index.css", "")}</file>\n\n'
     )
@@ -56,7 +56,8 @@ def write_prompt(
 {context}{css}Write {file["path"]}: {file["purpose"]}
 
 {_name_rule(name)} Reply with the complete file in one ``` code block and nothing else. Import only files from the \
-plan (with the names they export), react, and lucide-react icons."""
+plan (with the names they export), react, and lucide-react icons. Use the files written as they are: give a \
+component the props its signature takes, and read data with the fields and shape it has."""
 
 
 def fix_prompt(path: str, code: str, problems: list[str]) -> str:
@@ -86,9 +87,28 @@ def _answers(brief: list[QuestionAnswer]) -> str:
     return f"\n{block}" if block else ""
 
 
-def _show(path: str, code: str) -> str:
-    """A file written earlier: whole when it's short, else what it exports (what later files can import)."""
-    if len(code) <= SHOWN_WHOLE_CHARS:
-        return f'<file path="{path}">\n{code}</file>'
-    exports = ", ".join(sorted(exported_names(code))) or "nothing"
-    return f'<file path="{path}" exports="{exports}" />'
+def _written(written: dict[str, str]) -> str:
+    """The files written earlier, in the order they were written: whole while they fit in `WRITTEN_SHOWN_CHARS` in all,
+    the others as their outline (what the next files need to use them right) and the names they export, which stay
+    there when the outline is cut. Empty before the first file."""
+    left = WRITTEN_SHOWN_CHARS
+    shown: list[str] = []
+    outlined = False
+    for path, code in written.items():
+        if len(code) <= left:
+            left -= len(code)
+            shown.append(f'<file path="{path}">\n{code}</file>')
+        else:
+            outlined = True
+            exports = ", ".join(sorted(exported_names(code)))
+            names = f' exports="{exports}"' if exports else ""
+            shown.append(f'<file path="{path}" outline="true"{names}>\n{outline(path, code)}\n</file>')
+    if not shown:
+        return ""
+    note = (
+        "A file with outline=\"true\" is too long to show whole: it has the file's types, its components' props and "
+        "the first item of each list (/* …N more */ stands for the rest).\n\n"
+        if outlined
+        else ""
+    )
+    return "<files_written>\n" + "\n\n".join(shown) + "\n</files_written>\n\n" + note

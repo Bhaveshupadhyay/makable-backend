@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterator
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -90,6 +91,17 @@ async def test_verify_accepts_a_valid_token_and_caches_the_keys(
     assert claims.sub == sub
     assert len(recorder.requests) == 1
     assert recorder.requests[0].headers["apikey"] == "sb_publishable_test"
+
+
+async def test_the_first_verify_fetches_the_keys_right_after_a_boot(
+    client: HttpSupabaseAuthClient, recorder: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Monotonic time counts from the machine's boot (a fresh CI runner, a restarted server): it can be under a minute.
+    monkeypatch.setattr(supabase_module, "time", SimpleNamespace(monotonic=lambda: 5.0))
+
+    await client.verify(sign())
+
+    assert len(recorder.requests) == 1
 
 
 @pytest.mark.parametrize(
