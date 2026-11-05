@@ -131,3 +131,114 @@ async def test_a_message_with_a_picture_is_sent_as_content_parts() -> None:
             "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:x"}}],
         }
     ]
+
+
+def users_model(handler: Callable[[httpx.Request], httpx.Response]) -> HttpModelClient:
+    """A model on a user's own key: its provider is named in its errors."""
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    endpoint = ModelEndpoint(base_url=URL, api_key="k", model="gemini-3.5-flash", provider="Google Gemini")
+    return HttpModelClient(http, endpoint, timeout_seconds=90)
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (
+            httpx.Response(400, json=[{"error": {"message": "This model only supports Interactions API."}}]),
+            "Your AI provider (Google Gemini) returned an error for gemini-3.5-flash: This model only supports "
+            "Interactions API.",
+        ),
+        (
+            httpx.Response(402, json={"error": {"message": "This request requires\n  more credits."}}),
+            "Your AI provider (Google Gemini) returned an error for gemini-3.5-flash: This request requires more "
+            "credits.",
+        ),
+        (
+            httpx.Response(503, text="<html>down</html>"),
+            "Your AI provider (Google Gemini) returned an error for gemini-3.5-flash (HTTP 503).",
+        ),
+        (
+            httpx.Response(200, json={"choices": [{"message": {"content": None}}]}),
+            "Your AI provider (Google Gemini) sent an empty reply from gemini-3.5-flash.",
+        ),
+    ],
+)
+async def test_a_users_provider_error_is_told_in_its_own_words(response: httpx.Response, message: str) -> None:
+    with pytest.raises(ModelUnavailableError) as err:
+        await users_model(lambda _: response).complete(MESSAGES)
+    assert err.value.message == message
+
+
+async def test_a_long_provider_message_is_cut() -> None:
+    response = httpx.Response(500, json={"error": {"message": "x" * 1000}})
+    with pytest.raises(ModelUnavailableError) as err:
+        await users_model(lambda _: response).complete(MESSAGES)
+    assert err.value.message.endswith("x…")
+    assert len(err.value.message) < 500
+
+
+async def test_a_users_provider_out_of_quota_says_so_and_keeps_the_wait() -> None:
+    said = "You have no credits remaining. Add credits to continue using the API."
+    response = httpx.Response(429, headers={"retry-after": "12"}, json={"error": {"message": said}})
+    with pytest.raises(ModelRateLimitedError) as err:
+        await users_model(lambda _: response).complete(MESSAGES)
+    assert err.value.message == f"Your AI provider (Google Gemini) returned an error for gemini-3.5-flash: {said}"
+    assert err.value.details == {"retryAfter": 12}
+
+
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        (
+            httpx.ReadTimeout(""),
+            "gemini-3.5-flash at your AI provider (Google Gemini) didn't answer within 90 seconds. Try again, or pick "
+            "another model.",
+        ),
+        (
+            httpx.ConnectError("refused"),
+            "makable couldn't reach your AI provider (Google Gemini). Try again in a moment.",
+        ),
+    ],
+)
+async def test_a_users_provider_that_doesnt_answer_is_named(raised: httpx.HTTPError, message: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise raised
+
+    with pytest.raises(ModelUnavailableError) as err:
+        await users_model(handler).complete(MESSAGES)
+    assert err.value.message == message
+
+
+async def test_makables_own_model_keeps_the_general_messages() -> None:
+    error = httpx.Response(400, json={"error": {"message": "OmniRoute: no route for auto"}})
+    with pytest.raises(ModelUnavailableError) as err:
+        await client(lambda _: error).complete(MESSAGES)
+    assert err.value.message == ModelUnavailableError.message
+
+    limited = httpx.Response(429, json={"error": {"message": "slow down"}})
+    with pytest.raises(ModelRateLimitedError) as rate_limited:
+        await client(lambda _: limited).complete(MESSAGES)
+    assert rate_limited.value.message == ModelRateLimitedError.message
+
+
+@pytest.mark.parametrize("status_code", [400, 429])
+async def test_credentials_a_provider_echoes_are_taken_out_of_its_message(status_code: int) -> None:
+    # The request's own key, whatever its shape (Mistral's have no prefix), and anything shaped like a key.
+    key = "Zq7mN2pL9xR4tY6w"
+    said = (
+        f"Key {key} can't use this model. Also seen: sk-proj-AbC123dEf456, AIzaSyD1234567890abcdefghij, "
+        "Bearer eyJhbGciOi.x.y, https://example.com/v1?key=secret123&alt=json"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"message": said}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    endpoint = ModelEndpoint(base_url=URL, api_key=key, model="m", provider="Mistral")
+    with pytest.raises((ModelUnavailableError, ModelRateLimitedError)) as err:
+        await HttpModelClient(http, endpoint, timeout_seconds=5).complete(MESSAGES)
+
+    assert err.value.message == (
+        "Your AI provider (Mistral) returned an error for m: Key [redacted] can't use this model. Also seen: "
+        "[redacted], [redacted], [redacted], https://example.com/v1?key=[redacted]&alt=json"
+    )

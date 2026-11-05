@@ -37,6 +37,11 @@ def model_accepts_images(model: str) -> bool:
     return bool(IMAGE_MODEL.search(name)) and not TEXT_ONLY_MODEL.search(name)
 
 
+def is_chat_model(model: str) -> bool:
+    """Whether a model in a provider's list can answer our chat completions requests (`NOT_CHAT_MODEL`)."""
+    return not NOT_CHAT_MODEL.search(model)
+
+
 def provider_endpoint(provider: AiProvider, api_key: str, model: str) -> ModelEndpoint:
     """How to call `model` at `provider` with the user's key."""
     spec = PROVIDERS[provider]
@@ -45,6 +50,7 @@ def provider_endpoint(provider: AiProvider, api_key: str, model: str) -> ModelEn
         base_url=spec.base_url,
         api_key=api_key,
         model=model,
+        provider=spec.name,
         headers=headers,
         accepts_images=model_accepts_images(model),
     )
@@ -120,6 +126,6 @@ def _chat_models(data: object) -> list[str]:
             case {"id": str(model_id)}:
                 # Gemini's OpenAI-compatible list writes `models/gemini-...`; its chat takes the bare name.
                 model_id = model_id.removeprefix("models/")
-                if MODEL_ID.fullmatch(model_id) and not NOT_CHAT_MODEL.search(model_id):
+                if MODEL_ID.fullmatch(model_id) and is_chat_model(model_id):
                     ids.add(model_id)
     return sorted(ids)[:MAX_LISTED_MODELS]

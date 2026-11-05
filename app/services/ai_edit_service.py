@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -9,7 +11,7 @@ from langgraph.types import Command, StateSnapshot
 from app.agents.ai_edit import EditRun, EditState, RunResult, compile_edit_graph, result_of, run_input, turn_for
 from app.agents.create_site import compile_create_graph
 from app.agents.thread import UserReply
-from app.clients.model import AiKeyInvalidError, ModelClient
+from app.clients.fallback_model import FallbackModel, ModelSwitch
 from app.constants.ai_edit import MAX_PREVIEW_ROUNDS, AiEditOutcome
 from app.core.exceptions import AppError, ConflictError, ExternalServiceError
 from app.core.limits import KeyLock
@@ -24,6 +26,7 @@ from app.schemas.ai_edit import (
     AiEditNeedsInput,
     AiEditPreviewReport,
     AiEditRequest,
+    AiModelSwitch,
     FileEdit,
     Question,
 )
@@ -31,7 +34,18 @@ from app.schemas.ai_key import ModelChoice
 from app.schemas.ai_thread import AiPausedRun, AiPreview, AiThreadRead, AiTurnRead
 from app.schemas.site import AiEditRecordCreate, SiteSnapshot
 from app.schemas.user import UserRead
-from app.services.ai_runs import DURABILITY, create_config, edit_config, end_paused, pause_kind, pause_value, prune
+from app.services.ai_runs import (
+    DURABILITY,
+    PickedModel,
+    create_config,
+    edit_config,
+    end_paused,
+    failure_summary,
+    pause_kind,
+    pause_value,
+    prune,
+    switches_read,
+)
 from app.services.site_service import SiteAccess, SiteConflictError, SiteNotFoundError, SiteService
 from app.utils.file_edits import apply_file_edits
 
@@ -63,11 +77,13 @@ class AiRunSupersededError(ConflictError):
 
 
 class ModelSource(Protocol):
-    """Picks the model for a request (`AiKeyService`)."""
+    """Picks the model for a request, with the ones it switches to if it stops answering (`AiKeyService`)."""
 
-    async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient: ...
+    async def model_for(
+        self, user_id: UUID, choice: ModelChoice | None, *, on_switch: Callable[[ModelSwitch], None] | None = None
+    ) -> FallbackModel: ...
 
-    async def key_refused(self, user_id: UUID, key_id: UUID) -> None: ...
+    async def key_refused(self, user_id: UUID, key_id: UUID, *, since: datetime) -> None: ...
 
 
 class AiEditService:
@@ -103,8 +119,9 @@ class AiEditService:
     async def edit(self, user: UserRead, request: AiEditRequest) -> AiEditResult:
         """Makes the change and commits it to the site's repo, hands the request to Tier 2 (by rule, or because the
         model escalated), or pauses on a question for the user (answered with `answer`). The model is the one the user
-        picked (`request.model`), or makable's own. The earlier requests in the prompt come from the site's thread. A
-        run paused on a question is skipped: the new instruction replaces it.
+        picked (`request.model`), or makable's own. If the user's pick stops answering, another of their models takes
+        over (the answer's `model_switches` say which). The earlier requests in the prompt come from the site's thread.
+        A run paused on a question is skipped: the new instruction replaces it.
 
         If the request is cancelled (Stop) once the commit has started, the commit still finishes and is recorded,
         and the chat shows it.
@@ -117,9 +134,11 @@ class AiEditService:
             AiModelRequiredError: Nothing was picked and there's no makable model.
             AiKeyNotFoundError: The picked key isn't the user's (any more).
             AiModelNotEnabledError: The picked model isn't turned on for the key.
-            AiKeyInvalidError: The provider refused the user's key. It's marked invalid.
-            ModelRateLimitedError: The provider is rate limiting the user's key.
-            ModelUnavailableError: The model couldn't be reached or answered with an error.
+            AiKeyInvalidError: The provider refused the user's key (and the ones switched to failed too). Keys refused
+                during the request are marked invalid.
+            ModelRateLimitedError: The provider is rate limiting the user's key (and the models switched to failed).
+            ModelUnavailableError: The model couldn't be reached or answered with an error (and the models switched to
+                failed).
             AiEditRejectedError: The model's answer was rejected on every attempt.
         """
         project_id = request.project_id
@@ -278,24 +297,24 @@ class AiEditService:
         *,
         resuming: bool,
     ) -> AiEditResult:
-        """Runs the graph (a new run, or a paused one resumed) and turns how it ended into the answer."""
-        run = EditRun(request, pick_model=lambda: self._models.model_for(user.id, request.model), site=site)
+        """Runs the graph (a new run, or a paused one resumed) and turns how it ended into the answer. Keys the
+        providers refused during the run are marked invalid, however it ended."""
+        picked = PickedModel(lambda: self._models.model_for(user.id, request.model))
+        run = EditRun(request, pick_model=picked.pick, site=site)
         config = self._config(request.project_id)
         try:
             state = await self._graph.ainvoke(graph_input, config, context=run, durability=DURABILITY)
         except asyncio.CancelledError:
             await self._after_cancel(user, request, run, resuming=resuming)
             raise
-        except AiKeyInvalidError as err:
-            if request.model is not None:
-                await self._models.key_refused(user.id, request.model.key_id)
-            await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=err.code)
-            raise
         except Exception as err:
             code = err.code if isinstance(err, AppError) else type(err).__name__
             # A resumed run that fails ends too: the answer was saved with it, so its question doesn't come back.
-            await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=code)
+            await self._record_quietly(user, request, run, AiEditOutcome.FAILED, summary=failure_summary(code, err))
             raise
+        finally:
+            await self._mark_refused(user, picked)
+        switches = switches_read(picked.switches)
         if state.get("__interrupt__"):
             value = state["__interrupt__"][0].value
             debug = self._debug_info(run, state.get("attempt", 0))
@@ -304,9 +323,25 @@ class AiEditService:
                     SiteSnapshot(commit_sha="", files=await run.files(), binary=[]), state
                 )
                 summary = result_of(state).get("summary", "")
-                return AiEditAwaitingResult(run_id=run_id, summary=summary, files=files, debug=debug)
-            return AiEditNeedsInput(run_id=run_id, question=Question.model_validate(value), debug=debug)
-        return await self._finish(user, request, run, run_id, state)
+                return AiEditAwaitingResult(
+                    run_id=run_id, summary=summary, files=files, model_switches=switches, debug=debug
+                )
+            question = Question.model_validate(value)
+            return AiEditNeedsInput(run_id=run_id, question=question, model_switches=switches, debug=debug)
+        return await self._finish(user, request, run, run_id, state, switches)
+
+    async def _mark_refused(self, user: UserRead, picked: PickedModel) -> None:
+        """Marks the keys the providers refused during a run invalid, so the menu stops offering them. A failure is
+        logged: the run's answer doesn't depend on it."""
+        since = picked.picked_at
+        if since is None:
+            return
+        for key_id in picked.refused_keys:
+            try:
+                await self._models.key_refused(user.id, key_id, since=since)
+            except Exception:
+                logger.exception("Couldn't mark a refused AI key invalid")
+                await self._uow.rollback()
 
     @staticmethod
     async def _preview_files(base: SiteSnapshot, values: dict[str, Any]) -> dict[str, str | None]:
@@ -348,7 +383,13 @@ class AiEditService:
         )
 
     async def _finish(
-        self, user: UserRead, request: AiEditRequest, run: EditRun, run_id: UUID, state: dict[str, Any]
+        self,
+        user: UserRead,
+        request: AiEditRequest,
+        run: EditRun,
+        run_id: UUID,
+        state: dict[str, Any],
+        switches: list[AiModelSwitch] | None,
     ) -> AiEditApplied | AiEditEscalated:
         result = result_of(state)
         outcome = AiEditOutcome(result["outcome"])
@@ -363,12 +404,14 @@ class AiEditService:
             raise AiEditRejectedError(details=details)
         debug = self._debug_info(run, attempts, state.get("model"))
         if outcome == AiEditOutcome.ESCALATED:
-            return AiEditEscalated(run_id=run_id, reason=result.get("reason", ""), debug=debug)
+            reason = result.get("reason", "")
+            return AiEditEscalated(run_id=run_id, reason=reason, model_switches=switches, debug=debug)
         return AiEditApplied(
             run_id=run_id,
             summary=result.get("summary", ""),
             commit_sha=result.get("commit_sha", ""),
             files=run.changed_files,
+            model_switches=switches,
             debug=debug,
         )
 

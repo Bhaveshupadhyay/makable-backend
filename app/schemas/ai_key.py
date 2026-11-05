@@ -125,5 +125,7 @@ class ModelEndpoint(BaseModel):
     base_url: str
     api_key: str | None
     model: str
+    # The user's provider, named in its errors (which are shown with its own words); None for makable's own model.
+    provider: str | None = None
     headers: dict[str, str] = {}
     accepts_images: bool = False

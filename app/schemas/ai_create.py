@@ -7,6 +7,7 @@ from pydantic import StringConstraints
 
 from app.constants.ai_create import MAX_PROMPT
 from app.constants.ai_edit import MAX_ANSWER
+from app.schemas.ai_edit import AiModelSwitch
 from app.schemas.ai_key import ModelChoice
 from app.schemas.common import CamelModel
 from app.schemas.site import SiteRead
@@ -37,3 +38,5 @@ class AiCreated(CamelModel):
     summary: str
     commit_sha: str
     site: SiteRead
+    # The models the creation switched from (its stream said so as it happened).
+    model_switches: list[AiModelSwitch] | None = None

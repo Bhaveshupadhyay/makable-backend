@@ -1,7 +1,8 @@
 import asyncio
 import base64
 import hashlib
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -9,6 +10,7 @@ from cryptography.fernet import Fernet
 from nacl.public import PrivateKey, SealedBox
 
 from app.clients.deploy_platforms import PlatformTokenInvalidError, PreparedProject
+from app.clients.fallback_model import FallbackModelClient, ModelCandidate, ModelSwitch
 from app.clients.github import (
     GithubConflictError,
     GithubNotFoundError,
@@ -373,32 +375,50 @@ VALID_PLATFORM_TOKEN = "platform-token-123"
 
 
 class FakeModelClient:
-    """Answers with scripted replies, in order, and records the messages it was sent."""
+    """Answers with scripted replies, in order (an error is raised), and records the messages it was sent."""
 
-    name = "fake-model"
-
-    def __init__(self, *replies: str, accepts_images: bool = False) -> None:
+    def __init__(self, *replies: str | Exception, accepts_images: bool = False, name: str = "fake-model") -> None:
         self.replies = list(replies)
         self.calls: list[list[ChatMessage]] = []
         self.accepts_images = accepts_images
+        self.name = name
 
     async def complete(self, messages: list[ChatMessage]) -> str:
         self.calls.append(list(messages))
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def fake_key_id(index: int) -> UUID:
+    """The key `FakeModelSource` calls its `index`th fallback with."""
+    return UUID(int=index + 1)
 
 
 class FakeModelSource:
-    """Always picks the given model; records keys reported as refused."""
+    """Always picks the given model (with the picked key, if there's a pick), then the given fallbacks, each on a key
+    of its own (`fake_key_id`); records keys reported as refused."""
 
-    def __init__(self, model: ModelClient) -> None:
+    def __init__(self, model: ModelClient, *fallbacks: ModelClient) -> None:
         self.model = model
+        self.fallbacks = fallbacks
         self.refused: list[UUID] = []
 
-    async def model_for(self, user_id: UUID, choice: ModelChoice | None) -> ModelClient:
-        return self.model
+    async def model_for(
+        self, user_id: UUID, choice: ModelChoice | None, *, on_switch: Callable[[ModelSwitch], None] | None = None
+    ) -> FallbackModelClient:
+        fallbacks = [ModelCandidate(connect_to(model), fake_key_id(i)) for i, model in enumerate(self.fallbacks)]
+        key_id = choice.key_id if choice is not None else None
+        return FallbackModelClient(self.model, key_id=key_id, fallbacks=fallbacks, on_switch=on_switch)
 
-    async def key_refused(self, user_id: UUID, key_id: UUID) -> None:
+    async def key_refused(self, user_id: UUID, key_id: UUID, *, since: datetime) -> None:
         self.refused.append(key_id)
+
+
+def connect_to(model: ModelClient) -> Callable[[], ModelClient]:
+    """A fallback's `connect` for a model that's built already."""
+    return lambda: model
 
 
 VALID_AI_KEY = "sk-test-valid-1234"
